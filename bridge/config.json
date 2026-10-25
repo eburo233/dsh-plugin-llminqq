@@ -210,5 +210,12 @@
       "clingy": 1.1,
       "steady": 1.0
     }
+  },
+  "memory": {
+    "reflection": {
+      "provider": "trae",
+      "model": "glm-5.3-flashx",
+      "reasoningEffort": null
+    }
   }
 }

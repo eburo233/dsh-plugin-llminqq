@@ -61,13 +61,29 @@ if (!dsh.bin || !dsh.profile || !dsh.provider || !dsh.model) {
 const { AcpRuntime } = await import(path.join(PROJECT, 'bridge', 'acp.js'))
 
 const timeoutSec = Number(arg('timeout', '180'))
+
+// 反思用**独立的小模型**，不占主路由。
+// 实测（同一 prompt，2026-10-25）：
+//   trae/glm-5.3-flashx      29.7s  ← 最快
+//   qodercn/gmodel (GLM-5.3)  42.0s
+//   qodercn/gfmodel          45.3s
+//   trae/deepseek-v4.1-flash 77.8s  ← 主路由，太慢
+//   trae/qwen3.8-flash       87.3s
+//   qodercn/dfmodel / qfmodel / mimo / minimax  >100s 超时
+// 反思是「读一堆对话 → 归纳几条」，不需要顶级模型，用小快模型足够，
+// 而且不跟主对话抢额度。
+const refl = cfg.memory?.reflection ?? {}
+const useProvider = refl.provider || dsh.provider
+const useModel = refl.model || dsh.model
+const useEffort = refl.reasoningEffort ?? dsh.reasoningEffort
+
 const rt = new AcpRuntime({
   bin: dsh.bin,
   profile: dsh.profile,
   cwd: dsh.cwd ?? path.join(PROJECT, 'qq-agent'),
-  provider: dsh.provider,
-  model: dsh.model,
-  reasoningEffort: dsh.reasoningEffort,
+  provider: useProvider,
+  model: useModel,
+  reasoningEffort: useEffort,
   // 反思只需要「读记忆 + 想」→ 不需要挂 MCP，省启动时间和 token
   mcpServers: [],
   startTimeoutMs: Math.min(timeoutSec * 1000, 90000),
