@@ -199,8 +199,133 @@ ok("只扫 24h 内的（1 条）", res["scanned"] == 1, res["scanned"])
 res = m.reflect(conn, "c2c:6", hours=200, use_llm=True, llm_caller=fake_llm_ok)
 ok("放宽到 200h 能扫到全部", res["scanned"] >= 2, res["scanned"])
 
-# ── 9. 边界 ────────────────────────────────────────────────────────────────
-print("\n=== 9. 边界 ===")
+# ── 10. 分批提炼 ────────────────────────────────────────────────────────────
+print("\n=== 10. 分批提炼 ===")
+# 真 bug 的复现规模：59 条一次性喂进去 → 实测 180s 超时。
+# 现在必须切成小批（batch=10 → 6 批），每批单独成功。
+conn = fresh_conn()
+BULK = [f"第{i}条：我在杭州做后端，平时喜欢喝美式" for i in range(59)]
+seed(conn, "c2c:8", BULK, hours_ago=1)
+
+seen_batches = []
+
+
+def fake_llm_batched(prompt, timeout):
+    seen_batches.append(prompt)
+    return f"- 他在杭州做后端开发（第{len(seen_batches)}批）\n- 他喜欢喝美式咖啡"
+
+
+res = m.reflect(conn, "c2c:8", hours=240, use_llm=True,
+                llm_caller=fake_llm_batched, batch=10)
+ok("扫到 59 条", res["scanned"] == 59, res["scanned"])
+ok("切成 6 批", res["batches"] == 6, res["batches"])
+ok("6 批全成功", res["batches_ok"] == 6, res["batches_ok"])
+ok("每批 prompt 里 ≤10 条记忆",
+   max(sum(1 for ln in p.splitlines() if ln.startswith("[")) for p in seen_batches) <= 10,
+   max(sum(1 for ln in p.splitlines() if ln.startswith("[")) for p in seen_batches))
+ok("模式是 llm", res["mode"] == "llm", res["mode"])
+ok("有新建", res["created"] > 0, res["created"])
+ok("59 条都打了标记",
+   conn.execute("SELECT COUNT(*) FROM entries WHERE peer=? AND kind='episodic' AND reflected=1",
+                ("c2c:8",)).fetchone()[0] == 59)
+
+# 幂等：再跑一次应该扫不到（都标记过了）
+res2 = m.reflect(conn, "c2c:8", hours=240, use_llm=True,
+                 llm_caller=fake_llm_batched, batch=10)
+ok("再跑一次 scanned=0", res2["scanned"] == 0, res2["scanned"])
+
+# batch 可配：batch=5 → 59 条切成 12 批
+conn = fresh_conn()
+seed(conn, "c2c:9", BULK, hours_ago=1)
+calls = []
+res = m.reflect(conn, "c2c:9", hours=240, use_llm=True,
+                llm_caller=lambda p, t: (calls.append(1), "- 他在杭州上班")[1], batch=5)
+ok("batch=5 切成 12 批", res["batches"] == 12, res["batches"])
+ok("调用次数等于批次数", len(calls) == 12, len(calls))
+
+# ── 11. 单批失败不连累全局 ──────────────────────────────────────────────────
+print("\n=== 11. 部分批次失败 ===")
+conn = fresh_conn()
+seed(conn, "c2c:10", BULK, hours_ago=1)
+state = {"n": 0}
+
+
+def fake_llm_fail_second(prompt, timeout):
+    state["n"] += 1
+    if state["n"] == 2:
+        raise m.LLMRuntimeError("模拟第2批超时")
+    return "- 他在杭州做后端"
+
+
+res = m.reflect(conn, "c2c:10", hours=240, use_llm=True,
+                llm_caller=fake_llm_fail_second, batch=10)
+ok("模式是 llm-partial", res["mode"] == "llm-partial", res["mode"])
+ok("batches_failed=1", res["batches_failed"] == 1, res["batches_failed"])
+ok("其它 5 批成功", res["batches_ok"] == 5, res["batches_ok"])
+ok("有 error 说明哪批挂了", "第 2 批" in (res["error"] or ""), res["error"])
+ok("成功批次仍产出了记忆", res["created"] > 0, res["created"])
+# 关键：失败那批必须留 reflected=0，否则永远提炼不到
+marked = conn.execute(
+    "SELECT COUNT(*) FROM entries WHERE peer=? AND kind='episodic' AND reflected=1",
+    ("c2c:10",)).fetchone()[0]
+ok("失败批的 10 条没打标记（可重试）", marked == 49, marked)
+left = conn.execute(
+    "SELECT COUNT(*) FROM entries WHERE peer=? AND kind='episodic' AND reflected=0",
+    ("c2c:10",)).fetchone()[0]
+ok("剩 10 条待重试", left == 10, left)
+
+# 重试：这次全成功 → 剩余的打上
+state2 = {"n": 0}
+res_r = m.reflect(conn, "c2c:10", hours=240, use_llm=True, batch=10,
+                  llm_caller=lambda p, t: "- 他在杭州做后端")
+ok("重试只扫剩下的 10 条", res_r["scanned"] == 10, res_r["scanned"])
+ok("重试后全标记无残留",
+   conn.execute("SELECT COUNT(*) FROM entries WHERE peer=? AND kind='episodic' AND reflected=0",
+                ("c2c:10",)).fetchone()[0] == 0)
+
+# 全部批都失败 → 才算 error，且一条都不改
+conn = fresh_conn()
+seed(conn, "c2c:11", BULK, hours_ago=1)
+res = m.reflect(conn, "c2c:11", hours=240, use_llm=True, batch=10,
+                llm_caller=fake_llm_raises_runtime)
+ok("全失败 mode=error", res["mode"] == "error", res["mode"])
+ok("全失败 batches_failed=6", res["batches_failed"] == 6, res["batches_failed"])
+ok("全失败不新建 semantic",
+   conn.execute("SELECT COUNT(*) FROM entries WHERE kind='semantic'").fetchone()[0] == 0)
+ok("全失败一条标记都不打",
+   conn.execute("SELECT COUNT(*) FROM entries WHERE reflected=1").fetchone()[0] == 0)
+
+# ── 12. 总超时预算 ──────────────────────────────────────────────────────────
+print("\n=== 12. 总超时预算 ===")
+conn = fresh_conn()
+seed(conn, "c2c:12", BULK, hours_ago=1)
+slow_calls = []
+
+
+def fake_llm_slow(prompt, timeout):
+    slow_calls.append(1)
+    import time as _t
+    _t.sleep(0.25)  # 累计会超过 total_timeout
+    return "- 他在杭州做后端"
+
+
+t_start = __import__("time").monotonic()
+res = m.reflect(conn, "c2c:12", hours=240, use_llm=True,
+                llm_caller=fake_llm_slow, batch=10, total_timeout=1)
+elapsed = __import__("time").monotonic() - t_start
+ok("没跑完 6 批就停了", len(slow_calls) < 6, len(slow_calls))
+ok("整个调用没拖很久", elapsed < 3.0, round(elapsed, 2))
+ok("模式是 llm-partial", res["mode"] == "llm-partial", res["mode"])
+ok("error 里说明是总超时", "总耗时" in (res["error"] or ""), res["error"])
+ok("已成功的那几批产出了记忆", res["created"] > 0, res["created"])
+ok("已成功批次打了标记，没跑到的没打",
+   conn.execute("SELECT COUNT(*) FROM entries WHERE reflected=1").fetchone()[0]
+   == res["batches_ok"] * 10,
+   (conn.execute("SELECT COUNT(*) FROM entries WHERE reflected=1").fetchone()[0],
+    res["batches_ok"]))
+
+# ── 13. 边界 ────────────────────────────────────────────────────────────────
+print("\n=== 13. 边界 ===")
 conn = fresh_conn()
 ok("空 peer 不崩", m.reflect(conn, "c2c:999")["scanned"] == 0)
 ok("reflect_all 空库不崩", m.reflect_all(conn) == [])

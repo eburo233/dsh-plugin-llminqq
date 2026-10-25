@@ -37,6 +37,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 
 try:
@@ -623,13 +624,50 @@ class LLMRuntimeError(Exception):
     """模型可用但这次调用失败了（超时/报错）。不应污染已有记忆。"""
 
 
+def _fallback_summaries(items):
+    """粗糙拼接（老 consolidate 的思路）：同关键词的几条并一句。"""
+    buckets = {}
+    for r in items:
+        if r["importance"] < 0.45:
+            continue
+        key = None
+        for tk in tokenize(r["text"]):
+            if len(tk) >= 2 and tk in IMPORTANT_WORDS:
+                key = tk
+                break
+        if key:
+            buckets.setdefault(key, []).append(r)
+    out = []
+    for key, rows in buckets.items():
+        if len(rows) < 2:
+            continue
+        joined = "；".join(i["text"][:60] for i in rows[:3])
+        out.append(f"[关于「{key}」的几条] {joined}")
+    return out
+
+
+def _mark_reflected(conn, ids):
+    """把一批 episodic 打上 reflected=1（分批 UPDATE，避开 SQLite 变量上限）。"""
+    for chunk_start in range(0, len(ids), 200):
+        chunk = ids[chunk_start:chunk_start + 200]
+        conn.execute(
+            f"UPDATE entries SET reflected=1 WHERE id IN ({','.join('?' * len(chunk))})",
+            chunk,
+        )
+
+
 def reflect(conn, peer, hours=24, n_min=2, n_max=5, use_llm=True,
-            timeout=180, llm_caller=None, dry_run=False):
+            timeout=90, batch=10, total_timeout=600, llm_caller=None,
+            dry_run=False):
     """对某个 peer 最近一段 episodic 记忆做一次反思提炼。
 
     幂等：被提炼过的 episodic 打 reflected=1，下次不会重复提炼。
+    分批：每 batch 条拼一个 prompt —— 一次性喂几十条会撑爆单次调用（实测 59 条
+          180s 超时，而 3 条只要 42s）。批大小和单批超时可调。
     失败安全：LLM 不可用 → 退回粗糙拼接法（consolidate 那套）；
-    LLM 调用出错 → 抛异常但**不改任何已有数据**（便于上层重试）。
+    单批失败不连累全局 → 该批不打标记、继续后面的批，返回 batches_failed；
+    全部批失败才算 mode='error'（且此时不改任何数据）。
+    总预算：累计耗时超 total_timeout → 停止后续批，已成功的存下来，mode='llm-partial'。
     """
     cutoff = now_ts() - hours * 3600
     items = conn.execute(
@@ -641,56 +679,72 @@ def reflect(conn, peer, hours=24, n_min=2, n_max=5, use_llm=True,
     result = {
         "peer": peer, "scanned": len(items), "created": 0, "skipped": 0,
         "mode": "none", "summaries": [], "error": None,
+        "batches": 0, "batches_ok": 0, "batches_failed": 0,
     }
     if not items:
         return result
 
-    prompt = _prompt_for_reflection(items, n_min, n_max)
+    batch = max(1, int(batch or 1))
+    chunks = [items[i:i + batch] for i in range(0, len(items), batch)]
+    result["batches"] = len(chunks)
     summaries = []
     mode = "llm"
 
     if use_llm:
         caller = llm_caller or _call_llm_via_acp
-        try:
-            raw = caller(prompt, timeout)
-            summaries = _parse_reflection(raw)[:n_max]
-            if not summaries:
-                # 模型说「无」时是正常结果，不是失败
-                mode = "llm-empty"
-        except LLMUnavailable as e:
+        seen = set()
+        done_ids, failed_ids, errs = [], [], []
+        failed_batches = 0
+        t0 = time.monotonic()
+        stopped = False
+        unavailable = False
+        for idx, chunk in enumerate(chunks):
+            if time.monotonic() - t0 > total_timeout:
+                stopped = True
+                errs.append(f"总耗时超过 {total_timeout}s，停止后续 {len(chunks) - idx} 批")
+                break
+            try:
+                raw = caller(_prompt_for_reflection(chunk, n_min, n_max), timeout)
+            except LLMUnavailable as e:
+                unavailable = True
+                result["error"] = f"LLM 不可用，退回拼接法: {e}"
+                break
+            except Exception as e:
+                # 单批失败：记下来，该批不打标记（下轮还能重试），继续后面的批
+                failed_ids.extend(r["id"] for r in chunk)
+                failed_batches += 1
+                errs.append(f"第 {idx + 1} 批: {e}")
+                continue
+            for sm in _parse_reflection(raw)[:n_max]:
+                f = fp(sm)
+                if f in seen:
+                    continue
+                seen.add(f)
+                summaries.append(sm)
+            done_ids.extend(r["id"] for r in chunk)
+            result["batches_ok"] += 1
+
+        result["batches_failed"] = failed_batches
+
+        if unavailable:
             mode = "fallback"
-            result["error"] = f"LLM 不可用，退回拼接法: {e}"
-        except LLMRuntimeError as e:
-            # 调用失败：不改任何数据，让上层下轮重试
-            result["error"] = f"LLM 调用失败: {e}"
+        elif not done_ids and errs:
+            # 一批都没成功 → 全失败，才算 error
+            result["error"] = "LLM 调用失败: " + "; ".join(errs)
             result["mode"] = "error"
             return result
-        except Exception as e:
-            result["error"] = f"意外错误: {e}"
-            result["mode"] = "error"
-            return result
+        else:
+            if errs:
+                result["error"] = "LLM 部分失败: " + "; ".join(errs)
+            if stopped or failed_ids:
+                mode = "llm-partial"
+            elif not summaries:
+                mode = "llm-empty"  # 模型说「无」是正常结果，不是失败
     else:
         mode = "fallback"
 
-    if mode in ("fallback", "none"):
-        # 粗糙拼接（老 consolidate 的思路）：同关键词的几条并一句
-        buckets = {}
-        for r in items:
-            if r["importance"] < 0.45:
-                continue
-            key = None
-            for tk in tokenize(r["text"]):
-                if len(tk) >= 2 and tk in IMPORTANT_WORDS:
-                    key = tk
-                    break
-            if key:
-                buckets.setdefault(key, []).append(r)
-        for key, rows in buckets.items():
-            if len(rows) < 2:
-                continue
-            joined = "；".join(i["text"][:60] for i in rows[:3])
-            summaries.append(f"[关于「{key}」的几条] {joined}")
-        mode = "fallback"
+    if mode == "fallback":
+        summaries = _fallback_summaries(items)
         if not summaries:
             result["mode"] = mode
             result["skipped"] = len(items)
@@ -707,14 +761,9 @@ def reflect(conn, peer, hours=24, n_min=2, n_max=5, use_llm=True,
         rid = remember(conn, peer, text, kind="semantic", importance=imp)
         if rid:
             created += 1
-    # 打标记（无论提炼出几条，这批都算处理过，避免反复扫同批）
-    ids = [r["id"] for r in items]
-    for chunk_start in range(0, len(ids), 200):
-        chunk = ids[chunk_start:chunk_start + 200]
-        conn.execute(
-            f"UPDATE entries SET reflected=1 WHERE id IN ({','.join('?' * len(chunk))})",
-            chunk,
-        )
+    # 只给成功处理过的批打标记：失败/没跑到的批保持 reflected=0，下轮还能重试
+    mark_ids = (done_ids if use_llm and mode != "fallback" else [r["id"] for r in items])
+    _mark_reflected(conn, mark_ids)
     conn.commit()
 
     result["created"] = created
@@ -723,8 +772,8 @@ def reflect(conn, peer, hours=24, n_min=2, n_max=5, use_llm=True,
     return result
 
 
-def reflect_all(conn, hours=24, n_min=2, n_max=5, use_llm=True, timeout=180,
-                llm_caller=None, dry_run=False):
+def reflect_all(conn, hours=24, n_min=2, n_max=5, use_llm=True, timeout=90,
+                batch=10, total_timeout=600, llm_caller=None, dry_run=False):
     """对所有有未反思 episodic 的 peer 跑一遍。"""
     peers = [r["peer"] for r in conn.execute(
         "SELECT DISTINCT peer FROM entries WHERE retired=0 AND kind='episodic' "
@@ -733,7 +782,8 @@ def reflect_all(conn, hours=24, n_min=2, n_max=5, use_llm=True, timeout=180,
     out = []
     for peer in peers:
         out.append(reflect(conn, peer, hours, n_min, n_max, use_llm, timeout,
-                           llm_caller=llm_caller, dry_run=dry_run))
+                           batch, total_timeout, llm_caller=llm_caller,
+                           dry_run=dry_run))
     return out
 
 
@@ -813,7 +863,9 @@ def main():
     p.add_argument("--n-min", type=int, default=2, help="至少提炼几条")
     p.add_argument("--n-max", type=int, default=5, help="最多提炼几条")
     p.add_argument("--no-llm", action="store_true", help="不调模型，退回粗糙拼接")
-    p.add_argument("--timeout", type=int, default=180, help="模型调用超时（秒）")
+    p.add_argument("--timeout", type=int, default=90, help="单批模型调用超时（秒）")
+    p.add_argument("--batch", type=int, default=10, help="每批喂几条记忆（默认10）")
+    p.add_argument("--total-timeout", type=int, default=600, help="全程总超时预算（秒）")
     p.add_argument("--dry-run", action="store_true", help="只打印提炼结果，不写库")
 
     p = sub.add_parser("remember", help="手动记一条")
@@ -845,11 +897,14 @@ def main():
         print(f"生成 {consolidate(conn)} 条语义记忆")
     elif a.cmd == "reflect":
         kwargs = dict(hours=a.hours, n_min=a.n_min, n_max=a.n_max,
-                      use_llm=not a.no_llm, timeout=a.timeout, dry_run=a.dry_run)
+                      use_llm=not a.no_llm, timeout=a.timeout, batch=a.batch,
+                      total_timeout=a.total_timeout, dry_run=a.dry_run)
         results = ([reflect(conn, a.peer, **kwargs)] if a.peer
                    else reflect_all(conn, **kwargs))
         for r in results:
-            print(f"[{r['peer']}] 扫描 {r['scanned']} 条 · 模式 {r['mode']} · 新建 {r['created']} 条")
+            print(f"[{r['peer']}] 扫描 {r['scanned']} 条 · 模式 {r['mode']} · 新建 {r['created']} 条"
+                  f" · 批次 {r.get('batches_ok', 0)}/{r.get('batches', 0)} 成功"
+                  f"（失败 {r.get('batches_failed', 0)}）")
             if r.get("error"):
                 print(f"    ⚠ {r['error']}")
             for sm in r.get("summaries") or []:

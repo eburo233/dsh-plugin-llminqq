@@ -146,7 +146,27 @@ python3 memory/memctl.py reflect --dry-run
 
 # 没有模型的环境：退回老的拼接法
 python3 memory/memctl.py reflect --no-llm
+
+# 分批参数（默认就是这几个值，一般不用改）
+python3 memory/memctl.py reflect --batch 10 --timeout 90 --total-timeout 600
 ```
+
+### 分批提炼（为什么必须分批）
+
+曾实测过：把 59 条 episodic **一次性**拼进一个 prompt → 单次调用 180 秒超时失败
+（返回 `mode='error'`、`created=0`）；而 3 条的小 prompt 只要 42 秒就成功。
+所以瓶颈是**单次输入太大**，不是模型不可用。
+
+现在 `reflect()` 按 `batch=10` 切批，逐批调用：
+
+- 每批单独一个 prompt（10 条 ≈ 几分钟内稳定返回），结果合并后按指纹去重
+- **单批失败不连累全局**：该批的 episodic 保持 `reflected=0`（下轮还能重试），
+  继续跑后面的批，返回里带 `batches_failed` 计数
+- **只有全部批都失败**才 `mode='error'`，此时一条数据都不改
+- 部分成功/超预算 → `mode='llm-partial'`，已成功的批次照常入库并打标记
+- **总超时预算** `total_timeout=600` 秒：累计超了就不再起新批，
+  已成功的存下来（不白跑）
+- 单批超时默认 `timeout=90`（小批够用，且失败更快暴露）
 
 ### 它让模型提炼哪几类
 
@@ -182,7 +202,9 @@ python3 memory/memctl.py reflect --no-llm
 ### 幂等与失败安全
 
 - 被提炼过的 episodic 打 `reflected=1`，**下次不重复提炼**（实测第二次扫描 0 条）
-- LLM **调用失败** → 抛错但**不改任何已有数据**、不打标记 → 上层可重试
+- 分批后：**只给成功处理的批打标记**，失败/没跑到的批保持 `reflected=0` → 下轮自动重试
+- 所有批都失败 → `mode='error'` 且**不改任何已有数据**、不打标记 → 上层可重试
+- 部分批失败 → `mode='llm-partial'` + `batches_failed`，成功那部分照常入库
 - LLM **不可用**（没配模型/起不来）→ 静默退回拼接法，不报错
 - 模型回「无」→ 正常结果（0 条），但照样打标记，避免反复扫同一批废话
 
