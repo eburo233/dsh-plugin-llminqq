@@ -573,7 +573,7 @@ def _parse_reflection(raw):
     return uniq
 
 
-def _call_llm_via_acp(prompt, timeout=180):
+def _call_llm_via_acp(prompt, timeout=90):
     """调一次模型。调用者是 reflection_llm.mjs（薄壳），失败抛异常。
 
     返回值：提炼后的文本；调用不可用时抛 LLMRuntimeError / LLMUnavailable。
