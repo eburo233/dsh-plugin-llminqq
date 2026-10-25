@@ -1,0 +1,33 @@
+# ── 不要进版本控制的东西 ──────────────────────────────────────────────────
+# 1) NapCat 的登录态 + QQ 数据（245 MB，且含账号隐私）
+qqacct/data/
+# 2) 运行时产物：日志、状态、pid、暂存媒体
+logs/
+.qq-media/
+qq-agent/.qq-media/
+# 3) 本地环境变量（含 WebUI token / 账号）
+.env
+qqacct/.env
+# 4) 依赖
+node_modules/
+# 5) 登录二维码 / 临时图
+qrcode*.png
+qqacct/qrcode*.png
+qr-now.png
+llminqq-qr*.png
+# 6) 编辑器的临时/备份文件
+*.bak-*
+*.tmp
+*.part
+.DS_Store
+
+# ── 但 qq-agent 的「人设 / 记忆 / 性格」要进库（这些是会成长的资产）──
+# qq-agent/persona/  ✅ 保留
+# qq-agent/memory/   ✅ 保留（.md 见闻录 + memctl.py）
+# qq-agent/meme-pack/ 的图库二进制不进，但说明留
+qq-agent/meme-pack/*.db
+qq-agent/meme-pack/*.jpg
+qq-agent/meme-pack/*.png
+qq-agent/meme-pack/*.gif
+qq-agent/memory/mem.db
+qq-agent/memory/log/

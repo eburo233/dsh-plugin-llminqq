@@ -1,0 +1,211 @@
+{
+  "onebot": {
+    "wsUrl": "ws://127.0.0.1:3001",
+    "token": "",
+    "reconnectMs": 3000,
+    "heartbeatTimeoutMs": 90000
+  },
+  "dsh": {
+    "bin": "/home/jojo/.local/bin/dsh",
+    "profile": "llminqq-acp",
+    "cwd": "/home/jojo/dsh/LLMinQQ/qq-agent",
+    "provider": "trae",
+    "model": "deepseek-v4.1-flash",
+    "reasoningEffort": "high",
+    "startTimeoutMs": 60000,
+    "turnTimeoutMs": 180000,
+    "fallbackRoutes": [
+      {
+        "provider": "codearts",
+        "model": "deepseek-v4.1-flash",
+        "reasoningEffort": "high"
+      },
+      {
+        "provider": "trae",
+        "model": "kimi-k3",
+        "reasoningEffort": "high"
+      },
+      {
+        "provider": "trae",
+        "model": "glm-5.3",
+        "reasoningEffort": "high"
+      },
+      {
+        "provider": "trae",
+        "model": "qwen3.8-flash",
+        "reasoningEffort": "high"
+      }
+    ],
+    "failover": {
+      "enabled": true,
+      "consecutiveFailures": 2,
+      "cooldownMs": 300000,
+      "probeBackMs": 180000
+    },
+    "protocol": "acp"
+  },
+  "policy": {
+    "allowC2C": true,
+    "allowUsers": [],
+    "allowGroups": [],
+    "maxReplyChars": 1500,
+    "replyChunkDelayMs": 400,
+    "ignoreSelf": true,
+    "cooldownMsPerPeer": 800,
+    "readAllGroupMessages": true,
+    "passiveWindowMs": 10000,
+    "passiveMaxPerWindow": 3,
+    "speaking": {
+      "smallGroupMax": 8,
+      "largeGroupMin": 50
+    },
+    "timezone": "Asia/Shanghai",
+    "quietHours": {
+      "enabled": true,
+      "startHour": 1,
+      "endHour": 7,
+      "passiveRatioFactor": 0.35
+    },
+    "flurry": {
+      "enabled": true,
+      "windowMs": 45000,
+      "minMsgs": 3,
+      "longMsgChars": 60,
+      "suppressRatio": 0.6,
+      "silenceAfter": 90000
+    }
+  },
+  "media": {
+    "enabled": true,
+    "stagingDir": "/home/jojo/dsh/LLMinQQ/.qq-media",
+    "maxFileBytes": 10485760,
+    "sensitiveNames": [
+      ".ssh",
+      ".env",
+      "credentials",
+      "id_rsa",
+      "id_ed25519",
+      ".credentials.yaml",
+      ".credentials.json",
+      "secret",
+      "token"
+    ],
+    "prune": {
+      "enabled": true,
+      "maxAgeHours": 24,
+      "maxFiles": 300
+    }
+  },
+  "server": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 18080,
+    "token": "llminqq-local-api",
+    "qrPath": "/qr.png"
+  },
+  "log": {
+    "level": "info",
+    "file": "/home/jojo/dsh/LLMinQQ/logs/bridge.log"
+  },
+  "persona": {
+    "path": "/home/jojo/dsh/LLMinQQ/qq-agent/persona/persona.md",
+    "maxBytes": 32768
+  },
+  "welcome": {
+    "enabled": true,
+    "groups": [],
+    "useLlm": true,
+    "template": "[CQ:at,qq={qq}] 新来的？报下名字和来路，别潜水。"
+  },
+  "poke": {
+    "enabled": true
+  },
+  "tts": {
+    "enabled": true,
+    "engine": "gsv",
+    "maxChars": 200,
+    "gsv": {
+      "url": "http://127.0.0.1:9880/",
+      "textLanguage": "zh",
+      "promptLanguage": "zh",
+      "speed": 1.0,
+      "temperature": 1.0,
+      "timeoutMs": 120000
+    },
+    "piper": {
+      "url": "http://127.0.0.1:5006/synthesize",
+      "voice": "zh_CN-huayan-medium",
+      "timeoutMs": 60000
+    },
+    "sherpa": {
+      "url": "http://127.0.0.1:9881/synthesize",
+      "engineId": "vits",
+      "sid": 0,
+      "timeoutMs": 60000
+    },
+    "character": "lucy-voice-male1",
+    "characterName": "憨憨小弟"
+  },
+  "bili": {
+    "enabled": true
+  },
+  "mcpServers": [
+    {
+      "name": "bilibili",
+      "command": "/home/jojo/.dsh/bili-duty/.venv/bin/python",
+      "args": [
+        "/home/jojo/.dsh/bili-duty/mcp_server.py"
+      ],
+      "env": {
+        "HOME": "/home/jojo",
+        "PATH": "/usr/local/bin:/usr/bin:/bin"
+      }
+    }
+  ],
+  "proactive": {
+    "enabled": true,
+    "baseProb": 0.1,
+    "step": 0.05,
+    "maxProb": 0.6,
+    "guaranteeCount": 6,
+    "cooldownMin": 40,
+    "tickMin": 20,
+    "quietStartHour": 1,
+    "quietEndHour": 7,
+    "nightStartHour": 23,
+    "nightEndHour": 1,
+    "nightFactor": 0.5,
+    "whitelist": [
+      "3022464706"
+    ]
+  },
+  "energy": {
+    "enabled": true,
+    "start": 0.75,
+    "perMsgDrop": 0.025,
+    "perHourRestore": 0.35,
+    "floor": 0.35,
+    "ceil": 1.0
+  },
+  "replyDelay": {
+    "enabled": false,
+    "minMs": 1500,
+    "maxMs": 12000
+  },
+  "security": {
+    "allowPrivateUrls": false,
+    "maxCardUrlChars": 400,
+    "sanitizeUntrustedText": true
+  },
+  "mood": {
+    "enabled": true,
+    "traits": {
+      "sensitivity": 1.15,
+      "sootheRate": 1.2,
+      "showOff": 1.6,
+      "grudge": 0.45,
+      "clingy": 1.1,
+      "steady": 1.0
+    }
+  }
+}
