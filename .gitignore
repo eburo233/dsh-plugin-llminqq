@@ -31,3 +31,6 @@ qq-agent/meme-pack/*.png
 qq-agent/meme-pack/*.gif
 qq-agent/memory/mem.db
 qq-agent/memory/log/
+
+# ASR 临时音频（转写完就该清，不进库）
+qq-agent/tools/tmp/
