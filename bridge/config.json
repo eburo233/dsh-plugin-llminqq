@@ -16,11 +16,6 @@
     "turnTimeoutMs": 180000,
     "fallbackRoutes": [
       {
-        "provider": "codearts",
-        "model": "deepseek-v4.1-flash",
-        "reasoningEffort": "high"
-      },
-      {
         "provider": "qodercn",
         "model": "dfmodel",
         "reasoningEffort": "high"
