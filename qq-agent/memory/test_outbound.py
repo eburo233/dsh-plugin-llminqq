@@ -6,6 +6,16 @@ tmp=tempfile.mkdtemp()
 m.DB=os.path.join(tmp,'mem.db'); m.LOG_DIR=os.path.join(tmp,'log'); m.CURSOR=os.path.join(tmp,'cursor')
 spec.loader.exec_module(m)
 
+# ⚠️ 必须在 exec_module **之后**再覆盖：模块加载时会把 DB 重设成生产路径。
+_TMPDIR = tempfile.mkdtemp(prefix="memtest-isolated-")
+m.DB = os.path.join(_TMPDIR, "mem.db")
+m.LOG_DIR = os.path.join(_TMPDIR, "log")
+m.CURSOR = os.path.join(_TMPDIR, "cursor")
+m.DIGEST = os.path.join(_TMPDIR, "digest.md")
+os.makedirs(m.LOG_DIR, exist_ok=True)
+_PROD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mem.db")
+assert os.path.abspath(m.DB) != os.path.abspath(_PROD), "测试必须隔离，不能连生产库！"
+
 pass_, fail_ = 0, 0
 def ok(n, c, d=''):
     global pass_, fail_
@@ -22,7 +32,7 @@ open(log,'w',encoding='utf-8').write('''2026-10-25T12:00:00.000Z 入站 c2c:3022
 2026-10-25T12:00:12.000Z 出站 c2c:3022464706 text="好，我记下了，明天三点三楼" chars=13
 2026-10-25T12:00:20.000Z 入站 c2c:3022464706 from=信风(3022464706) text="嗯" images=0
 ''')
-conn=m.connect()
+conn=m.connect(m.DB)
 n=m.ingest_bridge(conn,log)
 print(f'入库 {n} 条（噪音"嗯"应被挡）')
 print()

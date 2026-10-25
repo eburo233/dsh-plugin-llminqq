@@ -8,7 +8,17 @@ m.DB=os.path.join(_tmpdir,'mem.db')
 m.LOG_DIR=os.path.join(_tmpdir,'log')
 m.CURSOR=os.path.join(_tmpdir,'cursor')
 spec.loader.exec_module(m)
-conn=m.connect()
+
+# ⚠️ 必须在 exec_module **之后**再覆盖：模块加载时会把 DB 重设成生产路径。
+_TMPDIR = tempfile.mkdtemp(prefix="memtest-isolated-")
+m.DB = os.path.join(_TMPDIR, "mem.db")
+m.LOG_DIR = os.path.join(_TMPDIR, "log")
+m.CURSOR = os.path.join(_TMPDIR, "cursor")
+m.DIGEST = os.path.join(_TMPDIR, "digest.md")
+os.makedirs(m.LOG_DIR, exist_ok=True)
+_PROD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mem.db")
+assert os.path.abspath(m.DB) != os.path.abspath(_PROD), "测试必须隔离，不能连生产库！"
+conn=m.connect(m.DB)
 pass_,fail=0,0
 def ok(n,c,d=''):
     global pass_,fail

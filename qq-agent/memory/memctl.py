@@ -245,8 +245,15 @@ def is_pin(text):
     return False
 
 
-def connect():
-    conn = sqlite3.connect(DB)
+def connect(db_path=None):
+    """连库。db_path 显式传时用它 —— 测试必须传，否则会连到生产库。
+
+    ⚠️ 踩过的坑：测试在 exec_module **之前**改 m.DB 是没用的，
+       因为模块加载时 DB = os.path.join(BASE,"mem.db") 会把它覆盖回去。
+       结果三个测试一直在写生产库，其中一个还有 os.remove(m.DB) —— 直接把库删了。
+       所以这里必须支持显式传参。
+    """
+    conn = sqlite3.connect(db_path or DB)
     conn.row_factory = sqlite3.Row
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS entries (
@@ -261,12 +268,15 @@ def connect():
             hits INTEGER NOT NULL DEFAULT 1,
             created REAL NOT NULL,
             last_seen REAL NOT NULL,
-            retired INTEGER NOT NULL DEFAULT 0
+            retired INTEGER NOT NULL DEFAULT 0,
+            reflected INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_peer ON entries(peer);
         CREATE INDEX IF NOT EXISTS idx_kind ON entries(kind);
     """)
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(entries)")}
+    if "reflected" not in cols:
+        conn.execute("ALTER TABLE entries ADD COLUMN reflected INTEGER NOT NULL DEFAULT 0")
     fresh = "importance" not in cols
     if fresh:
         conn.execute("ALTER TABLE entries ADD COLUMN importance REAL NOT NULL DEFAULT 0.5")
@@ -491,6 +501,242 @@ def consolidate(conn, min_importance=0.45):
     return created
 
 
+# ── 定期反思（reflection）────────────────────────────────────────────────────
+# 论文 §4.2：让 agent 定期回头看最近的记忆，提炼成更高层的「反思」
+# （关于这个人是谁、他的偏好、你们的关系、答应过什么、还有什么没做完）。
+# 这里真正调一次 LLM 去做，而不是像 consolidate() 那样按关键词拼句子。
+
+REFLECTION_PROMPT = """你在整理一段聊天记录的记忆。请从下面的对话片段里，提炼出 **{n_min}~{n_max} 条**值得长期记住的事实。
+
+只记这几类（其他一律不要）：
+1. 这个人的身份/基本情况（称呼、所在、职业、习惯作息）
+2. 他明确的偏好与雷点（喜欢什么、讨厌什么、别对他做什么）
+3. 你们之间的约定和规矩（他要求你怎么做、什么情况下不做什么）
+4. 没做完 / 待办的事（他说了要做但还没做的、答应过的）
+5. 关系变化（称呼变了、态度变了、亲疏变了）
+
+**严格要求**：
+- 每条**一句话**，20~60 字，写在 `- ` 开头
+- 必须是**能脱离上下文独立看懂**的陈述（不要「他说了那个」「上面提到的」这种指代）
+- 只写**对话里真的出现过**的信息，**不要推测、不要编**
+- 如果这段对话没啥值得记的，就只输出 `- 无` 一行
+- 除了这 {n_min}~{n_max} 条，**不要写任何别的话**（不要标题、不要解释、不要总结段）
+
+对话片段（时间从早到晚）：
+{memories}
+"""
+
+
+def _prompt_for_reflection(items, n_min, n_max):
+    lines = []
+    for r in items:
+        try:
+            t = datetime.fromtimestamp(r["last_seen"], timezone.utc).strftime("%m-%d %H:%M")
+        except Exception:
+            t = "?"
+        lines.append(f"[{t}] {r['text'][:200]}")
+    body = "\n".join(lines)
+    return REFLECTION_PROMPT.format(n_min=n_min, n_max=n_max, memories=body)
+
+
+def _parse_reflection(raw):
+    """从模型输出里抠出条目。宽容解析：容忍编号、项目符号、多余前后缀。"""
+    out = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # 去掉常见前缀：- * • 1. 1) 「」
+        m = re.match(r"^(?:[-*•·]|\d+[.、)])\s*(.+)$", line)
+        cand = (m.group(1) if m else line).strip().strip("「」\"'")
+        if not cand:
+            continue
+        if cand in ("无", "（无）", "(无)", "没有", "无值得记录的信息"):
+            continue
+        # 过滤掉模型自作主张加的标题/说明行
+        if re.match(r"^(以下是|根据|总结|说明|注意|对话片段|以上)", cand):
+            continue
+        # 门槛设 4 字：实测 5 字的事实（「甲是程序员」）完全有效，
+        # 设 6 会把它们全丢掉。4 字以下基本只有「嗯」「好的」，那是噪音。
+        if len(cand) < 4:
+            continue
+        out.append(cand[:200])
+    # 去重（按内容指纹）
+    seen, uniq = set(), []
+    for c in out:
+        f = fp(c)
+        if f in seen:
+            continue
+        seen.add(f)
+        uniq.append(c)
+    return uniq
+
+
+def _call_llm_via_acp(prompt, timeout=180):
+    """调一次模型。调用者是 reflection_llm.mjs（薄壳），失败抛异常。
+
+    返回值：提炼后的文本；调用不可用时抛 LLMRuntimeError / LLMUnavailable。
+    """
+    import subprocess
+    import tempfile
+
+    script = os.path.join(BASE, "reflection_llm.mjs")
+    if not os.path.exists(script):
+        raise LLMUnavailable(f"找不到 {script}")
+    node = os.environ.get("NODE_BIN") or "node"
+    with tempfile.TemporaryDirectory(prefix="refl-") as td:
+        pf = os.path.join(td, "prompt.txt")
+        of = os.path.join(td, "out.json")
+        with open(pf, "w", encoding="utf-8") as f:
+            f.write(prompt)
+        try:
+            proc = subprocess.run(
+                [node, script, "--prompt-file", pf, "--out-file", of,
+                 "--timeout", str(timeout)],
+                capture_output=True, text=True, timeout=timeout + 60,
+            )
+        except subprocess.TimeoutExpired:
+            raise LLMRuntimeError(f"模型调用超时（>{timeout + 60}s）")
+        if not os.path.exists(of):
+            raise LLMUnavailable(
+                f"模型调用未产出结果（exit={proc.returncode}）: "
+                f"{(proc.stderr or '')[-300:]}"
+            )
+        try:
+            with open(of, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            raise LLMRuntimeError(f"结果文件读不出来: {e}")
+        if not data.get("ok"):
+            msg = data.get("error") or "未知错误"
+            if proc.returncode == 2:
+                raise LLMUnavailable(msg)
+            raise LLMRuntimeError(msg)
+        return data.get("text") or ""
+
+
+class LLMUnavailable(Exception):
+    """模型不可用（没配置 / 起不来）。这种情况应静默退回非 LLM 模式。"""
+
+
+class LLMRuntimeError(Exception):
+    """模型可用但这次调用失败了（超时/报错）。不应污染已有记忆。"""
+
+
+def reflect(conn, peer, hours=24, n_min=2, n_max=5, use_llm=True,
+            timeout=180, llm_caller=None, dry_run=False):
+    """对某个 peer 最近一段 episodic 记忆做一次反思提炼。
+
+    幂等：被提炼过的 episodic 打 reflected=1，下次不会重复提炼。
+    失败安全：LLM 不可用 → 退回粗糙拼接法（consolidate 那套）；
+    LLM 调用出错 → 抛异常但**不改任何已有数据**（便于上层重试）。
+    """
+    cutoff = now_ts() - hours * 3600
+    items = conn.execute(
+        "SELECT * FROM entries WHERE peer=? AND retired=0 AND kind='episodic' "
+        "AND reflected=0 AND last_seen>=? ORDER BY last_seen ASC LIMIT 80",
+        (peer, cutoff),
+    ).fetchall()
+
+    result = {
+        "peer": peer, "scanned": len(items), "created": 0, "skipped": 0,
+        "mode": "none", "summaries": [], "error": None,
+    }
+    if not items:
+        return result
+
+    prompt = _prompt_for_reflection(items, n_min, n_max)
+    summaries = []
+    mode = "llm"
+
+    if use_llm:
+        caller = llm_caller or _call_llm_via_acp
+        try:
+            raw = caller(prompt, timeout)
+            summaries = _parse_reflection(raw)[:n_max]
+            if not summaries:
+                # 模型说「无」时是正常结果，不是失败
+                mode = "llm-empty"
+        except LLMUnavailable as e:
+            mode = "fallback"
+            result["error"] = f"LLM 不可用，退回拼接法: {e}"
+        except LLMRuntimeError as e:
+            # 调用失败：不改任何数据，让上层下轮重试
+            result["error"] = f"LLM 调用失败: {e}"
+            result["mode"] = "error"
+            return result
+        except Exception as e:
+            result["error"] = f"意外错误: {e}"
+            result["mode"] = "error"
+            return result
+    else:
+        mode = "fallback"
+
+    if mode in ("fallback", "none"):
+        # 粗糙拼接（老 consolidate 的思路）：同关键词的几条并一句
+        buckets = {}
+        for r in items:
+            if r["importance"] < 0.45:
+                continue
+            key = None
+            for tk in tokenize(r["text"]):
+                if len(tk) >= 2 and tk in IMPORTANT_WORDS:
+                    key = tk
+                    break
+            if key:
+                buckets.setdefault(key, []).append(r)
+        for key, rows in buckets.items():
+            if len(rows) < 2:
+                continue
+            joined = "；".join(i["text"][:60] for i in rows[:3])
+            summaries.append(f"[关于「{key}」的几条] {joined}")
+        mode = "fallback"
+        if not summaries:
+            result["mode"] = mode
+            result["skipped"] = len(items)
+            return result
+
+    if dry_run:
+        result["mode"] = mode + "-dry"
+        result["summaries"] = summaries
+        return result
+
+    created = 0
+    for text in summaries:
+        imp = max(estimate_importance(text), 0.65)  # 反思产物天然比单条闲聊重要
+        rid = remember(conn, peer, text, kind="semantic", importance=imp)
+        if rid:
+            created += 1
+    # 打标记（无论提炼出几条，这批都算处理过，避免反复扫同批）
+    ids = [r["id"] for r in items]
+    for chunk_start in range(0, len(ids), 200):
+        chunk = ids[chunk_start:chunk_start + 200]
+        conn.execute(
+            f"UPDATE entries SET reflected=1 WHERE id IN ({','.join('?' * len(chunk))})",
+            chunk,
+        )
+    conn.commit()
+
+    result["created"] = created
+    result["mode"] = mode
+    result["summaries"] = summaries
+    return result
+
+
+def reflect_all(conn, hours=24, n_min=2, n_max=5, use_llm=True, timeout=180,
+                llm_caller=None, dry_run=False):
+    """对所有有未反思 episodic 的 peer 跑一遍。"""
+    peers = [r["peer"] for r in conn.execute(
+        "SELECT DISTINCT peer FROM entries WHERE retired=0 AND kind='episodic' "
+        "AND reflected=0 AND last_seen>=?", (now_ts() - hours * 3600,)
+    )]
+    out = []
+    for peer in peers:
+        out.append(reflect(conn, peer, hours, n_min, n_max, use_llm, timeout,
+                           llm_caller=llm_caller, dry_run=dry_run))
+    return out
+
+
 def digest(conn):
     """生成 digest.md：按三层 + 重要性排序，不是按时间堆砌。"""
     peers = [r["peer"] for r in conn.execute(
@@ -559,7 +805,16 @@ def main():
     p = sub.add_parser("prune", help="归档低分记忆")
     p.add_argument("--cutoff", type=float, default=0.15)
 
-    sub.add_parser("consolidate", help="情节→语义提炼")
+    sub.add_parser("consolidate", help="情节→语义提炼（粗糙拼接，不调模型）")
+
+    p = sub.add_parser("reflect", help="定期反思：调模型把情节真正提炼成语义记忆")
+    p.add_argument("--peer", default=None, help="只反思某个 peer（默认全部）")
+    p.add_argument("--hours", type=float, default=24, help="回看最近多少小时（默认24）")
+    p.add_argument("--n-min", type=int, default=2, help="至少提炼几条")
+    p.add_argument("--n-max", type=int, default=5, help="最多提炼几条")
+    p.add_argument("--no-llm", action="store_true", help="不调模型，退回粗糙拼接")
+    p.add_argument("--timeout", type=int, default=180, help="模型调用超时（秒）")
+    p.add_argument("--dry-run", action="store_true", help="只打印提炼结果，不写库")
 
     p = sub.add_parser("remember", help="手动记一条")
     p.add_argument("text")
@@ -588,6 +843,17 @@ def main():
         print(f"归档 {prune(conn, a.cutoff)} 条")
     elif a.cmd == "consolidate":
         print(f"生成 {consolidate(conn)} 条语义记忆")
+    elif a.cmd == "reflect":
+        kwargs = dict(hours=a.hours, n_min=a.n_min, n_max=a.n_max,
+                      use_llm=not a.no_llm, timeout=a.timeout, dry_run=a.dry_run)
+        results = ([reflect(conn, a.peer, **kwargs)] if a.peer
+                   else reflect_all(conn, **kwargs))
+        for r in results:
+            print(f"[{r['peer']}] 扫描 {r['scanned']} 条 · 模式 {r['mode']} · 新建 {r['created']} 条")
+            if r.get("error"):
+                print(f"    ⚠ {r['error']}")
+            for sm in r.get("summaries") or []:
+                print(f"    + {sm}")
     elif a.cmd == "remember":
         rid = remember(conn, a.peer, a.text, kind=a.kind, pin=a.pin)
         conn.commit()
