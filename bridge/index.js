@@ -1565,7 +1565,11 @@ async function proactiveSpeak (peerKey, peer, action) {
       `你的 QQ 号：${gateway.selfId ?? '未知'}`,
       `【硬约束】[SEND_FILE] 只放行会话工作区与暂存目录内的文件；要发图走 qq-meme skill。`,
     ].filter(x => x !== '')
-    const { text } = await dsh.prompt(PROTOCOL === 'acp' ? peerKey + ':proactive' : peerKey + ':proactive', [{ type: 'text', text: lines.join('\n') }])
+    // 主动搭话复用**同一个**会话（peerKey），不另开 `:proactive` 分身。
+    // 曾经用过 peerKey+':proactive'，后果：① state 里多出一个 turns=0 的僵尸键
+    // ② ACP 每次都要新建会话，Session 目录无限膨胀 ③ 它看不到正常对话的上下文，
+    //   主动开口时容易说出「我们刚才说到哪来着」这种失忆话。
+    const { text } = await dsh.prompt(peerKey, [{ type: 'text', text: lines.join('\n') }])
     const silent = /\[SILENT\]/i.test(text || '')
     const body = (text || '').replace(/\[SILENT\]/gi, '').trim()
     if (silent || !body) {
