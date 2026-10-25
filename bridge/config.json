@@ -188,9 +188,7 @@
     "ceil": 1.0
   },
   "replyDelay": {
-    "enabled": false,
-    "minMs": 1500,
-    "maxMs": 12000
+    "enabled": true
   },
   "security": {
     "allowPrivateUrls": false,

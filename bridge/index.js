@@ -113,6 +113,8 @@ const POKE_RE = /\[POKE:(\d+)(?::(c2c|group))?\]/g
 // 语音（TTS）：模型输出 [VOICE:要说的文字] 或 [VOICE:文字:音色id]
 // 桥调 QQ 内置 AI 音色把文字合成语音，以 record 消息发出去。
 // 只支持群聊（NapCat 的 send_group_ai_record 仅群）；私聊自动降级为普通文字。
+// 「补一句」：主消息发完后隔一会儿再补一条（真人说漏了又补 / 想起来补充）
+const FOLLOW_RE = /\[FOLLOW:\s*([^\]]+?)\s*\]/g
 const VOICE_RE = /\[VOICE:\s*([^\]:]+?)(?::([^\]:\]]+?))?\s*\]/g
 const VOICE_MAX_CHARS = 120        // AI 语音单条上限（太长会被截断/拒绝）
 const DEFAULT_AUDIO_CHARACTER = 'lucy-voice-male1' // 憨憨小弟，与「白嫖吉祥物」自嘲定位最搭
@@ -1410,24 +1412,52 @@ function detectMoodTriggers (text, { addressed = false, atMe = false } = {}) {
 // 需求：「回话有快有慢，太匀速反而假」。
 // 默认关（容易让人以为掉线），开启后对**被 @ / 私聊**的回复加一个短随机延迟。
 const DELAY_DEFAULTS = {
-  enabled: false,
-  minMs: 1500,
-  maxMs: 12000,
-  // 短消息（几个字）延迟更小，长回复延迟更自然
-  shortMsgMs: 60000,
+  enabled: true,
+  // 按「打字」算，不是纯随机：
+  //   总时长 = 反应时间 + 字数 × 每字耗时，再加抖动
+  // 真人「嗯」秒回；一段话要打一会儿。这才是"回话有快有慢"的真实来源。
+  reactMs: 1200,         // 看到消息后的反应时间
+  perCharMs: 110,        // 每字大约打多久（中文输入法约 9 字/10 秒）
+  minMs: 900,            // 兜底最短
+  maxMs: 15000,          // 兜底最长（再长像掉线）
+  jitterRatio: 0.35,     // 抖动 ±35%
+  energySlow: 0.6,       // 精力见底时打字速度乘数（0.6 = 慢 1.67 倍）
+  arousalFast: 0.55,     // 情绪最亢奋时打字速度乘数（0.55 = 快近 2 倍）
 }
 
 function delayCfg () { return { ...DELAY_DEFAULTS, ...(config.replyDelay ?? {}) } }
 
-/** 算一个回复延迟（毫秒）。enabled=false 时返回 0。 */
-function replyDelayMs (text) {
+/**
+ * 算一个回复延迟（毫秒）。按字数算打字时间，再叠加精力/情绪。
+ * @param {string} text 要发的内容
+ * @param {string} [peerKey] 传了就把精力（累了慢）和情绪（亢奋快）算进去
+ */
+function replyDelayMs (text, peerKey) {
   const c = delayCfg()
   if (!c.enabled) return 0
-  // 短回复本来就该快（"在""好"这种，1-4 秒足够）
-  const short = (text ?? '').length < 8
-  const lo = short ? Math.min(800, c.minMs) : c.minMs
-  const hi = short ? Math.min(4000, c.maxMs) : c.maxMs
-  return Math.round(lo + Math.random() * Math.max(0, hi - lo))
+  const len = Array.from(String(text ?? '')).length
+  let ms = c.reactMs + len * c.perCharMs
+
+  if (peerKey) {
+    try {
+      // 精力低 → 打字慢
+      const e = energyState(peerKey)
+      if (e) {
+        const t = Math.max(0, Math.min(1, e.value))
+        ms *= 1 + (1 - t) * (1 / c.energySlow - 1)
+      }
+      // 情绪亢奋 → 打字快
+      const m = moodState(peerKey)
+      if (m && m.arousal > 0.5) {
+        // arousal 0.5 → ×1；1.0 → ×c.arousalFast（线性）
+        const t = Math.min(1, (m.arousal - 0.5) / 0.5)
+        ms *= 1 - t * (1 - c.arousalFast)
+      }
+    } catch { /* 状态取不到就跳过，别影响发送 */ }
+  }
+
+  ms *= 1 + (Math.random() * 2 - 1) * c.jitterRatio
+  return Math.round(Math.max(c.minMs, Math.min(c.maxMs, ms)))
 }
 
 let proactiveTimer = null
@@ -1562,6 +1592,35 @@ async function proactiveSpeak (peerKey, peer, action) {
   } finally {
     busy.delete(peerKey)
   }
+}
+
+/**
+ * 读记忆摘要里**属于这个对端**的部分。
+ * digest.md 按 `## c2c-<qq>` / `## group-<群号>` 分节，别把别的会话的事串进来。
+ */
+function readMemoryDigestFor (peerKey) {
+  try {
+    const p = path.join(config.dsh.cwd, 'memory', 'digest.md')
+    if (!fs.existsSync(p)) return ''
+    const raw = fs.readFileSync(p, 'utf8')
+    // peerKey 形如 c2c:3022464706 / group:1017567471 → 节名 c2c-3022464706 / group-1017567471
+    const sectionKey = peerKey.replace(':', '-')
+    const lines = raw.split('\n')
+    let out = []
+    let inSection = false
+    for (const line of lines) {
+      if (line.startsWith('## ')) {
+        // 进入新的节
+        inSection = line.slice(3).trim() === sectionKey
+        if (inSection) out.push(line)
+        continue
+      }
+      if (inSection) out.push(line)
+    }
+    const text = out.join('\n').trim()
+    if (!text) return ''
+    return text.length > 1200 ? text.slice(0, 1200) + '\n…（截断）' : text
+  } catch { return '' }
 }
 
 /** 读记忆摘要（吉祥物自己维护的 memory/digest.md），读不到就返回空。 */
@@ -2043,6 +2102,16 @@ async function handleInbound(evt) {
     if (eh) contextLines.push('', eh)
     const mh = moodHint(peerKey)
     if (mh) contextLines.push(mh)
+    // 记忆摘要：让它在正常对话里也能"想起以前的事"，而不是只在主动搭话时才看
+    const mem = readMemoryDigestFor(peerKey)
+    if (mem) {
+      contextLines.push(
+        '',
+        '【你记得的事】以下是你的见闻录摘要（memory/digest.md 的相关部分）：',
+        mem,
+        '提到以前的事就照着说，不确定就别硬编。想翻更细的可以 read memory/ 下的文件。',
+      )
+    }
     contextLines.push(
       `【硬约束】QQ 通道不认 [表情: 描述] 文字标记；要发表情包必须用 qq-meme skill 发送真实图片文件并输出 [SEND_FILE: 绝对路径]。`,
       `【硬约束】[SEND_FILE] 只放行会话工作区 (${config.dsh.cwd}) 与暂存目录 (${STAGING_DIR}) 内的文件。`,
@@ -2176,6 +2245,15 @@ async function handleInbound(evt) {
       return ''
     }).trim()
 
+    // 「补一句」：抽出来，主消息发完后再补发（真人说漏了又补）
+    const follows = []
+    FOLLOW_RE.lastIndex = 0
+    textForSend = textForSend.replace(FOLLOW_RE, (_all, t) => {
+      const v = String(t).trim()
+      if (v) follows.push(v)
+      return ''
+    }).trim()
+
     const { files, text: plain } = extractSendFiles(textForSend)
 
     if (!addressed && (silentMarked || (!plain && files.length === 0 && pokes.length === 0 && voices.length === 0))) {
@@ -2196,7 +2274,7 @@ async function handleInbound(evt) {
     }
 
     // 回话延迟（v2-2）：让回复节奏有快有慢，不是每条都秒回
-    const dly = replyDelayMs(cappedPlain || '')
+    const dly = replyDelayMs(cappedPlain || '', peerKey)
     if (dly > 0) {
       logger.log(`replyDelay ${peerKey}: ${dly}ms（模拟人打字的时间）`)
       await sleep(dly)
@@ -2211,7 +2289,14 @@ async function handleInbound(evt) {
       await sendVoiceTo(peer, v.text, v.character)
       await sleep(400)
     }
-    for (const p of pokes) {
+        // 补发的几句：间隔像真人想了一下（1.2-3.5 秒）
+    for (const f of follows.slice(0, 2)) {
+      await sleep(1200 + Math.random() * 2300)
+      await sendTextTo(peer, f)
+      logger.log(`follow ${peerKey}: 补发一句 ${JSON.stringify(f.slice(0, 40))}`)
+    }
+
+for (const p of pokes) {
       // 默认 @/戳 对端；显式 scope=c2c 时强制私聊戳
       await sendPokeTo(peer, p.qq, p.scope === 'c2c' ? 'c2c' : undefined)
       await sleep(300)
