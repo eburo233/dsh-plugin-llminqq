@@ -34,3 +34,7 @@ qq-agent/memory/log/
 
 # ASR 临时音频（转写完就该清，不进库）
 qq-agent/tools/tmp/
+
+# Python 缓存
+__pycache__/
+*.pyc
