@@ -53,6 +53,25 @@ for t in "${SUITES[@]}"; do
   fi
 done
 
+# Python 记忆系统测试（隔离到临时库）
+echo
+echo "== 2.5 记忆系统测试 =="
+for t in test_memctl test_outbound; do
+  f="qq-agent/memory/${t}.py"
+  [ -f "$f" ] || { echo "  ⚠ $t (缺文件)"; continue; }
+  out=$(python3 "$f" 2>&1)
+  line=$(printf '%s' "$out" | grep -E "^结果:" | tail -1)
+  if printf '%s' "$line" | grep -q "0 失败"; then
+    echo "  ✓ $t  ${line}"
+    n=$(printf '%s' "$line" | grep -oE "[0-9]+ 通过" | grep -oE "[0-9]+")
+    total_pass=$((total_pass + ${n:-0}))
+  else
+    echo "  ✗ $t  ${line:-（跑失败）}"
+    printf '%s\n' "$out" | tail -5 | sed 's/^/      /'
+    total_fail=$((total_fail + 1))
+  fi
+done
+
 echo
 if [ "$total_fail" != "0" ]; then
   echo "❌ 有 $total_fail 个套件失败，拒绝提交。"

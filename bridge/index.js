@@ -2221,6 +2221,13 @@ async function handleInbound(evt) {
     energyDrop(peerKey)
     saveState()
     logger.log(`本轮完成 ${peerKey} ${Math.round((Date.now() - started) / 1000)}s 回复长度=${text.length}`)
+    // 把回复**内容**也写进日志（截断到 500 字）：
+    // 记忆系统只抓入站消息的话，就只剩「对方说了什么」，看不到「我回了什么」，
+    // 于是记不住自己的态度/承诺/说过的话 —— 这是「记忆简陋」的根因之一。
+    if (text && text.trim()) {
+      const forLog = text.replace(/\s+/g, ' ').slice(0, 500).replace(/"/g, '\\"')
+      logger.log(`出站 ${peerKey} text="${forLog}" chars=${text.length}`)
+    }
 
     // 旁听模式下模型可以选择沉默：
     //   - 输出 [SILENT] → 明确表示不接
