@@ -21,6 +21,11 @@
         "reasoningEffort": "high"
       },
       {
+        "provider": "qodercn",
+        "model": "dfmodel",
+        "reasoningEffort": "high"
+      },
+      {
         "provider": "trae",
         "model": "kimi-k3",
         "reasoningEffort": "high"
