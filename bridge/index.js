@@ -1248,6 +1248,9 @@ const ENERGY_DEFAULTS = {
   perHourRestore: 0.15, // 每静默一小时回升多少
   floor: 0.15,
   ceil: 1.0,
+  // 情绪联动：心情高涨时精力掉得少，低落时掉得多（见 moodEnergyFactor）
+  moodLinked: true,
+  moodLinkRange: 0.6,   // ±60%：最好心情 = 0.4x 消耗，最差 = 1.6x
 }
 
 function energyCfg () { return { ...ENERGY_DEFAULTS, ...(config.energy ?? {}) } }
@@ -1267,13 +1270,42 @@ function energyState (peerKey) {
 }
 
 /** 发了一条 → 精力下降。 */
+/**
+ * 情绪 → 精力的联动系数。
+ *
+ * 设计：**心情高涨时说话不费劲，心情低落时说话特别累**。
+ * 有生活依据：开心的时候聊天是回血，闷的时候回一句话都觉得耗。
+ *
+ * 把心情（valence + arousal）映射到约 0.4x ~ 1.6x 的消耗倍率：
+ *   心情好 → 倍率低（掉得少）；心情差 → 倍率高（掉得多）
+ *   中性心情 ≈ 1.0x（不改变原有手感）
+ *
+ * @returns {number} 消耗倍率（1 = 中性）
+ */
+function moodEnergyFactor (peerKey) {
+  const c = energyCfg()
+  if (c.moodLinked === false) return 1
+  const m = moodState(peerKey)
+  if (!m) return 1
+  const cr = c.moodLinkRange ?? 0.6
+  // 合成 -1..1 的「情绪好坏」：valence 占 70%，arousal 占 30%
+  // （arousal 高本身不代表好——焦虑也高，但 valence 正时它就是「来劲」）
+  const moodScore = Math.max(-1, Math.min(1, m.valence * 0.7 + (m.arousal - 0.5) * 2 * 0.3))
+  const factor = 1 - moodScore * cr
+  return Math.max(0.2, Math.min(2.0, factor))
+}
+
 function energyDrop (peerKey) {
   const c = energyCfg()
   if (!c.enabled) return
   const e = energyState(peerKey)
   if (!e) return
-  e.value = Math.max(c.floor, e.value - c.perMsgDrop)
+  // 情绪联动：心情好掉得少、心情差掉得多
+  const factor = moodEnergyFactor(peerKey)
+  const drop = c.perMsgDrop * factor
+  e.value = Math.max(c.floor, e.value - drop)
   e.at = Date.now()
+  logger.debug?.(`energyDrop ${peerKey}: ${c.perMsgDrop.toFixed(3)} × 情绪${factor.toFixed(2)} = 掉 ${drop.toFixed(3)}`)
   saveState()
 }
 
@@ -1309,7 +1341,18 @@ function energyHint (peerKey) {
     : v >= 0.4 ? '控制在 40 字以内'
     : v >= 0.25 ? '控制在 20 字以内'
     : '控制在 10 字以内，能一句就一句'
-  return `【你的精力】约 ${Math.round(v * 100)}%（${desc}，${cap}）。这是倾向不是禁令。`
+  // 情绪联动也要让它知道：说得起劲所以不累，还是心情闷所以更累。
+  // 不写清楚的话，模型无法解释「为什么同样聊了 10 句，这次特别累」。
+  let moodNote = ''
+  const m = moodState(peerKey)
+  if (m && c.moodLinked !== false) {
+    const f = moodEnergyFactor(peerKey)
+    if (f <= 0.65) moodNote = '（你现在聊得挺起劲，说话不怎么耗）'
+    else if (f >= 1.35) moodNote = '（心情不太好，说话格外费劲）'
+    else if (f <= 0.85) moodNote = '（心情不错，还算有劲）'
+    else if (f >= 1.15) moodNote = '（有点闷，说话比平时累）'
+  }
+  return `【你的精力】约 ${Math.round(v * 100)}%（${desc}，${cap}）${moodNote}。这是倾向不是禁令。`
 }
 
 // 低精力时的硬性字数上限（兜底，防止模型无视提示）
