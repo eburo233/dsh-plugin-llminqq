@@ -11,6 +11,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import http from 'node:http'
 import { fileURLToPath } from 'node:url'
+import { execFileSync } from 'node:child_process'
 import { OneBotGateway } from './onebot.js'
 import { DshRuntime } from './dsh.js'
 import { AcpRuntime } from './acp.js'
@@ -1527,10 +1528,19 @@ async function proactiveTick () {
       st.lastSpokeAt = Date.now()
       st.cooldownUntil = Date.now() + c.cooldownMin * 60000
     } else {
-      // 空转（评估过但找不到话题）→ 计为未命中
-      st.p = Math.min(c.maxProb, st.p + c.step)
-      st.missStreak += 1
-      logger.log(`proactive[${peerKey}] 空转（找不到合适话题），计为未命中`)
+      // 空转（模型评估过但确实没话说）→ **不累加 missStreak**。
+      //
+      // 这是一个真实的设计缺陷（2026-10-26 实测）：原来空转也被算作未命中，
+      // 导致「保底 → 模型没话说 → 空转 → streak+1 → 更快触发保底 → 又没话说」
+      // 的死循环。实测 missStreak 一路涨到 7，p 涨到 45%，连保底 3 次都空转。
+      //
+      // 语义上：missStreak 应该表示「运气不好，一直没抽中」，
+      // 而空转是「抽中了但内容上确实没什么可说的」——两者不该混为一谈。
+      // 所以：空转只轻微抬 p（让下次更容易抽中，给新话题一个机会），不动 streak。
+      st.p = Math.min(c.maxProb, st.p + c.step * 0.5)
+      st.empties = (st.empties ?? 0) + 1
+      st.lastEmptyAt = Date.now()
+      logger.log(`proactive[${peerKey}] 空转（真没话说），不累加 missStreak（当前 ${st.missStreak}，空转累计 ${st.empties}）`)
     }
     saveState()
   }
@@ -1547,6 +1557,10 @@ async function proactiveSpeak (peerKey, peer, action) {
     const persona = readPersona()
     const ps = state.peers[peerKey]
     const memDigest = readMemoryDigest()
+    // 从记忆里生成候选话题线索（这是解决「没话说就空转」的关键）
+    const hints = buildTopicHints(peerKey)
+    const hintText = topicHintText(hints)
+    if (hintText) logger.log(`proactive[${peerKey}] 话题线索: 未了结${hints.pending.length} 时间锚${hints.timeAnchor.length} 偏好${hints.preference.length}`)
     const lines = [
       persona.text ? `【人设】未变化，仍以 ${PERSONA_PATH} 为准（需要复查就 read 该文件）。` : `【人设文件缺失】${PERSONA_PATH}`,
       '',
@@ -1554,10 +1568,23 @@ async function proactiveSpeak (peerKey, peer, action) {
       `你在私聊（QQ号 ${peerKey.slice(4)}）里，对方已经 ${ps?.proactive?.lastSpokeAt ? Math.floor((Date.now() - ps.proactive.lastSpokeAt) / 60000) + ' 分钟' : '很久'} 没跟你说话了。`,
       `你自己已经安静了同样的时间。现在你可以考虑主动说一句。`,
       '',
+      hintText ? `【你可以聊的线索】（从你自己的记忆里翻出来的）\n${hintText}` : '',
+      '',
       '【怎么做】',
-      '- 先翻你记得的最近聊过什么，找能接的口子：他问过但没答完的事、上次没说完的话题、他提过的事现在有后续',
-      '- 也可以自己起个新话题，或者直接问他一句',
-      '- 找不到合适的就是**空转**：只输出 `[SILENT]`，别硬聊。宁可不出声。',
+      '**优先**从上面的线索里挑一条开口，比如：',
+      '  - 未了结的事 → 问一句后续（「上次说的那个事后来咋样了」）',
+      '  - 时间锚 → 核对现在时间，过了就问结果，没到就提个醒',
+      '  - 偏好 → 顺着他的兴趣起个话头',
+      '',
+      '**线索都用完了**（或者根本不合适）→ 就自己想一个：',
+      '  - 你最近在想/在学/刚知道的事（B站看到的梗、查到的东西）',
+      '  - 他以前说过但你当时没深问的',
+      '  - 一件小事、一个疑问、一句随口的感想都行',
+      '',
+      '**什么时候才该空转**：',
+      '  - 你确实连一个像样的话头都想不出来（这很少见，通常总有点什么可说）',
+      '  - 或者现在这个时间点开口明显不合适（比如深夜他可能在睡）',
+      '  - 空转就只输出 `[SILENT]`。**但别轻易用**——你已经有段时间没说话了。',
       '- 私聊没有每日上限，但别刷屏；发一条就够',
       '- 格式不限（文字/图/语音按平时分寸），不为了刷存在感硬发',
       '',
@@ -1602,6 +1629,58 @@ async function proactiveSpeak (peerKey, peer, action) {
  * 读记忆摘要里**属于这个对端**的部分。
  * digest.md 按 `## c2c-<qq>` / `## group-<群号>` 分节，别把别的会话的事串进来。
  */
+// ── 新话题联想（给主动搭话用）──────────────────────────────────────────────
+// 为什么需要：实测「保底 → 模型没话说 → 空转」的死循环（2026-10-26）。
+// 光给记忆摘要不够——摘要告诉他「发生过什么」，但没告诉他「可以聊什么」。
+// 所以这里主动从记忆里**生成候选话题线索**，按三类组织：
+//   ① 未了结的事（他提过但没后续 / 我答应过但没做）
+//   ② 时间锚（他提过某个日期/时间，可能已经到点了）
+//   ③ 他的偏好/雷点（可以顺着偏好的方向起话题，避开雷点）
+// 这些是**线索不是答案**，模型自己决定用不用、怎么说。
+const TOPIC_PATTERNS = {
+  pending: /(待办|还没|未完成|答应|承诺|一会儿|稍后|回头|下次|等我|等我忙完|打算|计划|想加|要加|TODO)/i,
+  timeAnchor: /(明天|后天|下周|周[一二三四五六日]|\d{1,2}[月日]|\d{1,2}[:：]\d{2}|\d{1,2}点)/,
+  preference: /(喜欢|讨厌|偏好|习惯|爱|不爱|雷|别|不要|受不了)/,
+}
+
+function buildTopicHints (peerKey, limit = 6) {
+  const out = { pending: [], timeAnchor: [], preference: [] }
+  try {
+    const memctl = path.join(config.dsh.cwd, 'memory', 'memctl.py')
+    if (!fs.existsSync(memctl)) return out
+    const py = execFileSync('python3', [memctl, 'recall', '--peer', peerKey.replace(':', '-'), '--top', '30'],
+      { encoding: 'utf8', timeout: 15000 })
+    for (const line of String(py).split('\n')) {
+      const m = /^\[[\d.]+\]\s+\((\w+),[^)]*\)\s+(.*)$/.exec(line.replace(/\r$/, ''))
+      if (!m) continue
+      const text = m[2].trim()
+      if (!text || text.length < 8) continue
+      if (TOPIC_PATTERNS.pending.test(text) && out.pending.length < limit) out.pending.push(text)
+      else if (TOPIC_PATTERNS.timeAnchor.test(text) && out.timeAnchor.length < limit) out.timeAnchor.push(text)
+      else if (TOPIC_PATTERNS.preference.test(text) && out.preference.length < limit) out.preference.push(text)
+    }
+  } catch (err) {
+    // 拿不到线索不算错 —— 主动搭话照常进行，只是少点灵感
+    logger.log(`topicHints 读取失败（不影响搭话）: ${String(err.message).slice(0, 80)}`)
+  }
+  return out
+}
+
+/** 把话题线索拼成 prompt 片段 */
+function topicHintText (hints) {
+  const parts = []
+  const fmt = (arr, title, tip) => {
+    if (!arr.length) return
+    parts.push(`【${title}】`)
+    for (const t of arr.slice(0, 4)) parts.push(`  - ${t.slice(0, 80)}`)
+    if (tip) parts.push(`  ${tip}`)
+  }
+  fmt(hints.pending, '未了结的事（可以问后续）', '答应过/提过但没下文的，问一句很自然。')
+  fmt(hints.timeAnchor, '有时间标记的事（可能到点了）', '核对当前时间：过了就问结果，没到别抢跑。')
+  fmt(hints.preference, '他的偏好和雷点', '顺着偏好起话题；雷点避开，别主动踩。')
+  return parts.join('\n')
+}
+
 function readMemoryDigestFor (peerKey) {
   try {
     const p = path.join(config.dsh.cwd, 'memory', 'digest.md')
