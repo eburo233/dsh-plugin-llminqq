@@ -798,7 +798,33 @@ function textToSegments(text) {
   return segs
 }
 
+/**
+ * 整理出站文本里的换行。
+ *
+ * 为什么需要：模型经常输出「第一句\n\n第二句」——那是**写文章的排版**（段落之间空行）。
+ * 但 QQ 聊天里空一行读起来像发邮件/写周报，不像真人随口说话。
+ * 真人连说两句要么换行直接接，要么干脆一句话。
+ *
+ * 规则（保守，只动空行，不动单换行）：
+ *   - 连续 2 个以上换行 → 压成 1 个换行（段距变行距）
+ *   - 行首行尾空白去掉
+ *   - 不合并单换行（那是有意的分行，比如 1. 2. 3. 列表）
+ */
+function tidyLineBreaks (text) {
+  if (typeof text !== 'string' || !text) return text
+  return text
+    .replace(/\r\n?/g, '\n')          // 统一 LF
+    .replace(/[ \t]+$/gm, '')          // 行尾空白
+    .replace(/[ \t]{2,}/g, ' ')        // 行内多空格压一个
+    .replace(/\n{2,}/g, '\n')          // **核心：连续空行压成单换行**
+    .replace(/^\n+|\n+$/g, '')         // 首尾空行去掉
+    .trim()
+}
+
 async function sendTextTo(peer, text) {
+  if (!text) return
+  // 出站前统一整理换行（所有发送路径都走这里）
+  text = tidyLineBreaks(text)
   if (!text) return
   const max = config.policy.maxReplyChars ?? 1500
   // 分块时按纯文本长度算，保留 [AT] 标记
