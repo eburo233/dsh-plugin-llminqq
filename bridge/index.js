@@ -2870,10 +2870,36 @@ function startApiServer() {
         peers: Object.keys(state.peers).length,
         busy: [...busy],
         persona: { path: PERSONA_PATH, exists: !!readPersona().text },
+        recall: {
+          ttlMs: RECALL_TTL_MS, maxPerMinute: RECALL_RATE_MAX, historyMax: RECALL_HISTORY_MAX,
+          trackedPeers: sentMessages.size,
+        },
         sessions: state.peers,
       })
     }
     if (url.pathname === '/peers') return send(200, { ok: true, peers: state.peers })
+    // 运维/自测用：看某个 peer 最近发过哪些消息（撤回历史）+ 手动触发一次撤回。
+    // 和 /send 一样走同一份逻辑，不额外开权限面；token 保护由上面统一拦。
+    if (url.pathname === '/sent') {
+      const peer = { id: String(url.searchParams.get('peerId') ?? ''), scope: url.searchParams.get('scope') ?? 'group' }
+      if (!peer.id) return send(400, { ok: false, error: 'peerId required' })
+      const list = (sentMessages.get(recallKeyOf(peer)) ?? []).map(x => ({ message_id: x.message_id, kind: x.kind, ageMs: Date.now() - x.ts }))
+      return send(200, { ok: true, peer: recallKeyOf(peer), sent: list })
+    }
+    if (url.pathname === '/recall' && req.method === 'POST') {
+      let body = ''
+      for await (const chunk of req) body += chunk
+      let payload
+      try { payload = JSON.parse(body) } catch { return send(400, { ok: false, error: 'bad json' }) }
+      const peer = { id: String(payload.peerId ?? payload.groupId ?? payload.userId ?? ''), scope: payload.scope ?? (payload.groupId ? 'group' : 'c2c') }
+      if (!peer.id || peer.id === 'undefined') return send(400, { ok: false, error: 'peerId required' })
+      const idx = payload.index ?? (payload.last ? 1 : NaN)
+      if (!Number.isInteger(Number(idx)) || Number(idx) < 1) return send(400, { ok: false, error: 'index (>=1) required' })
+      try {
+        const r = await performRecall(peer, Number(idx))
+        return send(r.ok ? 200 : 409, { ok: r.ok, index: r.index, detail: r.detail })
+      } catch (err) { return send(500, { ok: false, error: err.message }) }
+    }
     if (url.pathname === '/send' && req.method === 'POST') {
       let body = ''
       for await (const chunk of req) body += chunk
