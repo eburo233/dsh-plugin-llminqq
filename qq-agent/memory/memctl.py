@@ -118,6 +118,61 @@ def fp(text):
     return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
 
 
+# ── 按人归集（owner / visibility / is_self）─────────────────────────────────
+# 为什么要有 owner：记忆原来只按「会话」（peer）分开 —— c2c-3022464706 和
+# group-1017567471 是两个互不相通的抽屉。于是**同一个人**在私聊说的事，
+# 群里聊天时想不起来。owner 把记忆从「按会话」改成「按人」归集，
+# peer 退回成「这条是在哪个通道发生的」这个属性。
+#
+# 三个字段的语义（别混）：
+#   owner      这条记忆**关于谁 / 谁说的**（QQ 号字符串）。群聊记忆 = 发言人 QQ。
+#              NULL = 归属未知（出站行 = 我自己说的；群聊反思摘要 = 多说话人混一起）。
+#   visibility 'dm_only'（只在私聊提过，群里别说）/'public'（群里可说）/NULL（未标注，
+#              一律当 public —— 见 README：宁可在群里多说一句，也不瞎标 dm_only 让它不敢说）。
+#   is_self    1 = 这条是**我自己说的话**（出站）。它不属于对方的记忆画像，
+#              但需要能从「我说过什么」的视角单独取。
+
+VISIBILITY_DM_ONLY = "dm_only"
+VISIBILITY_PUBLIC = "public"
+
+
+def norm_text(text):
+    """归一化文本（去空白），用于跟日志原文对账。跟 fp() 的归一方式保持一致。"""
+    return re.sub(r"\s+", "", text or "")
+
+
+def owner_from_peer(peer):
+    """从 peer 推断「这条记忆属于谁」。
+
+    - `c2c-<qq>` → `<qq>`（私聊只有一个对话者，就是这个人）
+    - `group-<群号>` → None（群号不是人；发言人得另给）
+    - 其它（`manual` 等）→ None
+    """
+    if not peer:
+        return None
+    p = str(peer)
+    if p.startswith("c2c-"):
+        qq = p[len("c2c-"):].strip()
+        return qq or None
+    return None
+
+
+def normalize_visibility(v):
+    """把 visibility 规范成 'dm_only' / 'public' / None（NULL 语义当 public）。"""
+    if v is None:
+        return None
+    v = str(v).strip().lower()
+    if v in ("dm_only", "dmonly", "dm", "private"):
+        return VISIBILITY_DM_ONLY
+    if v in ("public", "pub", "group"):
+        return VISIBILITY_PUBLIC
+    return None
+
+
+def is_group_peer(peer):
+    return bool(peer) and str(peer).startswith("group-")
+
+
 def tokenize(text):
     """粗分词：中文按二元组，英文按词。不依赖分词库，够用。"""
     t = (text or "").lower()
@@ -246,6 +301,106 @@ def is_pin(text):
     return False
 
 
+def _speaker_index(log_dir=None):
+    """(peer, 归一化文本) → {发言人 QQ}。数据来自 memory/log/*.jsonl（ingest 写的入站原文）。
+
+    为什么能这么办：`RE_INBOUND` 一直捕获了 `from=昵称(QQ)`，只是 v3 之前
+    没把它传进 remember()，只写进了 jsonl。所以**老库里的群聊记忆是可以回填
+    发言人的**，不需要重放消息、也不需要猜。
+    """
+    idx = {}
+    d = log_dir or LOG_DIR
+    try:
+        names = sorted(n for n in os.listdir(d) if n.endswith(".jsonl"))
+    except OSError:
+        return idx
+    pat = re.compile(r"^(?P<peer>.+)-(?P<day>\d{4}-\d{2}-\d{2})\.jsonl$")
+    for name in names:
+        mo = pat.match(name)
+        if not mo:
+            continue
+        peer = mo.group("peer")
+        try:
+            with open(os.path.join(d, name), "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    txt, qq = rec.get("text"), rec.get("qq")
+                    if not txt or not qq:
+                        continue
+                    idx.setdefault((peer, norm_text(txt)), set()).add(str(qq))
+        except OSError:
+            continue
+    return idx
+
+
+def _outbound_index(path=None):
+    """(peer, 归一化文本) → 出现次数。来自 bridge.out 的出站行 = 我自己说的话。"""
+    idx = {}
+    p = path or BRIDGE_LOG
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                mo = RE_OUTBOUND.match(line.rstrip("\n"))
+                if not mo:
+                    continue
+                key = (mo.group("peer").replace(":", "-"), norm_text(mo.group("text")))
+                idx[key] = idx.get(key, 0) + 1
+    except OSError:
+        pass
+    return idx
+
+
+def backfill_owner(conn, log_dir=None, bridge_log=None):
+    """给已有条目回填 owner / visibility / is_self（v4 迁移用，只在加列时跑一次）。
+
+    回填规则（README 里记了实测覆盖率）：
+      1. 出站行（bridge.out 里 `出站 <peer> text="..."`）→ `is_self=1`、owner=NULL。
+         理由：那是我说的话，不属于「我知道对方什么」的画像；要用它按人检索
+         是另一件事（stylebank 负责）。
+      2. `c2c-<qq>` → owner=<qq>（私聊只有一个人）。
+      3. `group-<群号>` → 用 (peer, 文本) 在 memory/log/*.jsonl 里对出发言人 QQ；
+         同一句话被**多个**发言人说过 → owner=NULL（不瞎猜，记 ambiguous）。
+      4. 都对不上（群聊 reflection 摘要等多说话人混合内容）→ owner=NULL。
+    """
+    stats = {"scanned": 0, "c2c": 0, "group_matched": 0, "group_unmatched": 0,
+             "outbound": 0, "ambiguous": 0, "unnamed": 0}
+    speakers = _speaker_index(log_dir)
+    outs = _outbound_index(bridge_log)
+    rows = conn.execute("SELECT id, peer, text, is_self FROM entries").fetchall()
+    for r in rows:
+        stats["scanned"] += 1
+        key = (r["peer"], norm_text(r["text"]))
+        is_self = 1 if r["is_self"] or key in outs else 0
+        if is_self:
+            owner = None
+            stats["outbound"] += 1
+        else:
+            owner = owner_from_peer(r["peer"])
+            if owner:
+                stats["c2c"] += 1
+            elif is_group_peer(r["peer"]):
+                qqs = speakers.get(key) or set()
+                if len(qqs) == 1:
+                    owner = next(iter(qqs))
+                    stats["group_matched"] += 1
+                else:
+                    if len(qqs) > 1:
+                        stats["ambiguous"] += 1
+                    stats["group_unmatched"] += 1
+            else:
+                stats["unnamed"] += 1
+        conn.execute("UPDATE entries SET owner=?, is_self=? WHERE id=?",
+                     (owner, is_self, r["id"]))
+    conn.commit()
+    stats["owned"] = conn.execute(
+        "SELECT COUNT(*) FROM entries WHERE owner IS NOT NULL").fetchone()[0]
+    stats["total"] = stats["scanned"]
+    return stats
+
+
 def connect(db_path=None):
     """连库。db_path 显式传时用它 —— 测试必须传，否则会连到生产库。
 
@@ -270,7 +425,10 @@ def connect(db_path=None):
             created REAL NOT NULL,
             last_seen REAL NOT NULL,
             retired INTEGER NOT NULL DEFAULT 0,
-            reflected INTEGER NOT NULL DEFAULT 0
+            reflected INTEGER NOT NULL DEFAULT 0,
+            owner TEXT,
+            visibility TEXT,
+            is_self INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_peer ON entries(peer);
         CREATE INDEX IF NOT EXISTS idx_kind ON entries(kind);
@@ -281,6 +439,17 @@ def connect(db_path=None):
     fresh = "importance" not in cols
     if fresh:
         conn.execute("ALTER TABLE entries ADD COLUMN importance REAL NOT NULL DEFAULT 0.5")
+    # ── v4 迁移：按人归集（owner / visibility / is_self）──────────────────────
+    # 跟 importance 同样的模式：**只在列还不存在时迁移一次**。
+    # 千万别每次 connect 都跑回填 —— 回填要读 logs/bridge.out + memory/log/*.jsonl，
+    # 那是几百毫秒的活，而且会把手动标注过的 visibility 重算掉。
+    fresh_owner = "owner" not in cols
+    if fresh_owner:
+        conn.execute("ALTER TABLE entries ADD COLUMN owner TEXT")
+        conn.execute("ALTER TABLE entries ADD COLUMN visibility TEXT")
+        conn.execute("ALTER TABLE entries ADD COLUMN is_self INTEGER NOT NULL DEFAULT 0")
+    # 索引必须在加列之后建（老库这时才有 owner 列）
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_owner ON entries(owner)")
     # v1 的 kind（fact/person/topic/task/约定）→ v2 三层
     for old_k, new_k in [("fact", "episodic"), ("person", "semantic"),
                          ("topic", "episodic"), ("task", "procedural")]:
@@ -294,6 +463,8 @@ def connect(db_path=None):
             if r["pinned"]:
                 imp = max(imp, 0.8)
             conn.execute("UPDATE entries SET importance=? WHERE id=?", (imp, r["id"]))
+    if fresh_owner:
+        backfill_owner(conn)
     conn.commit()
     return conn
 
@@ -500,7 +671,16 @@ def combine(row, query_tokens=None, at=None, index=None):
     return base * strength
 
 
-def remember(conn, peer, text, kind=None, pin=False, ts=None, importance=None, outbound=False):
+def remember(conn, peer, text, kind=None, pin=False, ts=None, importance=None, outbound=False,
+             owner=None, visibility=None, is_self=None):
+    """记一条记忆。
+
+    v4 新增三个可选参数（全部有默认值，老调用点不受影响）：
+      owner      这条记忆关于谁（QQ 号）。不传 → `is_self` 为假时按 peer 推断
+                 （c2c-<qq> → qq；group-<群号> → None，群聊必须由调用方给发言人 QQ）
+      visibility 'dm_only' / 'public' / None（None 当 public）
+      is_self    1 = 我自己说的话。不传则跟 outbound 一致
+    """
     t = (text or "").strip()
     if not t or t in NOISE:
         return None
@@ -521,6 +701,12 @@ def remember(conn, peer, text, kind=None, pin=False, ts=None, importance=None, o
         # 钉住的确实重要，但别一律 0.95 —— 全一样的话 importance 就没区分度了。
         # 抬到至少 0.8，保留原有的高低差异。
         imp = max(imp, 0.8)
+    if is_self is None:
+        is_self = 1 if outbound else 0
+    # 自己的话不归给对端（语义见 README：记忆画像只装「关于他的事」）
+    if owner is None and not is_self:
+        owner = owner_from_peer(peer)
+    vis = normalize_visibility(visibility)
     row = conn.execute(
         "SELECT id FROM entries WHERE peer=? AND fp=?", (peer, f)
     ).fetchone()
@@ -528,14 +714,16 @@ def remember(conn, peer, text, kind=None, pin=False, ts=None, importance=None, o
         # 同一句话再次出现 → 强化（hits 增、强度回升、重要性取高）
         conn.execute(
             "UPDATE entries SET hits=hits+1, last_seen=?, strength=MIN(1.5, strength+0.15), "
-            "importance=MAX(importance, ?), pinned=MAX(pinned, ?), kind=? WHERE id=?",
-            (ts, imp, 1 if pin else 0, kind, row["id"]),
+            "importance=MAX(importance, ?), pinned=MAX(pinned, ?), kind=?, "
+            "owner=COALESCE(?, owner), visibility=COALESCE(?, visibility) WHERE id=?",
+            (ts, imp, 1 if pin else 0, kind, owner, vis, row["id"]),
         )
         return row["id"]
     cur = conn.execute(
-        "INSERT INTO entries(peer, kind, text, fp, importance, strength, pinned, hits, created, last_seen, retired) "
-        "VALUES(?,?,?,?,?,?,?,1,?,?,0)",
-        (peer, kind, t, f, imp, 1.0, 1 if pin else 0, ts, ts),
+        "INSERT INTO entries(peer, kind, text, fp, importance, strength, pinned, hits, created, last_seen, retired, "
+        "owner, visibility, is_self) "
+        "VALUES(?,?,?,?,?,?,?,1,?,?,0,?,?,?)",
+        (peer, kind, t, f, imp, 1.0, 1 if pin else 0, ts, ts, owner, vis, 1 if is_self else 0),
     )
     return cur.lastrowid
 
@@ -545,6 +733,9 @@ def recall(conn, peer=None, query=None, top=8, min_score=0.05):
 
     IDF 统计用**全库**（跨 peer 的文档频率才准），候选条目才按 peer 过滤。
     索引进程内缓存，语料变化时自动重建（见 bm25_index）。
+
+    ⚠️ 这个函数是**老的桥接口**，行为必须逐位不变（v4 一个字都没动它）。
+    要按人跨通道检索用 `recall_for_person()` / `recall_with_visibility()`。
     """
     if peer:
         rows = conn.execute(
@@ -557,6 +748,120 @@ def recall(conn, peer=None, query=None, top=8, min_score=0.05):
     scored = [(combine(r, qt, index=idx), r) for r in rows]
     scored.sort(key=lambda x: x[0], reverse=True)
     return [(s, r) for s, r in scored[:top] if s >= min_score]
+
+
+# ── 按人跨通道检索（v4）──────────────────────────────────────────────────────
+def peers_for_owner(conn, qq):
+    """某个人的记忆分布在哪些 peer 上（跨 c2c 和 group）—— 这就是「归集」的入口。"""
+    if not qq:
+        return []
+    return [r["peer"] for r in conn.execute(
+        "SELECT DISTINCT peer FROM entries WHERE owner=? AND retired=0 ORDER BY peer",
+        (str(qq),))]
+
+
+def _person_rows(conn, qq, in_group=False, include_self=False):
+    """取「属于这个人」的候选条目（跨通道），并按场景过滤可见性。
+
+    关于 include_self：出站记忆的 owner 是 NULL（按设计，它不属于「我知道对方
+    什么」的画像，见 README）。所以「我说过的话」不能靠 owner 查，得靠
+    私聊 peer 反推：`c2c-<qq>` 下 is_self=1 的条目就是「我对这个人说过的话」。
+    群里的出站无法归到具体说话人（我自己发在群里的话不针对某个人）→ 不纳入。
+    """
+    qq = str(qq)
+    sql = "SELECT * FROM entries WHERE retired=0 AND owner=?"
+    args = [qq]
+    if include_self:
+        sql += " OR (is_self=1 AND peer=?)"
+        args.append("c2c-" + qq)
+    else:
+        sql += " AND IFNULL(is_self,0)=0"
+    if in_group:
+        # 群聊场景：只在私聊提过的事（dm_only）不能说。NULL 未标注 → 按 public
+        sql += " AND IFNULL(visibility,'public')<>?"
+        args.append(VISIBILITY_DM_ONLY)
+    return conn.execute(sql, tuple(args)).fetchall()
+
+
+def recall_for_person(conn, qq, query=None, top=8, in_group=False,
+                      include_self=False, min_score=0.05):
+    """跨通道按人检索：找 `owner=<qq>` 的全部记忆（c2c 的 + 群里的）。
+
+    - `in_group=True` → 过滤掉 `visibility='dm_only'`（群里不能说私聊的事）
+    - `in_group=False` → 全都给（私聊场景，私下说的当然能提）
+    - `include_self=False`（默认）→ 不混进「我自己说的话」（那是 stylebank 的事）
+
+    返回格式跟 recall() 完全一致：[(score, Row), ...]，方便桥无缝切换。
+    """
+    rows = _person_rows(conn, qq, in_group=in_group, include_self=include_self)
+    qt = tokenize(query) if query else None
+    idx = bm25_index(conn) if qt else None
+    scored = [(combine(r, qt, index=idx), r) for r in rows]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [(s, r) for s, r in scored[:top] if s >= min_score]
+
+
+def recall_with_visibility(conn, peer=None, query=None, top=8, in_group=None,
+                           speaker=None, include_self=False, min_score=0.05,
+                           include_peer_context=True):
+    """给桥用的统一入口：能算出 owner 就跨通道取，算不出就退回老 recall()。
+
+    `in_group=None` → 按 peer 前缀自动判断（group-* 是群场景）。
+    `speaker=<qq>` → 群聊场景下由桥把发言人 QQ 传进来；有了它，群里的记忆
+                     也算到说话人头上（这是 v4 之后桥该传的新参数）。
+    `include_peer_context=True` → **额外带上本 peer 里 owner 未知的条目**
+        （群聊 reflection 摘要等多说话人混合内容，归不到某个具体的人）。
+        不加这个会丢群级知识 —— A/B 实测里「头像」「B站」两个查询就退化了，
+        所以默认开启，且这些条目同样受 dm_only 过滤约束。
+
+    向后兼容（重要）：`owner` 算不出来时**原样委托 recall()**，所以老桥
+    不改代码也不会看到任何行为差异。
+    """
+    owner = speaker or owner_from_peer(peer)
+    if in_group is None:
+        in_group = is_group_peer(peer)
+    if not owner:
+        return recall(conn, peer, query, top, min_score)
+    rows = list(_person_rows(conn, owner, in_group=in_group, include_self=include_self))
+    if include_peer_context and peer:
+        # 本通道的「群级/未知归属」条目：归不到人，但就是这个会话里的知识
+        sql = ("SELECT * FROM entries WHERE retired=0 AND peer=? AND owner IS NULL"
+               " AND IFNULL(is_self,0)=0")
+        args = [peer]
+        if in_group:
+            sql += " AND IFNULL(visibility,'public')<>?"
+            args.append(VISIBILITY_DM_ONLY)
+        seen = {r["id"] for r in rows}
+        rows.extend(r for r in conn.execute(sql, tuple(args)).fetchall()
+                    if r["id"] not in seen)
+    qt = tokenize(query) if query else None
+    idx = bm25_index(conn) if qt else None
+    scored = [(combine(r, qt, index=idx), r) for r in rows]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [(s, r) for s, r in scored[:top] if s >= min_score]
+
+
+def set_visibility(conn, ids=None, peer=None, visibility="dm_only", dm_only=True):
+    """手动标注可见性（唯一可靠的来源 —— 自动判定一律不猜，全留 NULL 当 public）。
+
+    参数：
+      `ids` / `peer` 二选一：按 id 列表标，或把某个 peer 的全部记忆都标了
+      `dm_only=True`（默认）→ 标成 'dm_only'（只在私聊能提）；False → 标成 'public'
+    返回被改动的行数。
+    """
+    vis = VISIBILITY_DM_ONLY if dm_only else VISIBILITY_PUBLIC
+    if ids:
+        ids = [int(i) for i in ids]
+        n = 0
+        for i in ids:
+            n += conn.execute("UPDATE entries SET visibility=? WHERE id=?", (vis, i)).rowcount
+        conn.commit()
+        return n
+    if peer:
+        n = conn.execute("UPDATE entries SET visibility=? WHERE peer=?", (vis, peer)).rowcount
+        conn.commit()
+        return n
+    return 0
 
 
 def ingest_bridge(conn, path=BRIDGE_LOG):
@@ -603,8 +908,12 @@ def ingest_bridge(conn, path=BRIDGE_LOG):
                 ).timestamp()
             except ValueError:
                 ts = now_ts()
-            remember(conn, peer, text, kind=classify(text), pin=is_pin(text), ts=ts)
-            short = {"ts": ts, "from": m.group("name"), "qq": m.group("qq"), "text": text}
+            # 入站：发言人 QQ 一直就在日志里（RE_INBOUND 的 from=昵称(QQ)），
+            # v4 起把它当作 owner —— 群聊记忆因此能归到具体的人而不是「大锅饭」。
+            qq = m.group("qq")
+            remember(conn, peer, text, kind=classify(text), pin=is_pin(text), ts=ts,
+                     owner=qq, is_self=0)
+            short = {"ts": ts, "from": m.group("name"), "qq": qq, "text": text}
             day = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
             p = os.path.join(LOG_DIR, f"{peer}-{day}.jsonl")
             with open(p, "a", encoding="utf-8") as lf:
@@ -1044,6 +1353,24 @@ def main():
     p.add_argument("--query", default=None)
     p.add_argument("--top", type=int, default=8)
 
+    p = sub.add_parser("recall-person", help="跨通道按人检索（c2c + group 一起找）")
+    p.add_argument("--qq", required=True, help="QQ 号，如 3022464706")
+    p.add_argument("--query", default=None)
+    p.add_argument("--top", type=int, default=8)
+    p.add_argument("--in-group", action="store_true",
+                   help="群聊场景：过滤掉只该在私聊说的 dm_only 记忆")
+    p.add_argument("--include-self", action="store_true", help="连我说过的话一起找")
+
+    p = sub.add_parser("set-visibility", help="手动标注可见性（自动判定不猜，默认全 public）")
+    p.add_argument("ids", nargs="*", type=int, help="条目 id（可多个）")
+    p.add_argument("--peer", default=None, help="或整个 peer 一起标")
+    p.add_argument("--public", action="store_true", help="标成 public（默认标 dm_only）")
+
+    p = sub.add_parser("backfill-owner", help="回填 owner/is_self（迁移已自动做过，这里是手动重跑）")
+    p.add_argument("--force", action="store_true", help="（无实际作用，回填本身幂等）")
+
+    p = sub.add_parser("owners", help="看按人归集情况（含回填覆盖率）")
+
     sub.add_parser("stats", help="统计")
 
     p = sub.add_parser("scan", help="从文本文件抽记忆")
@@ -1081,6 +1408,36 @@ def main():
     elif a.cmd == "recall":
         for s, r in recall(conn, a.peer, a.query, a.top):
             print(f"[{s:.3f}] ({r['kind']},{'pin' if r['pinned'] else '-'},imp={r['importance']:.2f}) {r['text'][:90]}")
+    elif a.cmd == "recall-person":
+        print(f"归集到 {a.qq} 的 peer：{peers_for_owner(conn, a.qq) or '(无)'}"
+              f"{'（群聊场景，已过滤 dm_only）' if a.in_group else ''}")
+        for s, r in recall_for_person(conn, a.qq, a.query, a.top,
+                                      in_group=a.in_group, include_self=a.include_self):
+            print(f"[{s:.3f}] ({r['peer']},imp={r['importance']:.2f}"
+                  f"{',dm_only' if r['visibility'] == VISIBILITY_DM_ONLY else ''}) {r['text'][:90]}")
+    elif a.cmd == "set-visibility":
+        if not a.ids and not a.peer:
+            print("要给 id 或 --peer")
+        else:
+            n = set_visibility(conn, ids=a.ids or None, peer=a.peer,
+                               dm_only=not a.public)
+            print(f"已标 {n} 条为 {'public' if a.public else 'dm_only'}")
+    elif a.cmd == "backfill-owner":
+        st = backfill_owner(conn)
+        print(f"扫描 {st['scanned']} 条 · c2c 归属 {st['c2c']} · "
+              f"群聊对上发言人 {st['group_matched']} · 群聊未对上 {st['group_unmatched']}"
+              f"（其中多说话人 {st['ambiguous']}）· 出站 {st['outbound']} · "
+              f"其它未知 {st['unnamed']} → 最终有 owner 的 {st['owned']}/{st['total']}")
+    elif a.cmd == "owners":
+        total = conn.execute("SELECT COUNT(*) FROM entries WHERE retired=0").fetchone()[0]
+        owned = conn.execute("SELECT COUNT(*) FROM entries WHERE retired=0 AND owner IS NOT NULL").fetchone()[0]
+        selfn = conn.execute("SELECT COUNT(*) FROM entries WHERE retired=0 AND is_self=1").fetchone()[0]
+        print(f"有效记忆 {total} 条：有 owner {owned} 条（{owned/total*100:.1f}%）· "
+              f"我说的话 {selfn} 条 · owner 未知 {total - owned - selfn} 条")
+        for r in conn.execute(
+                "SELECT owner, COUNT(*) n, COUNT(DISTINCT peer) p FROM entries "
+                "WHERE retired=0 AND owner IS NOT NULL GROUP BY owner ORDER BY n DESC"):
+            print(f"  {r['owner'] or '?'}   {r['n']:4} 条   跨 {r['p']} 个 peer")
     elif a.cmd == "stats":
         total = conn.execute("SELECT COUNT(*) FROM entries WHERE retired=0").fetchone()[0]
         print(f"有效记忆 {total} 条")

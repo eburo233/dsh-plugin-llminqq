@@ -74,7 +74,7 @@ done
 # Python 记忆系统测试（隔离到临时库）
 echo
 echo "== 2.5 记忆系统测试 =="
-for t in test_memctl test_outbound test_reflection test_bm25; do
+for t in test_memctl test_outbound test_reflection test_bm25 test_owner; do
   f="qq-agent/memory/${t}.py"
   [ -f "$f" ] || { echo "  ⚠ $t (缺文件)"; continue; }
   out=$(python3 "$f" 2>&1)

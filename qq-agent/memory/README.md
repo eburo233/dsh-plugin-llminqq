@@ -3,7 +3,196 @@
 > 每个对端（群 / 私聊）一份见闻录。这是我自己维护的，不是桥自动写的。
 > 想不起某件事的时候翻这里。只记有用的：谁常说什么、最近在聊什么、答应过谁什么、什么话题别再提。
 
+## v4：按人归集、按通道可见（owner / visibility / is_self）
+
+v3 的记忆完全按**会话**（`peer`）分开：
+
+```
+c2c-3022464706      ← 他私聊说的
+group-1017567471    ← 群里的所有发言（不分谁说的）
+```
+
+后果很实在：**同一个人在私聊说过的事，群里聊天时我想不起来。** 检索只能看到
+「本通道里说过的话」，跨不了通道。群聊那半边还是「大锅饭」——315 条记忆分不清
+哪句是信风说的、哪句是别人说的。
+
+v4 把索引从「按会话」改成「按人」，`peer` 退回成「这条发生在哪个通道」这个属性。
+
+### 三个新字段
+
+| 字段 | 是什么 | 取值 |
+|---|---|---|
+| `owner` | 这条记忆**关于谁 / 谁说的**（QQ 号） | `'3022464706'` / `NULL`=归属未知 |
+| `visibility` | 这话能在哪说 | `'dm_only'`（只在私聊提）/ `'public'` / `NULL`（未标注，**当 public**）|
+| `is_self` | 这条是**我自己说的话**（出站） | `0` / `1` |
+
+### 群聊记忆怎么拿到发言人的（原以为拿不到，其实一直有）
+
+任务初稿里写的是「群聊记忆 owner 只能 NULL，因为 ingest 拿不到发言人 QQ」。
+**实测不是这样，这个判断是错的。** `logs/bridge.out` 的入站行长这样：
+
+```
+2026-10-23T10:22:15.036Z 入站 group:1017567471 from=信风(3022464706) text="图片接收正常"
+```
+
+`RE_INBOUND` 正则（`memctl.py:83`）**一直就捕获了 `(?P<qq>\d+)`**，只是 v3 之前
+没把它传进 `remember()`，只写进了 `memory/log/*.jsonl`。实测 452 条入站日志里
+带 `from=昵称(QQ)` 的是 **452 条，覆盖率 100%**。
+
+所以 v4 做的是：**ingest 时把 `m.group("qq")` 当 owner 传进去**，群聊记忆直接归到
+发言人。这不是「估算」或「猜」，是日志里就有的字段。
+
+### 老库迁移（684 条，已生产验证）
+
+跟 `importance` 一样的模式：**只在 `owner` 列不存在时迁移一次**，之后
+`connect()` 什么都不做。原因是回填要读 `logs/bridge.out` + `memory/log/*.jsonl`，
+几百毫秒的活，而且会把手动标注过的 `visibility` 重算掉。
+
+回填规则（`backfill_owner()`）：
+
+1. 出站行（`bridge.out` 的 `出站 <peer> text="..."`）→ `is_self=1`、`owner=NULL`
+2. `c2c-<qq>` → `owner=<qq>`（私聊只有一个人）
+3. `group-<群号>` → 用 `(peer, 文本)` 在 `memory/log/*.jsonl` 里**精确对出**发言人 QQ；
+   同一句话被多个发言人说过 → `owner=NULL`（不瞎猜）
+4. 都对不上 → `owner=NULL`
+
+**实测回填覆盖率**（生产库 684 条，迁移耗时 44ms，`integrity_check=ok`）：
+
+| 类别 | 条数 | 归到 owner |
+|---|---|---|
+| `c2c` 非出站 | 294 | **294 / 294 = 100%** |
+| `group` | 318 | **283 / 318 = 89.0%** |
+| 出站（我说的） | 72 | 0（`is_self=1`，按设计不归给对端）|
+| **合计** | 684 | **577 / 684 = 84.4%** |
+
+没归上的 35 条**全是群聊里 owner=NULL 的条目**，其中大多数是
+`reflect()` 产出的**群聊反思摘要**（如「他凌晨五点多还在线…」）——那是把整个群的
+对话一起喂给模型提炼出来的，一句话里混了多个说话人，**归属本来就不唯一**，
+硬塞给某个人是错的。另有 1 组是同一句话被 3 个发言人重复说过（`ambiguous`）。
+
+**已知限制（如实记录）**：这 35 条群级记忆 `owner=NULL`，`recall_for_person(qq)`
+不会返回它们。所以桥用的入口 `recall_with_visibility()` 默认会**额外带上本 peer
+里 owner 未知的条目**（`include_peer_context=True`）——不这么做会丢群级知识，
+A/B 实测里「头像」「B站」两个查询就退化成找不到了。
+
+### 出站为什么 owner=NULL（而不是归给对端）
+
+我自己的回复**不属于「关于这个人我知道什么」的画像**——它是「我当时怎么说的」，
+那件事由风格库（`stylebank.py`）负责。混进来会污染对方的画像检索：
+问「他是个什么样的人」，结果顶上来一堆我说过的话。
+
+也不归给 agent 自己：`owner` 的语义是「这条记忆的主体是谁」，
+如果把自己的话也标成 owner=自己，`recall_for_person()` 就得额外排除，
+反而更容易写错。所以用**独立字段** `is_self=1` 表达，语义干净：
+- 默认 `include_self=False`：对方的画像里没有我的话
+- 要看「我对这个人说过什么」：`include_self=True`，靠 `c2c-<qq>` 反查
+  （出站行的 peer 就是对端，所以能精确找回）
+- 群里的出站无法归到具体说话人（我在群里发言不针对某个人）→ 不纳入
+
+### visibility：不自动猜，默认全 public
+
+**没有做任何自动 dm_only 判定。** 理由是瞎标的代价不对称：漏标只是「群里多说
+一句」，错标会让它**该说的时候不敢说**，那更糟。所以迁移后 `visibility` 全是
+`NULL`，语义上等于 `public`。
+
+唯一的可靠来源是**手动标注**：
+
+```bash
+# 把 id 123 标成「只在私聊提过」
+python3 memory/memctl.py set-visibility 123
+# 一次标多条
+python3 memory/memctl.py set-visibility 123 456 789
+# 整条会话都标（慎用）
+python3 memory/memctl.py set-visibility --peer c2c-3022464706
+# 标回 public（撤回之前的 dm_only）
+python3 memory/memctl.py set-visibility 123 --public
+```
+
+生产库里 684 条**目前没有一条被标 dm_only**——这是诚实的现状：能力有了，
+但自动判定没做，得等手动标或以后由 LLM 辅助。所以现阶段「群聊不说私事」这个
+约束**实际还没生效**（库里没有 dm_only 数据），它生效的前提是有人真的标了。
+
+### 新检索接口
+
+```bash
+# 跨通道按人检索（c2c + 所有群一起找）
+python3 memory/memctl.py recall-person --qq 3022464706 --query "撤回" --top 8
+
+# 群聊场景：过滤掉只该在私聊说的
+python3 memory/memctl.py recall-person --qq 3022464706 --query "考试" --in-group
+
+# 看归集情况和覆盖率
+python3 memory/memctl.py owners
+```
+
+Python 侧三个函数：
+
+| 函数 | 用途 |
+|---|---|
+| `recall_for_person(conn, qq, query, top, in_group)` | 纯按人跨通道（不含本通道 owner=NULL 条目）|
+| `recall_with_visibility(conn, peer, query, top, in_group, speaker)` | **给桥用的入口**：算不出 owner 就原样委托 `recall()`；算出就跨通道 + 带上本 peer 群级记忆 |
+| `set_visibility(conn, ids, peer, dm_only)` | 手动标注可见性 |
+
+**桥还没接。** 阶段一（本次）只做记忆层，`bridge/index.js` 一行没动。
+桥现在的调用点 `bridge/index.js:1737`（`buildTopicHints` → `memctl recall --peer ...`）
+**行为完全没变**，因为 `recall()` 一个字符都没改。要让跨通道生效，桥需要：
+1. 群聊时把发言人 QQ 传进来（`speaker`）
+2. 把 `recall` 换成 `recall_with_visibility`
+
+### A/B 实测（生产库副本，群聊场景下问「这个人」的事）
+
+**旧** = `recall(conn, 'group-1017567471', q)`，只看本群 peer 内的记忆。
+**新** = `recall_with_visibility(conn, 'group-1017567471', q, speaker='3022464706')`。
+
+| 查询 | 旧 hit@3 | 新 hit@3 | 旧 top3 零重合噪音 | 新 |
+|---|---|---|---|---|
+| 撤回 | ✗ | **✓** | 3/3 | 0/3 |
+| 开会 | ✗ | **✓** | 3/3 | 1/3 |
+| 规矩 | ✗ | **✓** | 3/3 | 0/3 |
+| 头像 | ✓ | ✓ | 0/3 | 0/3 |
+| 评论区 | ✓ | ✓ | 1/3 | 0/3 |
+| B站 | ✓ | ✓ | 0/3 | 1/3 |
+| 记忆 | ✓ | ✓ | 1/3 | 0/3 |
+| 性格 | ✗ | **✓** | 3/3 | 2/3 |
+| 语音 | ✓ | ✓ | 2/3 | 1/3 |
+| 安全 | ✗ | **✓** | 3/3 | 1/3 |
+
+**hit@3：旧 5/10 → 新 10/10。** 5 个原来完全找不到的，现在都能找到。
+
+典型例子（`query=开会`）：
+- 旧：top3 全是 0.084 分的群聊废话（「你发给它的每条进度消息，它都回了…」），
+  因为零重合被折到 25%（`combine()` 的规则），但仍是本群最高分——**开会那条在私聊，跨不过来**
+- 新：top1 `0.894` = 「明天(2026-10-26)下午三点开会，地点3楼」，top2 `0.836` = 「行行行，开会什么的最烦了」
+
+**要诚实说的两点**：
+1. 「B站」那条新结果的零重合噪音从 0/3 变 1/3 —— 因为新路径把私聊里的
+   「B站」（就一个词，单 token 命中→归一化给满分 0.757）顶到了第 1。
+   这是**粗分词 + 查询内归一**的已知副作用（v3 BM25 就有的），不是跨通道引入的。
+2. 我只测了 10 个查询。样本小，别当成统计显著的准确率结论；
+   但「旧路径物理上看不到别的通道」这件事是结构性的，不靠样本量。
+
+### 测试
+
+`test_owner.py`（65 项）：
+
+```bash
+python3 memory/test_owner.py
+```
+
+覆盖：
+- **schema 迁移**：手工建一个 v3 结构的库 → `connect()` 升级；断言老字段**逐位不变**、
+  条数不变、`importance` 手调值没被覆盖；第二次 `connect()` 幂等
+- **owner 推断**：`c2c-<qq>` → qq、`group-<群号>` → NULL、`remember(group, owner=QQ)` 归到发言人、
+  `outbound=True` → `is_self=1` 且 owner=NULL
+- **跨 peer 归集**：同一个人在 c2c + 两个群说的话能被 `recall_for_person` 一起找到；
+  另一个人的同话题记忆不混进来；`is_self` 默认过滤
+- **dm_only**：群聊场景过滤、私聊场景放行、`NULL` 按 public、`set_visibility` 双向可标
+- **老 `recall()` 逐位不变**：用**独立手算公式的参照实现**（不调 `recall`/`combine`）
+  对 12 种组合逐条比对 id 序列和分数（容差 1e-12），并断言候选集等于
+  `retired=0` 裸 SQL 的结果（没掺 owner/is_self 过滤）
+
 ## v3：检索从 bigram 字面重合升级为 BM25（带 IDF）
+
 
 v2 的 `relevance()` 是：
 
@@ -192,14 +381,15 @@ v2 加三道闸：
 
 ```
 memory/
-├── memctl.py          # 记录/检索/衰减/提炼（我写的，可改）
-├── mem.db             # 长期层：条目 + 三层 + importance + 半衰期
+├── memctl.py          # 记录/检索/衰减/提炼/按人归集（我写的，可改）
+├── mem.db             # 长期层：条目 + 三层 + importance + 半衰期 + owner/visibility
 ├── digest.md          # 自动生成的摘要（按三层分组），每轮可以直接读这个
-├── log/               # 短期层：原文流水，按天切（含出站）
+├── log/               # 短期层：原文流水，按天切（含出站；也是 owner 回填的数据源）
 ├── README.md          # 本文件
 ├── test_memctl.py     # 25 项测试（用临时库，不碰生产）
 ├── test_outbound.py   # 出站降权测试
 ├── test_bm25.py       # 37 项：IDF/归一化/索引缓存/零重合折损（用临时库）
+├── test_owner.py      # 65 项：schema 迁移/owner 推断/跨 peer 归集/dm_only/老 recall 回归
 └── *.md               # 手写的见闻录（人设性质的东西放这）
 ```
 
@@ -320,11 +510,21 @@ python3 memory/memctl.py prune
 python3 memory/test_memctl.py    # 25 项：importance 区分度/三层分类/pin 判定/去重/噪音/检索/边界
 python3 memory/test_outbound.py  # 出站降权 + 不 pin
 python3 memory/test_bm25.py      # 37 项：IDF 生效/归一化/词频/索引缓存失效/归零重合折损
+python3 memory/test_owner.py     # 65 项：schema 迁移/owner 推断/跨 peer 归集/dm_only/老 recall 回归
 ```
 
-三个测试都用**临时库**，不会碰生产 `mem.db`。
+四个测试都用**临时库**，不会碰生产 `mem.db`。
 
 ## 已知的不足（诚实记录）
+
+0. **按人归集的 35 条群级记忆 owner=NULL**（占群聊 318 条的 11%）。它们是
+   `reflect()` 产出的群聊反思摘要，一句话混了多个说话人，归属不唯一。
+   `recall_for_person(qq)` 取不到它们；桥用的 `recall_with_visibility()` 默认
+   额外带上，但纯按人检索会漏。**这是真实限制，不是已经解决了。**
+
+0b. **`visibility` 自动判定没做**，684 条全是 NULL（= public），只有手动命令能标。
+   所以在有人标之前，「群里不说私聊的事」这条约束**实际没生效**。
+   不想为了填字段瞎猜——错标 dm_only 会让它该说话时不敢说，比漏标更糟。
 
 1. **分类还不准**。`procedural` / `semantic` / `episodic` 是靠关键词猜的，
    会把「我给你加个情绪咋样」归到程序记忆。不影响检索（有 relevance 兜着），
