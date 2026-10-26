@@ -2602,7 +2602,7 @@ function startProactiveLoop () {
       chatFollowTick().catch(err => logger.log(`chatFollow tick 异常: ${err.message}`))
     }, everyMin * 60000)
     chatFollowTimer.unref?.()
-    logger.log(`proactive: 接话路径已启动，每 ${everyMin}min 检查一次（对方沉默 ≥${fc.silentMin}min 才判断，每小时上限 ${fc.maxPerHour}）`)
+    logger.log(`proactive: 接话路径已启动，每 ${everyMin}min 检查一次（只在对方最后一条消息后 ${fc.silentMin}min **窗口内**补话；窗口过了就交给 20min 概率路径，每小时上限 ${fc.maxPerHour}）`)
   } else {
     logger.log('proactive: 接话路径未启用（chatFollow.enabled=false），只用 20min 概率路径')
   }

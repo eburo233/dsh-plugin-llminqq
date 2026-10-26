@@ -66,6 +66,33 @@ GROUP_BATCH = 40           # 群语料每批喂多少条消息给模型
 MAX_GROUP_MSGS = 160       # 群语料最多用多少条（成本/时间闸）
 BILI_MAX_COMMENTS = 8      # 每个 BV 号抓多少条一级评论（带楼中楼，不要更多——防风控）
 
+# ── 语料池（crawl-bili-comments.mjs 抓的，跨分区，学的时候按轮取）──────────────
+# 为什么单轮要卡死 18 段 / 1.2 万字（不是「能学多少学多少」）：
+#   实测 12 段 / 7000 字 ≈ 520s。4000 条评论 ≈ 10 万字 ≈ 170 段 ≈ 2 小时，
+#   一期肯定跑不完，而且模型在后半段明显开始糊 —— 所以**池子大**（覆盖广）和
+#   **单轮小**（质量稳）必须分开：池子攒在磁盘上，一轮只吃预算内的那一段，
+#   用游标记住学到哪，下一轮接着来。
+CORPUS_DEFAULT_DIR = os.environ.get("LLMINQQ_CORPUS_DIR") or os.path.join(BASE, "corpus")
+CORPUS_ROUND_SEGMENTS = 18   # 单轮最多几段（≈8-10 分钟，跟 520s/12 段对齐后再留余量）
+CORPUS_ROUND_CHARS = 12000   # 单轮最多多少字（硬闸；段数闸先到也会停）
+CORPUS_SEG_CHARS = 900       # 一段大约多少字（按字数切段，别按条数：长评论很悬殊）
+CORPUS_PER_DOMAIN = 2        # 每个领域单轮最多取几段（分层采样的核心，见下）
+# 分层采样而不是随机抽的原因：评论区热门分区（游戏/影视/科技）的语料量能是历史/科普的
+# 十倍，随机抽的时候冷门分区会被直接淹没，最后学出来的还是「热门分区那套」。按 domain
+# 各取 1-2 段，才能保证历史/科普这些「说话方式跟二次元圈差得最远」的语料真的进模型。
+CORPUS_CURSOR_NAME = ".learn-cursor.json"
+# 语料条目里这两类字面量要拦：B站表情标记（[大笑]/[傲娇]/[米雪儿·绮星梦使 应援装扮_哈气]）在
+# QQ 根本发不出去，学来只会让模型在 QQ 里输出无效标记；回复前缀「回复 @某人 :」是评论区脚手架
+# 不是说话内容。
+# 为什么括号宽度放宽到 40 字：第一版只认「汉字/字母数字下划线 1-10 字」，漏掉了带「·」和「_」
+# 的**动态表情包名**（实测 3662 条里有 1402 条带表情、34 条是窄正则漏掉的）。漏掉的表情会以
+# 长串「[米雪儿·绮星梦使 应援装扮_哈气]」原样进 prompt，比不洗更糟 —— 模型会把它当「表情玩法」
+# 学成字面量。放宽后纯表情评论会洗成空串，正好被 MIN_CHAT_CHARS 挡掉（那种本来也没语料价值）。
+BILI_EMOJI_RE = re.compile(r"\[[^\[\]\n]{1,40}\]")
+REPLY_PREFIX_RE = re.compile(r"^(?:回复\s*@[^\s:：]{0,24}\s*[:：]\s*)+")
+# 评论里的 @ 人（「@某某」）也是脚手架：学说话方式时说话对象是群友，不是这个被 @ 的陌生人
+AT_MENTION_RE = re.compile(r"@[\w\u4e00-\u9fa5\-]{1,24}")
+
 # ── 「工作语料」vs「聊天语料」：这个功能最容易翻的车 ──────────────────────────
 # 实测（2026-10-26，772 条群语料）：
 #   SeekDee(4011477594)  178 条中 112 条（62.9%）带工程词 —— 他主要是给 AI 下指令、
@@ -170,6 +197,9 @@ def learning_cfg(cfg=None):
     learn = cfg.get("learning") or {}
     venv = learn.get("venvPython") or os.path.join(
         os.path.expanduser("~"), ".dsh", "bili-duty", ".venv", "bin", "python")
+    corpus_dir = learn.get("corpusDir") or CORPUS_DEFAULT_DIR
+    if not os.path.isabs(corpus_dir):
+        corpus_dir = os.path.join(_ROOT, corpus_dir)
     return {
         "enabled": learn.get("enabled", True) is not False,
         "biliSources": learn.get("biliSources") or [],
@@ -182,6 +212,11 @@ def learning_cfg(cfg=None):
         "groupBatch": int(learn.get("groupBatch") or GROUP_BATCH),
         "timeout": int(learn.get("timeout") or 120),
         "totalTimeout": int(learn.get("totalTimeout") or 900),
+        # 语料池（crawl-bili-comments.mjs 抓的跨分区评论）
+        "corpusDir": corpus_dir,
+        "corpusSegments": int(learn.get("corpusRoundSegments") or CORPUS_ROUND_SEGMENTS),
+        "corpusChars": int(learn.get("corpusRoundChars") or CORPUS_ROUND_CHARS),
+        "corpusPerDomain": int(learn.get("corpusPerDomain") or CORPUS_PER_DOMAIN),
     }
 
 
@@ -255,8 +290,18 @@ def _clean_entry(raw):
     if conf < MIN_CONFIDENCE:
         return None, "low-confidence"
     source = str(raw.get("source") or "").strip().lower()
-    if source not in ("group", "bili"):
-        source = "group" if source in ("qq", "chat", "群", "群聊") else source or "group"
+    # 语料池那一轮的 source 是 "bili:<domain>"（如 bili:history），分层采样要靠它
+    # 追溯「这条词是从哪个领域学的」；其它写法归一到 group/bili。
+    if source.startswith("bili"):
+        dom = source.split(":", 1)[1].strip() if ":" in source else ""
+        if not re.match(r"^[a-z]{2,16}$", dom or ""):
+            source = "bili"
+        else:
+            source = f"bili:{dom}"
+    elif source in ("qq", "chat", "群", "群聊"):
+        source = "group"
+    elif source not in ("group",):
+        source = "group"
     return {
         "kind": kind,
         "text": text,
@@ -265,6 +310,19 @@ def _clean_entry(raw):
         "source": source[:16],
         "confidence": round(conf, 3),
     }, None
+
+
+def _source_ok(source):
+    """合法来源：group / bili / bili:<domain>。
+
+    为什么要区分 bili:<domain> 而不是一律压成 bili：语料池是分层采样的，
+    「这个词是从历史区学的还是从游戏区学的」是排查过拟合的唯一线索 ——
+    压成 bili 之后就再也看不出来词库是不是又被二次元/游戏喂歪了。
+    """
+    s = str(source or "").strip().lower()
+    if s in ("group", "bili"):
+        return True
+    return bool(re.match(r"^bili:[a-z]{2,16}$", s))
 
 
 def _norm_key(kind, text):
@@ -472,6 +530,212 @@ def bili_segments(comments, max_per_seg=30):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 语料池：crawl-bili-comments.mjs 抓的跨分区评论（分层采样 + 游标）
+# ─────────────────────────────────────────────────────────────────────────────
+def _crawl_clean(text):
+    """语料池的一条评论洗成「可以说的话」：去掉评论区脚手架和 QQ 用不了的标记。
+
+    为什么要在**进 prompt 之前**洗（而不是只靠落盘侧的质量闸）：
+    虽然 _clean_entry 会挡住带标记的词条，但模型看到「[大笑]」满屏时会把它学成
+    expression 的字面量 —— 那就白学了（QQ 发不出 B站表情）。清洗越早越省事。
+    """
+    t = str(text or "")
+    t = BILI_EMOJI_RE.sub("", t)      # B站表情 [大笑] / [傲娇] —— QQ 用不了
+    t = REPLY_PREFIX_RE.sub("", t)    # 「回复 @某某 : X」→ X
+    t = AT_MENTION_RE.sub("", t)      # @人 是脚手架，不是说话内容
+    t = MARKER_RE.sub("", t)
+    t = url_clean(t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def load_corpus_files(corpus_dir=None, path=None):
+    """读语料池目录，返回 {domain: [file_doc, ...]}。
+
+    为什么按 domain 分组而不是摊平：分层采样要「每个领域各取几段」，
+    摊平之后就没法保证冷门领域不被热门领域挤掉（见 CORPUS_PER_DOMAIN 注释）。
+    文件坏了/字段缺了只跳过那一个文件，不能让整轮学习挂掉。
+    """
+    corpus_dir = corpus_dir or learning_cfg()["corpusDir"]
+    groups = {}
+    if not os.path.isdir(corpus_dir):
+        return groups
+    for name in sorted(os.listdir(corpus_dir)):
+        if not name.endswith(".json") or name.startswith("."):
+            continue
+        full = os.path.join(corpus_dir, name)
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(d, dict) or not isinstance(d.get("comments"), list):
+            continue
+        dom = str(d.get("domain") or "unknown").strip() or "unknown"
+        d["_path"] = full
+        d["_name"] = name
+        groups.setdefault(dom, []).append(d)
+    return groups
+
+
+def corpus_segments(groups, cursor=None, max_segments=None, max_chars=None,
+                    per_domain=None):
+    """从语料池里**分层**取本轮要学的段，并推进游标。
+
+    返回 (segments, new_cursor, info)：
+      segments  —— [(text, source), ...]，source 是 "bili:<domain>"
+      new_cursor—— {文件名: 已消费到的段序号}，下次从这里接着学
+      info      —— {domains, segments, chars, exhausted}
+
+    三个设计点（都是踩过的坑）：
+      ① **按 domain 轮转取，不按文件顺序取**。按文件顺序的话，读完三个科技视频
+         额度就用完了，历史和科普永远轮不到。这里每个 domain 轮流贡献 1 段。
+      ② **游标记在「段」维度而不是「文件」维度**。一个文件 100 条评论能切成 10 段，
+         按文件记的话要么一次吃 10 段（超预算），要么永远只吃第一段。
+      ③ **轮转用 per_domain 限流 + 全局预算双闸**。per_domain 保证冷门领域有份，
+         全局预算保证单轮不超时 —— 缺哪个都会出问题（只限 per_domain 会学不完，
+         只限全局会让热门领域吃满）。
+    """
+    learn = learning_cfg()
+    max_segments = max_segments or learn["corpusSegments"]
+    max_chars = max_chars or learn["corpusChars"]
+    per_domain = per_domain or learn["corpusPerDomain"]
+    cursor = dict(cursor or {})
+
+    # 先把每个 domain 的「下一段」准备好：文件内按 _segIndex 顺延，文件间按名字排
+    queues = {}
+    for dom in sorted(groups):
+        q = []
+        for doc in groups[dom]:
+            segs = _corpus_doc_segments(doc)
+            start = int(cursor.get(doc["_name"]) or 0)
+            if start >= len(segs):
+                continue
+            q.append((doc, segs, start))
+        if q:
+            queues[dom] = q
+
+    segments = []
+    chars = 0
+    taken_by_domain = {}
+    doms = sorted(queues)
+    # 轮转：每个 domain 单轮最多贡献 per_domain 段（**硬上限**，不随轮次递增），
+    # 直到全局预算用完。这一条是分层采样的关键：热门领域文件再多也只能拿 2 段，
+    # 剩下的额度留给历史/科普 —— 否则 3 个科技视频就能把 18 段预算全吃满。
+    while len(segments) < max_segments:
+        progressed = False
+        for dom in doms:
+            if len(segments) >= max_segments or chars >= max_chars:
+                break
+            if taken_by_domain.get(dom, 0) >= per_domain:
+                continue
+            q = queues.get(dom) or []
+            if not q:
+                continue
+            doc, segs, start = q[0]
+            text = segs[start]
+            # 字数闸：放不进就跳过这个 domain 这一段（去下一个 domain 试试），
+            # 而不是直接停 —— 否则一个长段能把后面的冷门领域全挡掉
+            if len(text) > max_chars - chars:
+                taken_by_domain[dom] = taken_by_domain.get(dom, 0) + 1
+                cursor[doc["_name"]] = start + 1
+                _advance(q)
+                continue
+            segments.append((text, f"bili:{dom}"))
+            chars += len(text)
+            taken_by_domain[dom] = taken_by_domain.get(dom, 0) + 1
+            cursor[doc["_name"]] = start + 1
+            progressed = True
+            _advance(q)
+        if not progressed:
+            break
+
+    exhausted = not any(q for q in queues.values())
+    info = {"domains": sorted({s.split(":", 1)[1] for _, s in segments}),
+            "segments": len(segments), "chars": chars, "exhausted": exhausted}
+    return segments, cursor, info
+
+
+def _advance(queue):
+    """把某个 domain 的队列往前推一段：当前文件读完就换下一个文件、从第 0 段起。"""
+    if not queue:
+        return
+    doc, segs, start = queue[0]
+    if start + 1 >= len(segs):
+        queue.pop(0)
+
+
+def _corpus_doc_segments(doc, seg_chars=None):
+    """一个语料文件切成若干「一段话」的文本（楼中楼用 └ 标出接话关系）。
+
+    为什么按**字数**切而不是按条数：评论长短悬殊得离谱（历史区有人贴整首词，
+    科技区有人只说「好」），按条数切会让某一段的字数是另一段的十倍，
+    单轮预算按字数算才有意义（模型耗时基本正比于字数，不是条数）。
+    """
+    seg_chars = seg_chars or CORPUS_SEG_CHARS
+    lines = []
+    for c in doc.get("comments") or []:
+        if not isinstance(c, dict):
+            continue
+        content = _crawl_clean(c.get("content"))
+        if len(content) < MIN_CHAT_CHARS or WORK_RE.search(content):
+            continue
+        who = str(c.get("user") or "?")[:16]
+        lines.append(f"{who}: {content}")
+        for sub in (c.get("top_replies") or [])[:3]:
+            if not isinstance(sub, dict):
+                continue
+            sc = _crawl_clean(sub.get("content"))
+            if len(sc) < MIN_CHAT_CHARS or WORK_RE.search(sc):
+                continue
+            lines.append(f"  └ {str(sub.get('user') or '?')[:16]}: {sc}")
+    head = f"【B站评论区·{doc.get('domain') or '?'}·{str(doc.get('title') or '')[:40]}】"
+    out = []
+    buf, size = [], 0
+    for ln in lines:
+        if buf and size + len(ln) > seg_chars:
+            out.append("\n".join([head] + buf))
+            buf, size = [], 0
+        buf.append(ln)
+        size += len(ln) + 1
+    if buf:
+        out.append("\n".join([head] + buf))
+    return out
+
+
+def read_cursor(corpus_dir=None):
+    corpus_dir = corpus_dir or learning_cfg()["corpusDir"]
+    p = os.path.join(corpus_dir, CORPUS_CURSOR_NAME)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_cursor(cursor, corpus_dir=None):
+    """原子写游标。跟 lexicon.json 同样的理由：定时任务随时会被杀掉重来，
+    游标写一半（上次学到哪说不清）比没游标更糟 —— 会重学或漏学一大截。"""
+    corpus_dir = corpus_dir or learning_cfg()["corpusDir"]
+    os.makedirs(corpus_dir, exist_ok=True)
+    p = os.path.join(corpus_dir, CORPUS_CURSOR_NAME)
+    fd, tmp = tempfile.mkstemp(prefix=".cursor-", suffix=".json", dir=corpus_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cursor, f, ensure_ascii=False, indent=1)
+            f.write("\n")
+        os.replace(tmp, p)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return p
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Prompt
 # ─────────────────────────────────────────────────────────────────────────────
 PROMPT_HEAD = """你在帮一个 QQ 群里的吉祥物「学别人怎么说话」。下面是真实语料。
@@ -506,11 +770,35 @@ source 只能是 group（本群语料）或 bili（B站评论区）。confidence
 
 def build_prompt(segment, source):
     return f"""{PROMPT_HEAD}
-下面这段是【{'本群熟人语料' if source == 'group' else 'B站评论区（陌生人围观，主要学梗和表情用法）'}】：
+下面这段是【{_source_label(source)}】：
 ---
 {segment}
 ---
 只输出 JSON。"""
+
+
+def _source_label(source):
+    """语料来源的说明文字。
+
+    为什么要按领域分别说清楚（而不是一句「B站评论区」）：
+    历史区/科普区的评论区是**长论证 + 冷幽默**，游戏/动画区是**短梗 + 玩梗接龙**——
+    这是完全不同的两种「说话方式」。同一个 prompt 里糊在一起，模型会把长论证的
+    说法当「句式模板」学走（那玩意儿在群聊里根本用不上）。分开标注才能让它
+    按领域各自提炼，也方便事后按来源排查「学歪了是哪个领域带偏的」。
+    """
+    s = str(source or "")
+    if s == "group":
+        return "本群熟人语料"
+    if s.startswith("bili:"):
+        dom = s.split(":", 1)[1]
+        label = {
+            "history": "历史人文", "tech": "科技数码", "food": "美食",
+            "game": "游戏", "life": "生活日常", "science": "科普",
+            "animation": "动画二次元", "unknown": "未分类",
+        }.get(dom, dom)
+        return (f"B站{label}区的公开评论区（陌生人围观：主要学梗、口语词、表情用法；"
+                f"长论证式的说理**不要**当成句式模板学）")
+    return "B站评论区（陌生人围观，主要学梗和表情用法）"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -647,7 +935,9 @@ def _fake_caller_from_file(path):
 
 
 def learn(sources=("group", "bili"), path=None, cfg=None, caller=None,
-          timeout=None, total_timeout=None, out=None, dry_run=False):
+          timeout=None, total_timeout=None, out=None, dry_run=False,
+          corpus_dir=None, commit_cursor=True,
+          corpus_segments_max=None, corpus_chars_max=None):
     """跑一轮学习。返回真实统计 dict（CLI --json 会原样打印，供人工核对）。"""
     cfg = cfg if cfg is not None else load_config()
     learn_cfg = learning_cfg(cfg)
@@ -655,6 +945,7 @@ def learn(sources=("group", "bili"), path=None, cfg=None, caller=None,
     timeout = timeout or learn_cfg["timeout"]
     total_timeout = total_timeout or learn_cfg["totalTimeout"]
     caller = caller or _default_caller
+    corpus_dir = corpus_dir or learn_cfg["corpusDir"]
 
     result = {
         "mode": "none", "sources": list(sources), "batches": 0, "batches_ok": 0,
@@ -679,8 +970,27 @@ def learn(sources=("group", "bili"), path=None, cfg=None, caller=None,
                 continue
             for seg in bili_segments(d.get("comments") or []):
                 segments.append((seg, "bili"))
+    # 语料池（crawl-bili-comments.mjs）：这一路是「池子」，每轮按预算取一小段，
+    # 游标记着学到哪。它跟上面的 "bili"（现抓现学）刻意分开：一个是攒好的池子，
+    # 一个是配置里的几个固定源，混在一起就没法用游标「分几轮覆盖完整个池子」了。
+    corpus_info = None
+    old_cursor = None
+    if "corpus" in sources:
+        groups = load_corpus_files(corpus_dir)
+        if not groups:
+            errors.append(f"语料池为空或不存在: {corpus_dir}（先跑 scripts/crawl-bili-comments.mjs）")
+        else:
+            old_cursor = read_cursor(corpus_dir)
+            segs, new_cursor, corpus_info = corpus_segments(
+                groups, cursor=old_cursor,
+                max_segments=corpus_segments_max, max_chars=corpus_chars_max)
+            for seg, src in segs:
+                segments.append((seg, src))
+            corpus_info["cursor"] = new_cursor
+            corpus_info["prevCursor"] = old_cursor
     result["segments"] = len(segments)
     result["chars"] = sum(len(s) for s, _ in segments)
+    result["corpus"] = corpus_info
     if errors:
         result["error"] = "；".join(errors)
     if not segments:
@@ -710,8 +1020,10 @@ def learn(sources=("group", "bili"), path=None, cfg=None, caller=None,
             if isinstance(ent, dict):
                 ent = dict(ent)
                 ent.setdefault("source", source)
-                # 里层 source 若被模型瞎写，以实际来源为准
-                if ent.get("source") not in ("group", "bili"):
+                # 里层 source 若被模型瞎写，以实际来源为准。
+                # 语料池那一路的来源是 "bili:<domain>"（分层采样要能追溯领域），
+                # 所以这里不能只认 "group"/"bili" 两个字面量。
+                if not _source_ok(ent.get("source")):
                     ent["source"] = source
             candidates.append(ent)
     result["batches_ok"] = ok_batches
@@ -742,6 +1054,11 @@ def learn(sources=("group", "bili"), path=None, cfg=None, caller=None,
         lex["updatedAt"] = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
         lex["updatedBy"] = "lexicon.py"
         write_lexicon(lex, path)
+        # 游标跟着落盘走：**只在真的学到东西之后**推进。dry_run 不推、
+        # 全失败不推 —— 否则「模型挂了但游标往前走」= 这段语料永远学不到。
+        if commit_cursor and corpus_info and corpus_info.get("cursor") is not None \
+                and (added or merged):
+            write_cursor(corpus_info["cursor"], corpus_dir)
     return result
 
 
@@ -853,6 +1170,12 @@ def main(argv=None):
     lp.add_argument("--path", default=argparse.SUPPRESS, help="lexicon.json 路径（也可写在子命令前）")
     lp.add_argument("--no-group", action="store_true", help="不学本群语料")
     lp.add_argument("--no-bili", action="store_true", help="不学 B站评论区（省风控）")
+    lp.add_argument("--corpus-dir", default=None,
+                    help="语料池目录（crawl-bili-comments.mjs 的产出）；给了就只学池子，不现抓 B站")
+    lp.add_argument("--only-corpus", action="store_true",
+                    help="只学语料池（不学群语料、不现抓 B站）—— 定时任务用这个")
+    lp.add_argument("--segments", type=int, default=None, help="本轮最多几段（默认 18）")
+    lp.add_argument("--max-chars", type=int, default=None, help="本轮最多多少字（默认 12000）")
     lp.add_argument("--timeout", type=int, default=None, help="单段模型调用超时")
     lp.add_argument("--total-timeout", type=int, default=None, help="全程总超时预算")
     lp.add_argument("--fake-llm", default=None, help="测试用：从文件读固定模型回答，不真调模型")
@@ -878,21 +1201,37 @@ def main(argv=None):
 
     if a.cmd == "learn":
         sources = []
-        if not a.no_group:
-            sources.append("group")
-        if not a.no_bili:
-            sources.append("bili")
+        if a.only_corpus:
+            # 只吃语料池：不读群语料、不现抓 B站。定时任务用这个 ——
+            # 现抓 B站每轮都要请求 3 个 BV，跟 crawl 抢风控额度还没增量（池子已经有）。
+            sources = ["corpus"]
+        else:
+            # 给了 --corpus-dir 就是「我要学池子」，此时默认不再现抓 B站
+            # （池子里的评论就是抓来的，重复请求只会白发风控）。
+            if not a.no_bili and not a.corpus_dir:
+                sources.append("bili")
+            if not a.no_group:
+                sources.append("group")
+            if a.corpus_dir or "corpus" in sources:
+                sources.insert(0, "corpus")
         caller = _fake_caller_from_file(a.fake_llm) if a.fake_llm else None
         res = learn(sources=sources, path=a.path, caller=caller,
-                    timeout=a.timeout, total_timeout=a.total_timeout, dry_run=a.dry_run)
+                    timeout=a.timeout, total_timeout=a.total_timeout, dry_run=a.dry_run,
+                    corpus_dir=a.corpus_dir,
+                    corpus_segments_max=a.segments, corpus_chars_max=a.max_chars)
         if a.json:
             print(json.dumps(res, ensure_ascii=False))
         else:
-            print(f"[学习] 模式 {res['mode']} · 语料段 {res['segments']} · "
+            print(f"[学习] 模式 {res['mode']} · 来源 {res['sources']} · 语料段 {res['segments']} · "
                   f"批次 {res['batches_ok']}/{res['batches']} 成功"
                   f"（失败 {res['batches_failed']}）· 模型产出 {res['llm_entries']} 条"
                   f" → 新增 {res['added']} / 合并 {res['merged']} · 库里 {res['entries']} 条"
                   f" · {res['elapsed']}s")
+            ci = res.get("corpus")
+            if ci:
+                print(f"   语料池：{ci['segments']} 段 / {ci['chars']} 字 / 领域 {ci['domains']}"
+                      f" · {ci['chars'] and round(ci['chars'] / max(1, ci['segments']), 0)} 字每段"
+                      f" · 池子{'已学完' if ci.get('exhausted') else '还有剩余'}")
             if res.get("dropped"):
                 print(f"   质量闸挡下：{res['dropped']}")
             if res.get("error"):

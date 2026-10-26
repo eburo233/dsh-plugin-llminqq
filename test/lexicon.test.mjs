@@ -472,6 +472,170 @@ console.log('\n=== B2. 桥侧：抠出 lexicon 段落单独求值 ===')
   }
 }
 
+console.log('\n=== A7. 语料池：分层采样 / 游标 / 每轮预算 / 来源标注 ===')
+{
+  // 语料池是 crawl-bili-comments.mjs 抓的跨分区评论。这一组测的是「学习端怎么吃池子」：
+  //   ① 分层采样：每个 domain 都要有份，不能被热门领域吃满（随机会让历史/科普被淹没）
+  //   ② 游标：两轮不重复，同一段不会被反复学
+  //   ③ 单轮预算：段数 + 字数双闸（对应「4000 条是池子，不是单轮输入量」）
+  //   ④ source 记成 bili:<domain>（排查「学歪了是哪个领域带偏的」的唯一线索）
+  // 全部用临时目录，绝不碰生产 corpus/。
+
+  const CORPUS = path.join(TMP, 'corpus')
+  fs.mkdirSync(CORPUS, { recursive: true })
+  // 造 7 个 domain 的池子：game/tech 各给 3 个文件（模拟热门领域语料多），
+  // history/science 各 1 个（模拟冷门）。文件越多不等于越容易被抽到 —— 这正是要测的。
+  const mkDoc = (bvid, domain, n) => {
+    const comments = []
+    for (let i = 0; i < n; i++) {
+      comments.push({
+        user: `u${i}`,
+        content: `${bvid} 的 ${domain} 区第${i}条评论：这话说得也太过分了吧，绷不住`,
+        like: i,
+        top_replies: [{ user: `r${i}`, content: `楼中楼${i}：确实，有点离谱`, like: 1 }],
+      })
+    }
+    return { bvid, domain, fetchedAt: 1, count: comments.length, comments }
+  }
+  const docs = [
+    ['BVgame1', 'game', 30], ['BVgame2', 'game', 30], ['BVgame3', 'game', 30],
+    ['BVtech1', 'tech', 30], ['BVtech2', 'tech', 30], ['BVtech3', 'tech', 30],
+    ['BVhist1', 'history', 30],
+    ['BVsci1', 'science', 30],
+    ['BVlife1', 'life', 30],
+  ]
+  for (const [bv, dom, n] of docs) {
+    fs.writeFileSync(path.join(CORPUS, `bili-${bv}.json`), JSON.stringify(mkDoc(bv, dom, n)), 'utf8')
+  }
+
+  const pyL = (code) => execFileSync('python3', ['-c', code], {
+    encoding: 'utf8', timeout: 30000,
+    env: { ...process.env, PYTHONIOENCODING: 'utf8' },
+  })
+
+  // ① 分层：第一轮每个 domain 至少 1 段（game/tech 文件再多也不能独占全部额度）
+  const r1 = JSON.parse(pyL(`
+import sys, json
+sys.path.insert(0, ${JSON.stringify(path.join(ROOT, 'qq-agent/memory'))})
+import lexicon as L
+g = L.load_corpus_files(${JSON.stringify(CORPUS)})
+segs, cursor, info = L.corpus_segments(g, cursor={}, max_segments=14, max_chars=100000,
+                                       per_domain=2)
+print(json.dumps({"n": len(segs), "sources": [s for _, s in segs],
+                  "doms": sorted({s.split(":", 1)[1] for _, s in segs}),
+                  "info": info, "cursor": cursor}, ensure_ascii=False))
+`))
+  ok('语料池按 domain 分组读出来', Object.keys(r1.cursor).length > 0, JSON.stringify(r1.cursor))
+  ok('冷门领域（history/science/life）都有份，没被热门吃满',
+    ['history', 'science', 'life'].every(d => r1.doms.includes(d)), JSON.stringify(r1.doms))
+  ok('每个领域单轮不超过 per_domain=2 段',
+    Object.values(r1.sources.reduce((m, s) => { m[s] = (m[s] ?? 0) + 1; return m }, {}))
+      .every(n => n <= 2), JSON.stringify(r1.sources))
+  ok('source 标成 bili:<domain>', r1.sources.every(s => /^bili:[a-z]+$/.test(s)), JSON.stringify(r1.sources))
+
+  // ② 游标：第二轮从第一轮停的地方接着学，两轮内容不重复
+  const r2 = JSON.parse(pyL(`
+import sys, json
+sys.path.insert(0, ${JSON.stringify(path.join(ROOT, 'qq-agent/memory'))})
+import lexicon as L
+g = L.load_corpus_files(${JSON.stringify(CORPUS)})
+c1 = json.loads(${JSON.stringify(JSON.stringify(r1.cursor))})
+s1, _, _ = L.corpus_segments(g, cursor={}, max_segments=14, max_chars=100000, per_domain=2)
+s2, c2, _ = L.corpus_segments(g, cursor=c1, max_segments=14, max_chars=100000, per_domain=2)
+print(json.dumps({"t1": [t for t, _ in s1], "t2": [t for t, _ in s2], "c2": c2}, ensure_ascii=False))
+`))
+  ok('第二轮不重复第一轮已学过的段（游标生效）',
+    r2.t2.length > 0 && r2.t2.every(t => !r2.t1.includes(t)),
+    `重复 ${r2.t2.filter(t => r2.t1.includes(t)).length} 段`)
+  ok('游标只前进不倒退',
+    Object.entries(r2.c2).every(([k, v]) => (r1.cursor[k] ?? 0) <= v), JSON.stringify(r2.c2))
+
+  // ③ 单轮预算：段数闸 + 字数闸（4000 条是池子，单轮最多 15-20 段/1.2 万字）
+  const r3 = JSON.parse(pyL(`
+import sys, json
+sys.path.insert(0, ${JSON.stringify(path.join(ROOT, 'qq-agent/memory'))})
+import lexicon as L
+g = L.load_corpus_files(${JSON.stringify(CORPUS)})
+segs, _, info = L.corpus_segments(g, cursor={}, max_segments=5, max_chars=100000, per_domain=3)
+print(json.dumps({"n": len(segs), "chars": sum(len(t) for t, _ in segs)}, ensure_ascii=False))
+`))
+  ok('max_segments 是硬闸（要 5 段就只给 5 段）', r3.n === 5, JSON.stringify(r3))
+  const r4 = JSON.parse(pyL(`
+import sys, json
+sys.path.insert(0, ${JSON.stringify(path.join(ROOT, 'qq-agent/memory'))})
+import lexicon as L
+g = L.load_corpus_files(${JSON.stringify(CORPUS)})
+segs, _, info = L.corpus_segments(g, cursor={}, max_segments=40, max_chars=1500, per_domain=9)
+print(json.dumps({"n": len(segs), "chars": sum(len(t) for t, _ in segs)}, ensure_ascii=False))
+`))
+  ok('max_chars 是硬闸（1500 字预算下不会超）', r4.chars <= 1500, JSON.stringify(r4))
+
+  // ④ 清洗：B站表情标记（QQ 发不出去）/回复前缀/@人 不进 prompt
+  const r5 = JSON.parse(pyL(`
+import sys, json
+sys.path.insert(0, ${JSON.stringify(path.join(ROOT, 'qq-agent/memory'))})
+import lexicon as L
+cases = ["确实[脱单doge]", "回复 @某某 : 这也太离谱了", "看[米雪儿·绮星梦使 应援装扮_哈气]",
+         "@张三 你说得对", "纯表情[哦呼][哦呼][哦呼]", "[冷][冷][冷]"]
+print(json.dumps([L._crawl_clean(c) for c in cases], ensure_ascii=False))
+`))
+  ok('B站表情标记被洗掉（含带·和_的动态表情包名）',
+    r5.every(t => !/\[[^\]]{1,40}\]/.test(t)), JSON.stringify(r5))
+  ok('「回复 @某某 : 」前缀被剥掉', r5[1] === '这也太离谱了', JSON.stringify(r5[1]))
+  ok('@人 被剥掉', !/@张三/.test(r5[3]), JSON.stringify(r5[3]))
+  ok('纯表情评论洗成空串（会被 MIN_CHAT_CHARS 挡掉）', r5[5] === '', JSON.stringify(r5[5]))
+
+  // ⑤ 落盘链路：learn --corpus-dir 真跑假模型 → 词库有 bili:<domain> 来源、游标被推进
+  const p = freshJson('corpus-learn')
+  const fake = writeFake([
+    { kind: 'word', text: '绷不住', meaning: '忍不住笑', usage: '看到离谱的东西时', confidence: 0.8 },
+  ])
+  const rl = py(['--path', p, 'learn', '--only-corpus', '--corpus-dir', CORPUS,
+    '--fake-llm', fake, '--json', '--segments', '4', '--max-chars', '100000'])
+  ok('learn --only-corpus 跑通（假模型）', rl.json?.mode === 'llm', rl.text || rl.stderr)
+  ok('报出语料池分层信息', Array.isArray(rl.json?.corpus?.domains) && rl.json.corpus.domains.length > 0,
+    JSON.stringify(rl.json?.corpus))
+  const cursorPath = path.join(CORPUS, '.learn-cursor.json')
+  ok('游标文件写出来了（下一轮才能接着学）', fs.existsSync(cursorPath), cursorPath)
+  const cur = JSON.parse(fs.readFileSync(cursorPath, 'utf8'))
+  ok('游标是真的往后走了（不是全 0）', Object.values(cur).some(v => v > 0), JSON.stringify(cur))
+  const lexAfter = JSON.parse(fs.readFileSync(p, 'utf8'))
+  ok('学到的词条来源是 bili:<domain>（可追溯领域）',
+    lexAfter.entries.length > 0 && lexAfter.entries.every(e => /^bili:[a-z]+$/.test(e.source)),
+    JSON.stringify(lexAfter.entries.map(e => e.source)))
+
+  // ⑥ dry-run 不推进游标（否则「预览一次」就把这段语料白吃了）
+  const p2 = freshJson('corpus-dry')
+  const fake2 = writeFake([{ kind: 'word', text: '预览词', meaning: 'x', usage: 'y', confidence: 0.8 }])
+  const curBefore = JSON.parse(fs.readFileSync(cursorPath, 'utf8'))
+  py(['--path', p2, 'learn', '--only-corpus', '--corpus-dir', CORPUS,
+    '--fake-llm', fake2, '--json', '--dry-run', '--segments', '3', '--max-chars', '100000'])
+  const curAfter = JSON.parse(fs.readFileSync(cursorPath, 'utf8'))
+  ok('--dry-run 不推进游标（预览不消耗语料）',
+    JSON.stringify(curBefore) === JSON.stringify(curAfter), '游标被推进了')
+
+  // ⑦ 路径可覆盖（CONTRIBUTING §9）：corpusDir 指到哪读哪
+  {
+    const elseDir = path.join(TMP, 'corpus-elsewhere')
+    fs.mkdirSync(elseDir, { recursive: true })
+    const cfgP = path.join(TMP, 'cfg-corpus.json')
+    fs.writeFileSync(cfgP, JSON.stringify({
+      learning: { corpusDir: elseDir, corpusRoundSegments: 2, corpusRoundChars: 100000 },
+    }), 'utf8')
+    const rEmpty = py(['--config', cfgP, '--path', freshJson('cfg'),
+      'learn', '--only-corpus', '--json', '--fake-llm', fake])
+    // learn 在「没学到东西」时退出码是 1，execFileSync 会抛 → py() 里的 json 是 null，
+    // 所以这里自己解析那一行（否则断言会一直假失败，看起来像路径没覆盖）
+    let emptyJson = rEmpty.json
+    if (!emptyJson) { try { emptyJson = JSON.parse(rEmpty.text.trim().split('\n').pop()) } catch {} }
+    // 指到空目录 → 明确报「池子为空」，而不是偷偷读生产 corpus/
+    ok('corpusDir 可被 config 覆盖（指到空目录就只认空目录）',
+      emptyJson && emptyJson.segments === 0 &&
+      String(emptyJson.error || '').includes(elseDir),
+      rEmpty.text)
+  }
+}
+
 console.log('\n=== C. 生产文件没被动过吗 ===')
 {
   // 这条断言以前在 style-bank.test.mjs 里踩过坑：写成 fs.existsSync(文件) → 恒真，等于没检查。
