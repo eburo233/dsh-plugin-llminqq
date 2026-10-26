@@ -31,6 +31,12 @@ qq-agent/meme-pack/*.png
 qq-agent/meme-pack/*.gif
 qq-agent/memory/mem.db
 qq-agent/memory/log/
+# 自我风格样本库（运行时数据，跟 mem.db 同性质，不进版本控制）
+qq-agent/memory/style.db
+qq-agent/memory/style-cases.jsonl
+qq-agent/memory/.style_cursor
+qq-agent/memory/.style_cursor_log
+qq-agent/.bridge/
 
 # ASR 临时音频（转写完就该清，不进库）
 qq-agent/tools/tmp/
@@ -38,3 +44,9 @@ qq-agent/tools/tmp/
 # Python 缓存
 __pycache__/
 *.pyc
+
+# 桥的运行时状态目录（撤回日志等）
+qq-agent/.bridge/
+# B站截帧临时文件
+qq-agent/.tmp-frames/
+qq-agent/tools/tmp/
