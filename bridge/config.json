@@ -215,6 +215,19 @@
       "reasoningEffort": null
     }
   },
+  "learning": {
+    "enabled": true,
+    "biliSources": [
+      "BV1fYpn6SEk9",
+      "BV1pGnn67EC2",
+      "BV1MNYy6WEgY"
+    ],
+    "biliNum": 8,
+    "timeout": 120,
+    "totalTimeout": 900,
+    "maxGroupMessages": 160,
+    "groupBatch": 40
+  },
   "style": {
     "enabled": false,
     "record": false

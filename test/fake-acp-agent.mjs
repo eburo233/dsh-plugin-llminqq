@@ -12,6 +12,10 @@ import fs from 'node:fs'
 const REPLY_FILE = process.env.FAKE_ACP_REPLY_FILE ?? ''
 const FALLBACK = process.env.FAKE_ACP_REPLY ?? '好的'
 const TRACE = process.env.FAKE_ACP_TRACE ?? ''
+// FAKE_ACP_PROMPT_LOG（新增，可选）：把每轮**收到的完整 prompt 文本**追加到文件。
+// 用来端到端验证「桥这一轮到底给模型注入了什么」—— 只落 trace 是不够的，
+// trace 只记方法名，看不到 prompt 正文（lexicon 注入验证要靠它）。
+const PROMPT_LOG = process.env.FAKE_ACP_PROMPT_LOG ?? ''
 const currentReply = () => {
   try {
     const s = fs.readFileSync(REPLY_FILE, 'utf8').trim()
@@ -53,6 +57,11 @@ function handle(frame) {
       return write({ jsonrpc: '2.0', id, result: {} })
     case 'session/prompt': {
       const sessionId = params?.sessionId
+      if (PROMPT_LOG) {
+        // prompt 是 blocks 数组：[{type:'text', text:'...'}]（桥把上下文拼在 text 里）
+        const text = (params?.prompt ?? []).map(b => b?.text ?? '').join('\n')
+        try { fs.appendFileSync(PROMPT_LOG, text + '\n') } catch { /* ignore */ }
+      }
       // ACP：prompt 是阻塞调用，先流式吐 session/update，再回 result
       write({
         jsonrpc: '2.0', method: 'session/update',

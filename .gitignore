@@ -50,3 +50,9 @@ qq-agent/.bridge/
 # B站截帧临时文件
 qq-agent/.tmp-frames/
 qq-agent/tools/tmp/
+
+# 说话方式学习（运行时数据，同 mem.db/style.db 性质：会定时重新生成，不进版本控制）
+# ⚠️ lexicon.json 不是代码资产，是「学出来的词库」—— 每次 learn 都会改写它，
+#    进库的话每 12 小时就有一次噪音提交。模板见 qq-agent/memory/lexicon.json.example
+qq-agent/memory/lexicon.json
+qq-agent/memory/.lexicon-*

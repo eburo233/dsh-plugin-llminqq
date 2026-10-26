@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "updatedAt": "2026-10-26T00:00:00+00:00",
+  "updatedBy": "lexicon.py",
+  "_说明": "这是模板，真实词库在内存/lexicon.json（gitignore），由 scripts/learn.sh 每 12 小时重生成。",
+  "entries": [
+    {
+      "kind": "word",
+      "text": "绷不住",
+      "meaning": "忍不住笑、扛不住",
+      "usage": "看到离谱或好笑的东西时顶一句",
+      "source": "bili",
+      "confidence": 0.8,
+      "hits": 3,
+      "firstSeen": 1793000000,
+      "lastSeen": 1793000000
+    },
+    {
+      "kind": "meme",
+      "text": "大肥鱼",
+      "meaning": "网友对某个 AI 的戏称",
+      "usage": "提到那个 AI（包括自嘲）时用",
+      "source": "group",
+      "confidence": 0.9,
+      "hits": 5,
+      "firstSeen": 1793000000,
+      "lastSeen": 1793000000
+    },
+    {
+      "kind": "expression",
+      "text": "笑哭类表情",
+      "meaning": "无奈又想笑",
+      "usage": "被对方离谱操作整无语、但又觉得好笑时",
+      "source": "bili",
+      "confidence": 0.75,
+      "hits": 2,
+      "firstSeen": 1793000000,
+      "lastSeen": 1793000000
+    },
+    {
+      "kind": "pattern",
+      "text": "X 成啥了",
+      "meaning": "调侃某物被改成很离谱的样子",
+      "usage": "看到明显被改坏/改离谱的东西时吐槽（pattern 置信度会打折，别硬套）",
+      "source": "bili",
+      "confidence": 0.45,
+      "hits": 1,
+      "firstSeen": 1793000000,
+      "lastSeen": 1793000000
+    }
+  ]
+}

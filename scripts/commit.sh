@@ -35,7 +35,7 @@ SUITES=(
   unit card-parse url-guard sanitize forward-path
   proactive-logic flurry-logic mood-logic mood-decay mood-traits delay-logic chain-walk
   quote-reply memory-cross-channel arousal-cap energy-mood-link recall
-  style-bank memory-cross-channel
+  style-bank memory-cross-channel lexicon
 )
 total_pass=0
 total_fail=0

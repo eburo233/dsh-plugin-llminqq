@@ -2317,6 +2317,86 @@ function startProactiveLoop () {
   logger.log(`proactive: 已启动，tick=${c.tickMin}min 白名单=[${c.whitelist.join(',')}]`)
 }
 
+// ── 说话方式学习（从「别人」的语料里学词汇/梗/表情用法/句式）─────────────────────
+// 三个已定的设计点（用户拍的，别改）：
+//   ① 学其他人 —— 学自己由上面的 stylebank 负责（效果未证），这里只吃
+//      qq-agent/memory/log/*.jsonl（群友原话）和 B站评论区楼中楼。
+//   ② 单独文件存 lexicon.json —— 人可读、可 diff，且**不污染 persona.md**
+//      （persona 是它自己会改的「我是谁」，词汇表是外来素材，混进去会被它下次自改冲掉）。
+//   ③ 定时跑 —— scripts/learn.sh + 独立 systemd timer（每 12h，比反思低：语料更新慢）。
+//      提炼要调模型、几分钟，塞进桥的对话链路会阻塞回话，所以是独立进程。
+//
+// 为什么不并进 stylebank.db：那是「我上次类似场合怎么说的」，
+// 这里是「别人平时怎么说话的」—— 视角相反，一张表会互相稀释。
+//
+// 路径全可覆盖（CONTRIBUTING §9）：端到端测试能把 lexicon.json 指到临时文件，
+// 保证测试绝不会往生产 memory/ 写数据。
+const LEXICON_ROOTS = (() => {
+  const base = config.learning?.dir ?? path.join(config.dsh.cwd, 'memory')
+  return {
+    script: config.learning?.script ?? path.join(base, 'lexicon.py'),
+    json: config.learning?.json ?? path.join(base, 'lexicon.json'),
+    recallTimeoutMs: config.learning?.recallTimeoutMs ?? 4000,
+    // 2 分钟缓存：文件 mtime 变了才作废（定时学完自然生效），避免每轮都起 python
+    cacheTtlMs: config.learning?.cacheTtlMs ?? 120000,
+    // 默认 900 跟 lexicon.py 的 DEFAULT_MAX_CHARS 保持一致：
+    // 渲染块尾巴那段「正经答题一个都别用」的约束是**防硬塞的关键**，
+    // 预算太小会把它截掉 → 约束失效、模型又开始堆词（比不注入更糟）。
+    maxChars: config.learning?.maxChars ?? 900,
+    injectN: config.learning?.injectN ?? 12,
+  }
+})()
+const lexiconCache = { at: 0, mtimeMs: -1, block: '' }
+
+/**
+ * 读 lexicon.json 渲染成可注入的上下文块；拿不到就返回 ''（静默降级）。
+ *
+ * 为什么不把词库直接读进桥、在 JS 里拼：渲染规则（排序、长度预算、冷启动闸）
+ * 只该有一份，放在 lexicon.py 里；桥复用它，和 stylebank 走 python 是同一套理由。
+ * 失败一律不注入：学来的词是锦上添花，不是主链路。
+ */
+function lexiconBlock () {
+  try {
+    if (!fs.existsSync(LEXICON_ROOTS.json)) return ''
+    const st = fs.statSync(LEXICON_ROOTS.json)
+    if (Date.now() - lexiconCache.at < LEXICON_ROOTS.cacheTtlMs &&
+        lexiconCache.mtimeMs === st.mtimeMs) return lexiconCache.block
+    const out = execFileSync('python3', [
+      LEXICON_ROOTS.script,
+      'render',
+      '--path', LEXICON_ROOTS.json,
+      '--n', String(LEXICON_ROOTS.injectN),
+      '--max-chars', String(LEXICON_ROOTS.maxChars),
+      '--json',
+    ], { encoding: 'utf8', timeout: LEXICON_ROOTS.recallTimeoutMs, stdio: ['ignore', 'pipe', 'ignore'] })
+    const res = JSON.parse(String(out).trim().split('\n').pop())
+    const block = res?.injected ? String(res.block ?? '') : ''
+    if (block.length > LEXICON_ROOTS.maxChars) {
+      // 双保险：python 侧已经控过长度，这里再兜一层，绝不让它挤占 prompt 预算
+      logger.debug(`lexicon: 块过长（${block.length} > ${LEXICON_ROOTS.maxChars}），截断`)
+    }
+    const safe = block.length > LEXICON_ROOTS.maxChars ? '' : block
+    lexiconCache.at = Date.now()
+    lexiconCache.mtimeMs = st.mtimeMs
+    lexiconCache.block = safe
+    if (safe) logger.log(`lexicon: 注入学来的说话方式（库 ${res.total} 条）`)
+    else if (res?.reason) {
+      // 区分两种情况（重要）：cold-start / no-usable-entry 是**正常**的「还没学够」，
+      // 用 debug；而 no-file/bad-json/bad-shape/unreadable 是**词库坏了** ——
+      // 那种要能被运维看见（WARN），否则「一直不注入」会静默持续好几天。
+      const broken = !['cold-start', 'no-usable-entry'].includes(res.reason)
+      const msg = `lexicon: 不注入（${res.reason}，库 ${res.total} 条）`
+      if (broken) logger.warn(msg)
+      else logger.debug(msg)
+    }
+    return safe
+  } catch (err) {
+    // 文件不存在/半截 JSON/python 挂掉/超时都走这里 —— 不注入，本轮照常说话
+    logger.debug(`lexicon 读取失败（不注入，不影响对话）: ${String(err.message).slice(0, 100)}`)
+    return ''
+  }
+}
+
 // ── 模型路由故障转移 ────────────────────────────────────────────────────────
 // 现象：trae/deepseek-v4.1-flash 会间歇性 `turn ended: error`（今天已 4 次）。
 // 策略：连续失败 N 次 → 切到下一条备选路由；主路由冷却 probeBackMs 后探测一次，
@@ -2805,6 +2885,13 @@ async function handleInbound(evt) {
     // 位置在记忆之后、硬约束之前 —— 越靠后越靠近行动，但不能压住硬约束。
     const styleBlock = styleAnchorBlock(peerKey, flat.text || forwardText || '')
     if (styleBlock) contextLines.push('', styleBlock)
+    // 说话方式学习：把「从别人语料里学来的词汇/梗/表情用法/句式」放进来。
+    // 位置紧贴硬约束之前 —— 它是「说话的手感」，应该靠近行动，但不能压住硬约束。
+    // 冷启动（库 <3 条）/文件不存在/解析失败 → lexiconBlock 返回 ''，不注入。
+    // 「贴切才用，别硬塞」这句话是渲染块自带的尾巴（lexicon.py RENDER_FOOTER），
+    // 因为「学来的词无脑堆」是这个功能最容易翻车的地方。
+    const lexBlock = lexiconBlock()
+    if (lexBlock) contextLines.push('', lexBlock)
     contextLines.push(
       `【硬约束】QQ 通道不认 [表情: 描述] 文字标记；要发表情包必须用 qq-meme skill 发送真实图片文件并输出 [SEND_FILE: 绝对路径]。`,
       `【硬约束】[SEND_FILE] 只放行会话工作区 (${config.dsh.cwd}) 与暂存目录 (${STAGING_DIR}) 内的文件。`,
