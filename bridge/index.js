@@ -1183,6 +1183,40 @@ const PROACTIVE_DEFAULTS = {
   nightEndHour: 1,
   nightFactor: 0.5,
   whitelist: [],
+  // ── 「接话窗口」（chatFollow，2026-10-26 新增；语义经过两轮纠正，别按旧注释理解）──
+  //
+  // 用户的原话：
+  //   「十分钟内可以不等对方发言。过十分钟回到原有逻辑，**不是对方10分钟不发言就找新话题**，
+  //     这样可能一直找新话题，不进原有逻辑。」
+  //   「在话题中正常人的对话一般不是一问一答的，而是这边几句那边几句。」
+  //
+  // 所以 silentMin 是**窗口长度**，不是「沉默到点触发」的门槛。时间轴：
+  //
+  //   T0          对方发消息（锚点 = lastUserMsgAt）
+  //   T0 ~ T0+10  窗口**开着**：我可以不等他回复就补话（这边几句那边几句）
+  //   T0+10 之后  窗口**彻底关闭** → chatFollow 停止，什么都不做
+  //               → 交给原有逻辑：我安静满 20min → 概率模型掷骰
+  //
+  // ⚠️ 三条硬规则（第一版全错了，这里写死，后人也别再改错）：
+  //   ① **锚点是对方最后一条消息**（lastUserMsgAt）。我说话**不延长窗口**。
+  //      否则我一直说自己就把窗口一直续上，退化成「无限找新话题」——正是用户担心的。
+  //      代码层面：touchLastUserMsg 只在**入站**时调，touchLastSpoke 绝不改它。
+  //   ② 窗口外 chatFollow 必须**彻底停**，不是「换个方式再找话题」。
+  //   ③ chatFollow 只做「把**当前话题**接着聊」，不做「起新话题」。
+  //      起新话题是窗口外原有 20min 概率路径的职责，两套逻辑**串行衔接**，不是并行竞争。
+  //
+  // 交互效果（这才是自然的）：
+  //   对方说话 → 我回 → 窗口开 10 分钟
+  //     窗口内：可以说 1-2 句（受 maxPerHour + 60~90s 间隔防抖）
+  //   10 分钟后窗口关，chatFollow 不再触发 → lastSpokeAt 自然老化
+  //   → 满 20 分钟，原有概率路径开始评估（「该不该主动找话了」）
+  chatFollow: {
+    enabled: true,
+    silentMin: 10,        // 窗口长度：对方最后一条消息之后这么多分钟内可以补话
+    maxPerHour: 3,        // 窗口内最多补几次（防刷屏）
+    minGapSec: 75,        // 窗口内两次补话的最短间隔（防「立刻连发」；真人也要隔一会儿）
+    maxFollowUps: 3,      // 每个窗口最多补几轮（我说话不续窗口，所以这是上限不是续期）
+  },
 }
 
 function proactiveCfg () {
@@ -1198,8 +1232,12 @@ function proactiveState (peerKey) {
       p: proactiveCfg().baseProb,
       missStreak: 0,
       lastSpokeAt: 0,
+      lastUserMsgAt: 0,       // 对方最后一次发言 = 接话**窗口的锚点**（我说话不改它）
       lastProactiveAt: 0,
       cooldownUntil: 0,
+      followHits: [],         // 接话最近命中的时间戳（每小时限频用）
+      followChain: 0,         // 本窗口内已补几句（窗口关了/新窗口开时清零）
+      followWindowClosedAt: 0, // 窗口关闭时刻（日志+下个窗口重置用；0=窗口开着）
     }
   }
   return ps.proactive
@@ -1209,6 +1247,13 @@ function proactiveState (peerKey) {
 function touchLastSpoke (peerKey) {
   const st = proactiveState(peerKey)
   if (st) st.lastSpokeAt = Date.now()
+  saveState()
+}
+
+/** 记录「对方最后一次发言」时间（接话路径的计时基准）。 */
+function touchLastUserMsg (peerKey) {
+  const st = proactiveState(peerKey)
+  if (st) st.lastUserMsgAt = Date.now()
   saveState()
 }
 
@@ -1731,6 +1776,31 @@ function replyDelayMs (text, peerKey) {
 }
 
 let proactiveTimer = null
+let chatFollowTimer = null
+
+/** 接话路径的配置（跟 proactive 共用 PROACTIVE_DEFAULTS，用户可只覆盖 chatFollow 段）。 */
+function chatFollowCfg () {
+  return { ...PROACTIVE_DEFAULTS.chatFollow, ...(proactiveCfg().chatFollow ?? {}) }
+}
+
+/**
+ * 接话限频：最近一小时内已经接了几次。
+ * followHits 只存最近 1 小时的命中时间戳，读的时候顺手清理旧的（自净，不用额外定时器）。
+ */
+function followRateOk (st, now = Date.now()) {
+  const c = chatFollowCfg()
+  const hits = (st.followHits ?? []).filter(t => now - t < 3600000)
+  st.followHits = hits
+  return hits.length < c.maxPerHour
+}
+
+/** 记一次接话命中（限频用）。 */
+function noteFollowHit (st, now = Date.now()) {
+  const hits = (st.followHits ?? []).filter(t => now - t < 3600000)
+  hits.push(now)
+  st.followHits = hits
+  saveState()
+}
 
 /** 选一个可以主动搭话的 peer：v1 只看白名单里的私聊。 */
 function proactiveCandidates () {
@@ -1812,6 +1882,212 @@ async function proactiveTick () {
       logger.log(`proactive[${peerKey}] 空转（真没话说），不累加 missStreak（当前 ${st.missStreak}，空转累计 ${st.empties}）`)
     }
     saveState()
+  }
+}
+
+// ── 接话窗口（chatFollow）────────────────────────────────────────────────────
+// 语义见 PROACTIVE_DEFAULTS.chatFollow 上方那段长注释。一句话：
+// **窗口内（对方最后一条消息之后 10 分钟内）可以不等回复就补话；窗口外彻底停。**
+// 窗口外的事不归这里管，归上面那条 20min 概率路径管 —— 两套逻辑**串行衔接**。
+//
+// 与 proactive 共享：静默时段、冷却、发送链路。
+// 不共享：概率模型（接话不看概率）、限频计数（各自独立，避免互相挤占额度）。
+/**
+ * 接话窗口的**纯决策函数**（不读写 state、不调模型、不发消息）。
+ *
+ * 抽出来的原因有两个，都很实际：
+ *   ① 窗口语义被改错过两次（「沉默到点就开口」→「窗口内才补话」），
+ *      把时间段判断集中到这里，测试才能用**假时钟**直接验证「窗口内/窗口外」的分界，
+ *      不用真的等 10 分钟。（真跑一遍 10 分钟的测试不会有人愿意跑。）
+ *   ② 边界条件写在一处，比散落在 tick 里更容易看对。
+ *
+ * 三条硬规则的落点（见 PROACTIVE_DEFAULTS.chatFollow 注释）：
+ *   规则①（锚点是 lastUserMsgAt，我说话不延长窗口）→ 这里只看 st.lastUserMsgAt，
+ *         **完全不碰 lastSpokeAt 来算 age**。
+ *   规则②（窗口外彻底停）→ age > windowMs 时 act=false，且不改任何「要不要找新话题」的意图。
+ *   规则③（只补当前话题，不找新话题）→ 体现在 chatFollowSpeak 的 prompt 里。
+ *
+ * @returns {{act:boolean, why?:string, age:number, windowClosedNow:boolean, newWindow:boolean}}
+ */
+function chatFollowDecision (st, now, cfg) {
+  const c = cfg ?? chatFollowCfg()
+  const windowMs = Math.max(1, Number(c.silentMin)) * 60000
+  const minGapMs = Math.max(0, Number(c.minGapSec) || 0) * 1000
+  // ① 从没收到过他的消息 → 不接（那是「起话」，20min 概率路径的事）
+  if (!st.lastUserMsgAt) return { act: false, why: '他还没发过言', age: Infinity, windowClosedNow: false, newWindow: false }
+
+  const age = now - st.lastUserMsgAt
+
+  // ② 窗口外 → **彻底停**。不是「换个方式找新话题」，是直接不管。
+  if (age > windowMs) {
+    const windowClosedNow = !st.followWindowClosedAt
+    if (windowClosedNow) {
+      st.followWindowClosedAt = now
+      st.followChain = 0
+    }
+    return { act: false, why: `窗口外（对方最后发言 ${Math.round(age / 60000)}min 前 > ${c.silentMin}min）`, age, windowClosedNow, newWindow: false }
+  }
+
+  // 窗口内。如果上次标记过关闭（说明对方又说话了），开新窗口并重置本窗口计数
+  let newWindow = false
+  if (st.followWindowClosedAt) {
+    st.followWindowClosedAt = 0
+    st.followChain = 0
+    newWindow = true
+  }
+
+  // ③ 窗口内但要满足补话间隔（防立刻连发）
+  if (st.lastSpokeAt && now - st.lastSpokeAt < minGapMs) {
+    return { act: false, why: `距我上次发言 ${Math.round((now - st.lastSpokeAt) / 1000)}s < ${c.minGapSec}s`, age, windowClosedNow: false, newWindow }
+  }
+  // ④ 冷却中（原路径命中后设的）→ 不接，避免两条路径叠在一起连着说话
+  if (now < st.cooldownUntil) {
+    return { act: false, why: `冷却中（剩 ${((st.cooldownUntil - now) / 60000).toFixed(0)}min）`, age, windowClosedNow: false, newWindow }
+  }
+  // ⑤ 每小时限频
+  if (!followRateOk(st, now)) {
+    return { act: false, why: `本小时已补 ${st.followHits?.length ?? 0}/${c.maxPerHour} 次`, age, windowClosedNow: false, newWindow }
+  }
+  // ⑥ 单个窗口内的补话上限
+  const chain = st.followChain ?? 0
+  if (chain >= (c.maxFollowUps ?? 3)) {
+    return { act: false, why: `本窗口已补 ${chain} 轮，到上限 ${c.maxFollowUps}`, age, windowClosedNow: false, newWindow }
+  }
+  return { act: true, age, windowClosedNow: false, newWindow }
+}
+
+async function chatFollowTick () {
+  const c = chatFollowCfg()
+  if (c.enabled === false) return
+  const pc = proactiveCfg()
+  if (pc.enabled === false) return          // 总开关关掉就都不跑
+  const win = proactiveWindow()
+  if (win.skip) return                      // 静默时段：不打扰（跟原路径同一套时段闸）
+  const candidates = proactiveCandidates()  // 复用同一批白名单 peer
+  if (!candidates.length) return
+  const now = Date.now()
+
+  for (const { peerKey, peer } of candidates) {
+    const st = proactiveState(peerKey)
+    if (!st) continue
+    const d = chatFollowDecision(st, now, c)
+    if (d.windowClosedNow) {
+      saveState()
+      logger.log(`chatFollow[${peerKey}] 窗口已关闭（对方最后发言 ${Math.round(d.age / 60000)}min 前），交给 20min 概率路径`)
+    }
+    if (d.newWindow) {
+      saveState()
+      logger.log(`chatFollow[${peerKey}] 新窗口打开（他又说话了，age=${Math.round(d.age / 1000)}s），本窗口补话计数清零`)
+    }
+    if (!d.act) {
+      if (d.why) logger.debug(`chatFollow[${peerKey}] 跳过：${d.why}`)
+      continue
+    }
+    const chain = st.followChain ?? 0
+
+    // ⑦ 忙就别插话
+    if (busy.has(peerKey)) continue
+
+    logger.log(`chatFollow[${peerKey}] 窗口内触发：对方最后发言 ${Math.round(age / 60000)}min 前（窗口 ${c.silentMin}min 内），继续聊当前话题`)
+    const spoke = await chatFollowSpeak(peerKey, peer)
+    if (spoke) {
+      noteFollowHit(st, now)
+      st.followChain = chain + 1
+      st.lastSpokeAt = Date.now()
+      st.lastProactiveAt = Date.now()
+      // 不设 cooldownUntil：窗口内本来就是「说几句」，加冷却会退化成严格一问一答。
+      // 防刷屏靠 maxPerHour + minGapSec + maxFollowUps 三道闸。
+      logger.log(`chatFollow[${peerKey}] 已补一句（本小时第 ${st.followHits.length}/${c.maxPerHour} 次，本窗口第 ${st.followChain}/${c.maxFollowUps} 轮）`)
+    } else {
+      st.lastEmptyAt = Date.now()
+      st.empties = (st.empties ?? 0) + 1
+      logger.log(`chatFollow[${peerKey}] 模型判断这会儿不用补（空转累计 ${st.empties}）`)
+    }
+    saveState()
+  }
+}
+
+/**
+ * 让模型判断「这话题要不要再补一句」，并真的发出去。
+ *
+ * 与原路径 proactiveSpeak 的根本区别（别混）：
+ *   · 这条在**窗口内**、话题**还在进行中** → prompt 只允许「顺着当前话题补话」
+ *   · 原路径在**窗口外**、话题已凉 → 那才是「找新话题/起话头」
+ * 用户举的例子（「今天好累啊」→「咋了」→「遇到糟心事了吗」）是第一类的典型。
+ *
+ * 返回 true = 真的发了；false = 模型选择空转。
+ */
+async function chatFollowSpeak (peerKey, peer) {
+  if (busy.has(peerKey)) return false
+  busy.add(peerKey)
+  try {
+    const persona = readPersona()
+    const st = proactiveState(peerKey)
+    const c = chatFollowCfg()
+    const silentMin = Math.round((Date.now() - (st?.lastUserMsgAt ?? Date.now())) / 60000)
+    const memDigest = readMemoryDigest()
+    const lines = [
+      persona.text ? `【人设】未变化，仍以 ${PERSONA_PATH} 为准（需要复查就 read 该文件）。` : `【人设文件缺失】${PERSONA_PATH}`,
+      '',
+      `【这是「接着刚才的话头再说一句」，不是新开一个话题】`,
+      `你在私聊（QQ号 ${peerKey.slice(4)}）里。他上一次说话是 ${silentMin} 分钟前。`,
+      '',
+      '**注意现在的情况**：你们正在一个**还没聊完的话题**里。他没回你，不是因为话题结束了，',
+      '而是聊天本来就长这样 —— 这边说几句，那边再说几句，不用每句都等回复。',
+      '',
+      '【你要做的】顺着**刚才那个话题**往下说一句（或两句）。比如：',
+      '  - 他刚才说「今天好累啊」→ 你可以先「咋了」，再说「遇到糟心事了吗」',
+      '  - 他刚才在讲一件事 → 追问细节、说你的看法、或者接一个相关的反应',
+      '',
+      '【不要做的】**重要**：',
+      '  - **不要开新话题** —— 那不是现在该干的事，现在聊的事还没完',
+      '  - 不要问「你在吗」「还在吗」「怎么不说话了」',
+      '  - 不要复述他刚才说过的话',
+      '  - 不要长篇，一两句就够（本来就是随口说）',
+      '',
+      '【什么时候输出 [SILENT]】',
+      '  - 刚才那个话题确实已经收尾了，没有能自然接下去的话',
+      '  - 或者你觉得这会儿不该说话',
+      '  但**别轻易用** —— 真人聊天里顺着自己上一句再补一句是很自然的。',
+      '',
+      memDigest ? `【你的记忆摘要】\n${memDigest}` : '',
+      `你的 QQ 号：${gateway.selfId ?? '未知'}`,
+      `【硬约束】[SEND_FILE] 只放行会话工作区与暂存目录内的文件；要发图走 qq-meme skill。`,
+    ].filter(x => x !== '')
+    const { text } = await dsh.prompt(peerKey, [{ type: 'text', text: lines.join('\n') }])
+    const silent = /\[SILENT\]/i.test(text || '')
+    const body = (text || '').replace(/\[SILENT\]/gi, '').trim()
+    if (silent || !body) {
+      logger.log(`chatFollow[${peerKey}] 模型选择不出声`)
+      return false
+    }
+    // 复用正常出站流程（图片/语音/戳/@ 都支持；撤回也照常剥）
+    const { specs: followRecalls, text: noRecallBody } = extractRecalls(body)
+    for (const idx of followRecalls) {
+      try { await performRecall(peer, idx) } catch (err) { logger.log(`[RECALL] 接话撤回异常: ${err.message}`) }
+    }
+    const { files, text: plain } = extractSendFiles(noRecallBody)
+    const voices = []
+    let textForSend = plain
+    VOICE_RE.lastIndex = 0
+    textForSend = textForSend.replace(VOICE_RE, (_a, vt, vc) => { voices.push({ text: String(vt).trim(), character: vc || null }); return '' }).trim()
+    if (!textForSend && !files.length && !voices.length) {
+      logger.log(`chatFollow[${peerKey}] 只剩撤回标记，无正文可发`)
+      return false
+    }
+    if (textForSend) await sendTextTo(peer, textForSend)
+    for (const f of files) {
+      const abs = path.isAbsolute(f) ? f : path.resolve(config.dsh.cwd, f)
+      await sendImageTo(peer, abs)
+    }
+    for (const v of voices) await sendVoiceTo(peer, v.text, v.character)
+    logger.log(`chatFollow[${peerKey}] 已接着补一句：${JSON.stringify(body.slice(0, 60))}`)
+    return true
+  } catch (err) {
+    logger.log(`chatFollow[${peerKey}] 出错: ${err.message}`)
+    return false
+  } finally {
+    busy.delete(peerKey)
   }
 }
 
@@ -2314,6 +2590,22 @@ function startProactiveLoop () {
     proactiveTick().catch(err => logger.log(`proactive tick 异常: ${err.message}`))
   }, c.tickMin * 60000)
   proactiveTimer.unref?.()
+
+  // ── 接话路径的定时器（**并行**，不替代上面那个）──────────────────────────
+  // 检查频率不能跟 tickMin(20min) 一样 —— silentMin 才 10 分钟，20 分钟检查一次
+  // 会把「10 分钟该判断」拖到 20 分钟，行为就钝了。所以按 min(silentMin, 5) 分钟检查一次。
+  const fc = chatFollowCfg()
+  if (fc.enabled !== false) {
+    const everyMin = Math.max(1, Math.min(Number(fc.silentMin) || 10, 5))
+    if (chatFollowTimer) clearInterval(chatFollowTimer)
+    chatFollowTimer = setInterval(() => {
+      chatFollowTick().catch(err => logger.log(`chatFollow tick 异常: ${err.message}`))
+    }, everyMin * 60000)
+    chatFollowTimer.unref?.()
+    logger.log(`proactive: 接话路径已启动，每 ${everyMin}min 检查一次（对方沉默 ≥${fc.silentMin}min 才判断，每小时上限 ${fc.maxPerHour}）`)
+  } else {
+    logger.log('proactive: 接话路径未启用（chatFollow.enabled=false），只用 20min 概率路径')
+  }
   logger.log(`proactive: 已启动，tick=${c.tickMin}min 白名单=[${c.whitelist.join(',')}]`)
 }
 
@@ -2482,6 +2774,82 @@ async function maybeProbeBackMain() {
 // ── 入站处理 ────────────────────────────────────────────────────────────────
 const busy = new Set() // peerKey
 const passiveHits = new Map() // peerKey -> [timestamp]，旁听节流窗口
+
+// ── 连发消息排队（修复「只回第一条，后面全丢」）──────────────────────────────
+// 现象（用户实测 + 日志证据）：模型回一条要 10-30 秒，用户在这段时间连发 3-5 条
+// 是很常见的（真人聊天就是「这边几句」）。原来 `busy` 一命中就 `return` ——
+// **第 2 条之后的消息被直接丢弃，模型根本没见过**。生产日志里这种丢弃有 43 次。
+//
+// 现在改成：忙时**入队不丢**，当前轮结束后把积压合并成一段再跑一轮。
+// 关键设计取舍：
+//   · 合并成**一轮**而不是每句一轮 —— 省调用，且模型能看到完整的连发上下文
+//     （分开跑的话第 3 条会看不到第 1、2 条的语气，回答会割裂）。
+//   · 队列上限 20 条 —— 真刷屏时丢最旧的（保留最新，因为最新才是他此刻在说的），
+//     并在日志里明确记下丢了几条，不静默。
+//   · 合并文本里带**时间戳**（HH:MM:SS）—— 模型能看出这八秒内他连发了三句，
+//     而不是以为这是一段连续的长文。时间戳用本地时区，跟上下文里别的时间一致。
+const PENDING_MAX = config.policy?.pendingIngressMax ?? 20
+/** peerKey -> [{text, senderName, senderQq, at, addressed}] */
+const pendingIngress = new Map()
+/** peerKey -> 是否已经在排空队列（防重入：排空过程中又来的消息留给下一轮） */
+const drainingIngress = new Set()
+
+/** 本地时区的 HH:MM:SS，用于合并段里的时间戳。 */
+function hhmmss(ts, tz) {
+  try {
+    return new Intl.DateTimeFormat('en-GB', {
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+      timeZone: tz || 'Asia/Shanghai',
+    }).format(new Date(ts))
+  } catch {
+    return new Date(ts).toTimeString().slice(0, 8)
+  }
+}
+
+/**
+ * 把一条入站消息放进队列（忙时才用）。
+ * 超上限丢**最旧**的：他刚发的那几条才是此刻在说的。
+ */
+function pushPendingIngress(peerKey, item) {
+  const q = pendingIngress.get(peerKey) ?? []
+  q.push(item)
+  let dropped = 0
+  while (q.length > PENDING_MAX) { q.shift(); dropped++ }
+  pendingIngress.set(peerKey, q)
+  if (dropped > 0) {
+    logger.log(`排队 ${peerKey}: 积压超过 ${PENDING_MAX} 条，丢弃最旧 ${dropped} 条（当前 ${q.length} 条）`)
+  }
+  logger.log(`排队 ${peerKey}: 本轮还在处理，这条不丢，入队（积压 ${q.length} 条）`)
+}
+
+/**
+ * 把积压的多条消息合并成给模型看的文本。
+ *
+ * 格式：
+ *   【他连着发了几条】（3 条，11 秒内）
+ *   [15:23:01] 今天好累啊
+ *   [15:23:05] 加班到十点
+ *   [15:23:12] 明天还得早起
+ *
+ * 群聊里连发的可能是不同人 → 每条带发送者，模型才能分清谁说的。
+ * 私聊只有一个对话者 → 不标人名（省 token）。
+ */
+function mergePendingIngress(peerKey, items) {
+  const tz = config.policy?.timezone ?? 'Asia/Shanghai'
+  const isGroup = String(peerKey).startsWith('group:')
+  const singleSender = !isGroup || new Set(items.map(i => i.senderQq)).size === 1
+  const lines = items.map(i => {
+    const who = singleSender ? '' : `${i.senderName || i.senderQq || '某人'}：`
+    return `[${hhmmss(i.at, tz)}] ${who}${i.text}`
+  })
+  const span = items.length > 1 ? Math.round((items[items.length - 1].at - items[0].at) / 1000) : 0
+  // 跨度 <1 秒时说「几秒内」而不是「0 秒内」—— 后者读起来像 bug。
+  const spanText = span >= 1 ? `${span} 秒内` : '几秒内'
+  const head = items.length === 1
+    ? '【这是他在同一轮里补的一条】'
+    : `【他连着发了几条】（${items.length} 条，${spanText}）`
+  return { head, lines }
+}
 
 // ── 「对打字机」抑制 ─────────────────────────────────────────────────────────
 // 现象：有人连续发长消息（工作汇报/自言自语），小群规则会让 bot 逐条回，听起来很吵。
@@ -2659,6 +3027,12 @@ async function handleInbound(evt) {
   const peerKey = peerKeyOf(peer)
   const now = Date.now()
 
+  // ⚠️ 接话窗口的锚点：**对方最后一条消息的时间**（在下面 busy.add 之后刷新，见那里的注释）。
+  // 为什么不在这一行刷新：此时 state.peers[peerKey] 可能还不存在（首条消息），
+  // touchLastUserMsg 内部的 proactiveState() 会因拿不到 ps 直接跳过，锚点就丢了。
+  // 而这里又不能提前建 peer 对象（会绕过 sessionIdFor 的 sessionId 初始化）。
+  // 所以放到 busy.add 之后 —— 那时 sessionIdFor 已经保证 state.peers[peerKey] 存在。
+
   // 情绪触发：对方说的话里有夸奖/怼/是否点到我
   for (const ev of detectMoodTriggers(flat.text, { addressed, atMe: flat.atMe })) {
     moodEvent(peerKey, ev.kind, ev.why)
@@ -2680,11 +3054,10 @@ async function handleInbound(evt) {
     logger.debug(`冷却中，忽略 ${peerKey}`)
     return
   }
-  if (busy.has(peerKey)) {
-    // 旁听消息在上一条还在处理时直接丢弃（不排队），避免消息风暴把 LLM 打爆
-    logger.log(`${peerKey} 正在处理上一轮，跳过本条${addressed ? '' : '（旁听）'}`)
-    return
-  }
+  // ⚠️ 这里**不再丢弃**忙时到达的消息（原来 `if (busy.has(...)) return` 是 bug）。
+  // 但要等下面的「图片/引用/转发」都处理完才能入队 —— 那些是异步的，且可能耗时
+  // （下载图片、get_msg、展开转发）。提前 return 会导致入队的消息丢掉图片和引用。
+  // 所以「忙」的判断放到内容准备好之后（见下方 queueIfBusy）。
   // 旁听：先看群多大，决定「说话欲望」。小群放宽节流（几乎都处理），大群收紧。
   let tendency = null
   const quiet = isQuietHours()
@@ -2735,7 +3108,10 @@ async function handleInbound(evt) {
 
   // 引用回复：reply 段只有 message_id，得用 get_msg 取回原话
   let quotedText = ''
-  if (flat.replyId) {
+  // 合并轮带来的引用（入队时已经取回过，不要重复请求 OneBot）
+  const mergedExtras = evt._mergedExtras ?? null
+  if (mergedExtras?.quotedText) quotedText = mergedExtras.quotedText
+  else if (flat.replyId) {
     const q = await quoteOf(flat.replyId)
     if (q.ok) {
       quotedText = `${q.from}：${q.text}`
@@ -2748,7 +3124,8 @@ async function handleInbound(evt) {
 
   // 合并转发：展开成「谁说了什么」的纯文本，让模型能读到里面的对话
   let forwardText = ''
-  if (flat.forwardIds.length) {
+  if (mergedExtras?.forwardText) forwardText = mergedExtras.forwardText
+  else if (flat.forwardIds.length) {
     forwardText = await expandForwards(flat.forwardIds)
     if (forwardText) logger.log(`已展开 ${flat.forwardIds.length} 条合并转发（${forwardText.length} 字）`)
   }
@@ -2766,6 +3143,8 @@ async function handleInbound(evt) {
       logger.log(`图片下载失败: ${err.message}`)
     }
   }
+  // 合并轮：图片在入队前已经下载过，直接用（别再下一遍）
+  if (mergedExtras?.imagePaths?.length) imagePaths.push(...mergedExtras.imagePaths)
 
   // 空消息判定必须把**所有**可能承载内容的东西都算上：
   // 纯文本、图片、合并转发展开内容、卡片。
@@ -2778,6 +3157,21 @@ async function handleInbound(evt) {
     return
   }
 
+  // ── 忙时排队（不再丢弃）────────────────────────────────────────────────
+  // 内容已经全部准备好（图片下载完、引用取回、转发展开），这时才发现忙 →
+  // 入队，等当前轮结束后合并成一段再喂模型。
+  if (busy.has(peerKey)) {
+    pushPendingIngress(peerKey, {
+      text: flat.text || (imagePaths.length ? `[发了 ${imagePaths.length} 张图片]` : '') ||
+        (hasForward ? '[合并转发]' : '') || (hasCard ? '[卡片]' : '') || '',
+      // 图片路径/转发/引用也要带过去，否则合并轮里模型看不到这些内容
+      imagePaths, quotedText, forwardText, cards: flat.cards ?? [],
+      senderName, senderQq: evt.user_id != null ? String(evt.user_id) : '',
+      at: Date.now(), addressed,
+    })
+    return
+  }
+
   busy.add(peerKey)
   try {
     // 想切回主路由就顺手探一下（内部有 probeBackMs 时间闸，不会每轮都探）
@@ -2785,6 +3179,13 @@ async function handleInbound(evt) {
     // 轮数上限：超过就换新会话（新会话会自动重新注入人设全文）
     rolloverIfNeeded(peerKey)
     const sdkSessionId = sessionIdFor(peerKey)   // 顺便确保 state.peers[peerKey] 已建好（ACP 记账要用）
+
+    // 接话窗口的锚点：**对方最后一条消息的时间**。
+    // 只有**真实**入站消息才刷新它 —— 合并轮（`_mergedExtras`）是桥自己合成的，
+    // 不是新消息，刷新它会让排空积压无限续窗口。
+    // 而「我说话不延长窗口」是硬规则：touchLastSpoke 只改 lastSpokeAt，绝不碰这个字段，
+    // 所以本行是 lastUserMsgAt 的**唯一**写入点（在 sessionIdFor 之后，保证 peer 对象已存在）。
+    if (!evt._mergedExtras) touchLastUserMsg(peerKey)
     const blocks = []
     // 人设：全文只在「首次」或「文件变了」时注入一次，其余轮次只给路径 + 状态。
     // 这样人设不会作为普通历史被反复计费（省 ~3600 tokens/轮），但改动仍然下一轮就生效。
@@ -2827,6 +3228,19 @@ async function handleInbound(evt) {
       `你的人设文件：${PERSONA_PATH}（可读可改，改完下一轮生效）`,
       '',
     )
+    // 合并轮：明确告诉模型「这不是一条长消息，是他连着发的几条」。
+    // 不加这句的话，模型会把带时间戳的多行当成一条排版奇怪的长文，
+    // 然后逐条点评（正是要避免的「他发十条我回十条」）。
+    if (mergedExtras?.count > 1) {
+      contextLines.push(
+        `【他连着发了 ${mergedExtras.count} 条，我把它们合在一起给你看了】`,
+        '这是同一个人在这几十秒内连续说的几句话（真实聊天就是这样，这边几句那边几句），',
+        '不是一条长消息。**当成一个整体的意思来回应**，不要一句一句点评。',
+        '如果几句话是分开的意思，挑最主要的那个回应，或者顺着他的情绪接一句就够。',
+        '**不要**复述他说过的话，也不要说「你说了三点」这种话。',
+        '',
+      )
+    }
     if (flurryMode) {
       contextLines.push(
         '',
@@ -2938,11 +3352,13 @@ async function handleInbound(evt) {
         '',
       )
     }
-    if (flat.cards?.length) {
+    // 卡片：本条的 + 合并轮里攒下的（入队时解析好的，别丢）
+    const anyCards = [...(flat.cards ?? []), ...(mergedExtras?.cards ?? [])]
+    if (anyCards.length) {
       contextLines.push(
         '',
         '【这条消息是个分享卡片】',
-        '你能看到的内容是：' + flat.cards.join(' / '),
+        '你能看到的内容是：' + anyCards.join(' / '),
         '卡片本身你打不开（看不到里面的视频/小程序/网页）。所以：',
         '  - 标题够看懂就顺着聊，别装作看过内容',
         '  - 想知道详情可以 bili_search 或搜一下标题',
@@ -3126,6 +3542,86 @@ for (const p of pokes) {
     try { await sendTextTo(peer, friendly) } catch { /* ignore */ }
   } finally {
     busy.delete(peerKey)
+    // 当前轮结束 → 把积压的连发消息合并成一轮再喂给模型。
+    //
+    // 为什么放在 finally 且不 await：这一轮已经结束，排空是**新一轮**的事，
+    // 等它会让 handleInbound 的调用方（事件循环）多挂一会儿。但也不能完全撒手 ——
+    // 用 drainingIngress 防重入：排空期间又来的消息入队，等下一轮排空时一起处理。
+    // 注意：不 await 的任务必须有 catch，否则 rejected promise 会变成 unhandled rejection。
+    drainPendingIngress(peerKey, peer).catch(err => logger.log(`排空队列异常 ${peerKey}: ${err.message}`))
+  }
+}
+
+/**
+ * 排空某个 peer 的积压消息：合并成一段，跑**一轮** LLM。
+ *
+ * 复用 handleInbound 的整条链路（人设/记忆/风格/发送/撤回等）是不可能的 ——
+ * 那些都绑在 evt 上。所以这里做的是「合成一个虚拟入站事件」，再走一遍 handleInbound。
+ * 这样合并轮和普通轮的行为完全一致（人设注入、记忆、限频、静默判定都走同一套），
+ * 不会出现「合并轮是个特殊路径，行为不一样」的坑。
+ */
+async function drainPendingIngress(peerKey, peer) {
+  const q = pendingIngress.get(peerKey)
+  if (!q || !q.length) return
+  if (drainingIngress.has(peerKey)) return
+  if (busy.has(peerKey)) return   // 又有新轮在跑了，留给它结束后的排空
+  drainingIngress.add(peerKey)
+  // 立刻摘走队列（不用等异步）：这样排空期间新来的消息会进新队列，不会混进这一批
+  pendingIngress.delete(peerKey)
+  try {
+    const items = q
+    const { head, lines } = mergePendingIngress(peerKey, items)
+    const mergedText = [head, ...lines].join('\n')
+    const last = items[items.length - 1]
+    // 把这一批里附带的非文本内容汇总起来（图片/引用/转发/卡片）。
+    // 这些在入队时就已经处理好了（图片下载完、引用取回、转发展开），
+    // 合并轮直接带上，不能丢 —— 否则「他连发三条，其中一张图」图就没了。
+    const allImagePaths = items.flatMap(i => i.imagePaths ?? [])
+    const allQuoted = items.map(i => i.quotedText).filter(Boolean)
+    const allForward = items.map(i => i.forwardText).filter(Boolean)
+    const allCards = items.flatMap(i => i.cards ?? []).filter(Boolean)
+    logger.log(`排空 ${peerKey}: 合并 ${items.length} 条积压消息成一轮（${mergedText.length} 字，图 ${allImagePaths.length} 引用 ${allQuoted.length} 转发 ${allForward.length}）`)
+
+    // 合成虚拟事件：sender 用**最后一条**的发送者（他就是刚说完话的人）
+    const evt = {
+      post_type: 'message',
+      message_type: peer.scope === 'group' ? 'group' : 'private',
+      sub_type: 'normal',
+      time: Math.floor(last.at / 1000),
+      self_id: gateway.selfId,
+      message_id: `merged-${Date.now()}`,
+      ...(peer.scope === 'group' ? { group_id: Number(peer.id) } : { user_id: Number(peer.id) }),
+      user_id: last.senderQq ? Number(last.senderQq) : Number(peer.id),
+      raw_message: mergedText,
+      font: 0,
+      sender: {
+        user_id: last.senderQq ? Number(last.senderQq) : Number(peer.id),
+        nickname: last.senderName || '某人',
+        card: last.senderName || '',
+      },
+      // 关键：message 段里放合并后的**整段**（含时间戳）。
+      // 这样 handleInbound 里所有基于 flat.text 的逻辑（情绪触发、检索 query、
+      // 风格锚的 context、空消息判定）看到的都是合并文本 —— 走和真消息同一条路。
+      message: [{ type: 'text', data: { text: mergedText } }],
+      // 非文本内容的旁路：handleInbound 会读这个字段，把它们塞进上下文，
+      // 但**不会**再走一遍下载/取回（那些在入队前已经做过了）。
+      _mergedExtras: {
+        count: items.length,
+        imagePaths: allImagePaths,
+        quotedText: allQuoted.join(' / '),
+        forwardText: allForward.join('\n'),
+        cards: allCards,
+      },
+    }
+    await handleInbound(evt)
+  } catch (err) {
+    logger.log(`排空 ${peerKey} 失败: ${err.message}`)
+  } finally {
+    drainingIngress.delete(peerKey)
+    // 排空期间又积了新消息 → 再排一次（递归但有 draining 闸，不会无限嵌套）
+    if ((pendingIngress.get(peerKey) ?? []).length) {
+      drainPendingIngress(peerKey, peer).catch(err => logger.log(`二次排空异常 ${peerKey}: ${err.message}`))
+    }
   }
 }
 
