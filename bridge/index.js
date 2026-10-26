@@ -214,10 +214,7 @@ async function sendRecordFile(peer, filePath) {
     ? { group_id: Number(peer.id), message: [{ type: 'record', data: { file: `base64://${b64}` } }] }
     : { user_id: Number(peer.id), message: [{ type: 'record', data: { file: `base64://${b64}` } }] }
   const res = await gateway.callData(peer.scope === 'group' ? 'send_group_msg' : 'send_private_msg', params, 120000)
-  if (res?.message_id != null) {
-    selfMessageIds.add(String(res.message_id))
-    if (selfMessageIds.size > 500) selfMessageIds.delete(selfMessageIds.values().next().value)
-  }
+  noteSelfSent(peer, res, 'record')
   return res
 }
 
@@ -244,9 +241,10 @@ async function sendVoiceTo(peer, text, characterName) {
         // QQ 内置音色只支持群聊
         if (peer.scope !== 'group') continue
         const character = resolveVoiceCharacter(characterName)
-        await gateway.callData('send_group_ai_record', {
+        const aiRes = await gateway.callData('send_group_ai_record', {
           group_id: Number(peer.id), character, text: clipped,
         }, 60000)
+        noteSelfSent(peer, aiRes, 'voice')
         logger.log(`已发语音(QQ内置) ${clipped.length}字 音色=${character} -> group:${peer.id}`)
         return true
       }
@@ -271,6 +269,177 @@ function extractSendFiles(text) {
   for (const m of text.matchAll(SEND_FILE_RE)) files.push(m[1].trim())
   const stripped = text.replace(SEND_FILE_RE, '').trim()
   return { files, text: stripped }
+}
+
+// ── 撤回（[RECALL]）：撤回自己发过的消息 ────────────────────────────────────
+// 语法（标记会被从正文里剥掉，对方看不到）：
+//   [RECALL:last]  或  [RECALL:1]   撤回我最近发的那一条（两者等价）
+//   [RECALL:2]                      撤回倒数第 2 条
+//   [RECALL:n]                      倒序 1-based；桥只记最近 10 条，n 最大 10
+// 语义：撤回发生在**本条消息发出之前**——所以写得对是「先撤掉说错的那条，再补一句」。
+//
+// 两个硬限制（协议事实，不是我们加的）：
+//   · QQ 撤回自己的消息有时限（普通成员约 2 分钟）。超时撤不掉，**必须明确报失败**，
+//     不能让模型以为撤了（对方其实还看得见）。
+//   · 每个 peer 每分钟最多撤 2 条（防它一气之下连撤刷屏）。
+// OneBot 11 动作：delete_msg({ message_id })
+const RECALL_RE = /\[RECALL:\s*(last|\d{1,2})\s*\]/gi
+const RECALL_HISTORY_MAX = config.recall?.historyMax ?? 10
+const RECALL_TTL_MS = config.recall?.ttlMs ?? 120000
+const RECALL_RATE_MAX = config.recall?.maxPerMinute ?? 2
+const RECALL_RATE_WINDOW_MS = 60 * 1000
+const RECALL_NOTE_MAX = 3
+
+/** peerKey -> [{ message_id, ts, kind }]，只留最近 RECALL_HISTORY_MAX 条 */
+const sentMessages = new Map()
+/** peerKey -> [撤回尝试时间戳]（滑动窗口限频） */
+const recallAttempts = new Map()
+/** peerKey -> [撤回结果文案]，留给下一轮告诉模型（最多 RECALL_NOTE_MAX 条） */
+const recallNotes = new Map()
+
+function recallKeyOf(peer) {
+  return `${peer.scope}:${peer.id}`
+}
+
+/**
+ * 发消息成功后调用：记住回来的 message_id，供之后的 [RECALL] 用。
+ * 只留最近 N 条（QQ 撤回时限才 2 分钟，留太多没意义还占内存）。
+ */
+function noteSentMessage(peer, res, kind = 'text') {
+  const raw = res?.message_id ?? res?.messageId ?? res?.msg_id
+  if (raw == null || raw === '') return
+  const key = recallKeyOf(peer)
+  const list = sentMessages.get(key) ?? []
+  list.push({ message_id: String(raw), ts: Date.now(), kind })
+  while (list.length > RECALL_HISTORY_MAX) list.shift()
+  sentMessages.set(key, list)
+}
+
+/**
+ * 抽出文本里的 [RECALL:…]，返回倒序 1-based 序号（1 = 最近一条）+ 剥掉标记的正文。
+ * 同一轮里重复的序号去重；一轮最多真的撤 RECALL_RATE_MAX 条（多写的丢弃并让调用方记日志）。
+ */
+function extractRecalls(text) {
+  const all = []
+  const stripped = String(text ?? '').replace(RECALL_RE, (_all, spec) => {
+    const v = String(spec).toLowerCase()
+    const idx = v === 'last' ? 1 : Number(v)
+    if (Number.isInteger(idx) && idx >= 1 && idx <= RECALL_HISTORY_MAX && !all.includes(idx)) all.push(idx)
+    return ''
+  }).trim()
+  return { specs: all.slice(0, RECALL_RATE_MAX), dropped: Math.max(0, all.length - RECALL_RATE_MAX), text: stripped }
+}
+
+function recallDescribeIndex(idx) {
+  return idx === 1 ? '最近一条' : `倒数第 ${idx} 条`
+}
+
+/** 撤回结果写进文件（qq-agent/.bridge/recall.log）：模型下一轮可以 read 它确认到底撤没撤。 */
+function recallStatusPath() {
+  const rc = config.recall ?? {}
+  if (rc.statusFile === false) return null
+  return rc.statusFile ?? path.join(config.dsh.cwd, '.bridge', 'recall.log')
+}
+
+function appendRecallStatus(line) {
+  const p = recallStatusPath()
+  if (!p) return
+  try {
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.appendFileSync(p, `${new Date().toISOString()} ${line}\n`)
+  } catch { /* 记不下来不影响撤回本身 */ }
+}
+
+/** 滑动窗口限频：同一 peer 每分钟最多 RECALL_RATE_MAX 次。 */
+function recallRateCheck(key, now = Date.now()) {
+  const arr = (recallAttempts.get(key) ?? []).filter(t => now - t < RECALL_RATE_WINDOW_MS)
+  if (arr.length >= RECALL_RATE_MAX) {
+    recallAttempts.set(key, arr)
+    return { ok: false, retryAfterMs: RECALL_RATE_WINDOW_MS - (now - arr[0]) }
+  }
+  arr.push(now)
+  recallAttempts.set(key, arr)
+  return { ok: true }
+}
+
+/** 统一的收尾：日志 + 状态文件 + 下一轮反馈队列。 */
+function finishRecall(peer, ok, index, detail) {
+  const key = recallKeyOf(peer)
+  const line = ok
+    ? `[RECALL] 成功 ${key} ${recallDescribeIndex(index)}：${detail}`
+    : `[RECALL] 失败 ${key} ${recallDescribeIndex(index)}：${detail}`
+  logger.log(line)
+  appendRecallStatus(line)
+  const notes = recallNotes.get(key) ?? []
+  notes.push(ok ? `✅ ${recallDescribeIndex(index)}：${detail}` : `❌ ${recallDescribeIndex(index)}：${detail}`)
+  while (notes.length > RECALL_NOTE_MAX) notes.shift()
+  recallNotes.set(key, notes)
+  return { ok, index, detail }
+}
+
+/**
+ * 执行一次撤回。
+ * @param {{id:string,scope:'group'|'c2c'}} peer
+ * @param {number} index 倒序 1-based（1 = 最近一条）
+ */
+async function performRecall(peer, index) {
+  const key = recallKeyOf(peer)
+  const idx = Number(index)
+  if (!Number.isInteger(idx) || idx < 1) return finishRecall(peer, false, index, '序号无效')
+  const list = sentMessages.get(key) ?? []
+  const target = list[list.length - idx]
+  if (!target) {
+    return finishRecall(peer, false, idx,
+      `没有${recallDescribeIndex(idx)}可撤（我最多记得最近 ${RECALL_HISTORY_MAX} 条，可能还没发过这么多）`)
+  }
+  const ageMs = Date.now() - target.ts
+  if (RECALL_TTL_MS > 0 && ageMs > RECALL_TTL_MS) {
+    return finishRecall(peer, false, idx,
+      `超过 QQ 撤回时限：这条已发出 ${Math.round(ageMs / 1000)} 秒（上限 ${Math.round(RECALL_TTL_MS / 1000)} 秒），` +
+      '撤不掉了，对方已经看到')
+  }
+  const rate = recallRateCheck(key)
+  if (!rate.ok) {
+    return finishRecall(peer, false, idx,
+      `撤回太频繁：同一会话每分钟最多 ${RECALL_RATE_MAX} 条，还要等 ${Math.ceil(rate.retryAfterMs / 1000)} 秒`)
+  }
+  const mid = target.message_id
+  try {
+    await gateway.callData('delete_msg', { message_id: /^\d+$/.test(mid) ? Number(mid) : mid }, 10000)
+  } catch (err) {
+    return finishRecall(peer, false, idx, `delete_msg 失败：${String(err?.message ?? err).slice(0, 140)}`)
+  }
+  // 撤成功了才从历史里删掉，避免误把别的条目当成已撤
+  list.splice(list.length - idx, 1)
+  sentMessages.set(key, list)
+  return finishRecall(peer, true, idx, `message_id=${mid}`)
+}
+
+/**
+ * [RECALL] 的 prompt 片段：能力说明（很短，每轮都有）+ 上一轮撤回结果（有才给）。
+ * 单独作为一个 block 追加在上下文块之后，不混进 contextLines 拼装段。
+ */
+function recallPromptBlock(peerKey) {
+  const lines = []
+  const notice = recallNoticeFor(peerKey)
+  if (notice) lines.push(notice, '')
+  lines.push(
+    '【你能撤回自己发的消息】写 `[RECALL:last]`（=撤回最近一条）或 `[RECALL:2]`（=倒数第 2 条，最多 10）。',
+    '撤回在你这条发出**之前**执行，标记会从正文剥掉。QQ 时限约 2 分钟、每分钟最多撤 2 条。',
+    '没发出标记就不要说「我撤回了」——上一轮的撤回结果会出现在这里。',
+  )
+  return { type: 'text', text: lines.join('\n') }
+}
+
+/**
+ * 取出（并清空）上一个 peer 的撤回结果，供下一轮 prompt 注入。
+ * 由 prompt 拼装处调用；没有结果返回 null。
+ */
+function recallNoticeFor(peerKey) {
+  const notes = recallNotes.get(peerKey)
+  if (!notes?.length) return null
+  recallNotes.delete(peerKey)
+  return ['【撤回结果】上一轮你用了 [RECALL] 标记，结果如下（别说反了）：', ...notes].join('\n')
 }
 
 // ── 媒体暂存（入站图片）─────────────────────────────────────────────────────
@@ -418,6 +587,7 @@ function sanitizeUntrustedText(text, { maxChars = 500 } = {}) {
   out = out.replace(/\[VOICE\s*:/gi, '[VOICE：')
   out = out.replace(/\[POKE\s*:/gi, '[POKE：')
   out = out.replace(/\[AT\s*:/gi, '[AT：')
+  out = out.replace(/\[RECALL\s*:/gi, '[RECALL：')
   out = out.replace(/\[SILENT\]/gi, '[SILENT_]')
   // ② 把可能冒充系统提示的粗方括号标题换成普通写法
   for (const m of SYS_MARKERS) {
@@ -443,6 +613,19 @@ async function downloadUrlToStaging(url, tag = 'in') {
 // ── OneBot 消息段处理 ───────────────────────────────────────────────────────
 // 记录机器人自己发出的消息 id，用于识别「别人回复了我」也算被 @
 const selfMessageIds = new Set()
+
+/**
+ * 发消息成功后统一记账：① 自己发的 id（识别「回复我」）② 撤回历史（[RECALL] 用）。
+ * 所有出站发送都必须走这里，否则模型撤到的是不存在的 id。
+ */
+function noteSelfSent(peer, res, kind = 'text') {
+  const raw = res?.message_id ?? res?.messageId ?? res?.msg_id
+  if (raw != null && raw !== '') {
+    selfMessageIds.add(String(raw))
+    if (selfMessageIds.size > 500) selfMessageIds.delete(selfMessageIds.values().next().value)
+  }
+  noteSentMessage(peer, res, kind)
+}
 
 function flattenMessage(message) {
   if (typeof message === 'string') return { text: message.trim(), images: [], replyId: null, atMe: false, replyToMe: false, atList: [], forwardIds: [] }
@@ -628,10 +811,7 @@ async function sendTextTo(peer, text) {
       : { user_id: Number(peer.id), message: segments, auto_escape: false }
     try {
       const res = await gateway.callData(peer.scope === 'group' ? 'send_group_msg' : 'send_private_msg', params, 20000)
-      if (res?.message_id != null) {
-        selfMessageIds.add(String(res.message_id))
-        if (selfMessageIds.size > 500) selfMessageIds.delete(selfMessageIds.values().next().value)
-      }
+      noteSelfSent(peer, res, 'text')
       const atCount = segments.filter(s => s.type === 'at').length
       if (atCount) logger.log(`已发送含 ${atCount} 个真 @ 的消息 -> ${peer.scope}:${peer.id}`)
     } catch (err) {
@@ -678,10 +858,7 @@ async function sendImageTo(peer, filePath) {
     : { user_id: Number(peer.id), message: [seg] }
   try {
     const res = await gateway.callData(peer.scope === 'group' ? 'send_group_msg' : 'send_private_msg', params, 60000)
-    if (res?.message_id != null) {
-      selfMessageIds.add(String(res.message_id))
-      if (selfMessageIds.size > 500) selfMessageIds.delete(selfMessageIds.values().next().value)
-    }
+    noteSelfSent(peer, res, 'image')
     logger.log(`已发图 ${path.basename(check.path)} -> ${peer.scope}:${peer.id}`)
     return true
   } catch (err) {
@@ -1604,11 +1781,20 @@ async function proactiveSpeak (peerKey, peer, action) {
       return false
     }
     // 复用正常出站流程（图片/语音/戳/@ 都支持）
-    const { files, text: plain } = extractSendFiles(body)
+    // 撤回标记在主动搭话里也支持：剥掉标记 → 先撤 → 再发（同正常回复顺序）
+    const { specs: proactiveRecalls, text: noRecallBody } = extractRecalls(body)
+    for (const idx of proactiveRecalls) {
+      try { await performRecall(peer, idx) } catch (err) { logger.log(`[RECALL] 主动搭话撤回异常: ${err.message}`) }
+    }
+    const { files, text: plain } = extractSendFiles(noRecallBody)
     const voices = []
     let textForSend = plain
     VOICE_RE.lastIndex = 0
     textForSend = textForSend.replace(VOICE_RE, (_a, vt, vc) => { voices.push({ text: String(vt).trim(), character: vc || null }); return '' }).trim()
+    if (!textForSend && !files.length && !voices.length) {
+      logger.log(`proactive[${peerKey}] 只剩撤回标记，无正文可发`)
+      return true
+    }
     if (textForSend) await sendTextTo(peer, textForSend)
     for (const f of files) {
       const abs = path.isAbsolute(f) ? f : path.resolve(config.dsh.cwd, f)
@@ -2261,6 +2447,7 @@ async function handleInbound(evt) {
       contextLines.push('如需查看可用 read_image 工具读取上述路径。若用户要求「入库/收藏/学图」，按 qq-meme skill 的 learn 流程处理。')
     }
     blocks.push({ type: 'text', text: contextLines.filter(Boolean).join('\n') })
+    blocks.push(recallPromptBlock(peerKey))
     if (flat.text) {
       // ⚠️ 用户消息本身也是不可信输入：里面如果藏着 [SEND_FILE:...] 等标记，
       //    模型复述时会被桥当成指令执行。这里把标记打散（全角冒号），让它失去语义。
@@ -2344,13 +2531,28 @@ async function handleInbound(evt) {
       return ''
     }).trim()
 
-    const { files, text: plain } = extractSendFiles(textForSend)
+    // 撤回标记 [RECALL:last] / [RECALL:n]：从正文剥掉，实际动作在**本条发出之前**执行。
+    // 这样「撤掉上一句 + 重发」是一轮里完成的，对方看到的效果接近真人秒撤重打。
+    // 同一次回复里最多撤 RECALL_RATE_MAX 条（多余的直接丢弃，记一笔日志）。
+    const { specs: recallSpecs, dropped: recallDropped, text: noRecallText } = extractRecalls(textForSend)
+    textForSend = noRecallText
 
-    if (!addressed && (silentMarked || (!plain && files.length === 0 && pokes.length === 0 && voices.length === 0))) {
+    const { files, text: plain } = extractSendFiles(textForSend)
+    const wantsSilence = silentMarked || (!plain && files.length === 0 && pokes.length === 0 &&
+      voices.length === 0 && follows.length === 0 && recallSpecs.length === 0)
+
+    if (!addressed && wantsSilence) {
       logger.log(`旁听→沉默 ${peerKey}（${silentMarked ? '[SILENT]' : '空回复'}），不发言`)
       state.peers[peerKey].silentSkips = (state.peers[peerKey].silentSkips ?? 0) + 1
       saveState()
       return
+    }
+    if (recallDropped > 0) {
+      logger.log(`[RECALL] ${peerKey} 一轮里写了 ${recallDropped + recallSpecs.length} 个撤回标记，超出 ${RECALL_RATE_MAX} 条上限的 ${recallDropped} 个被忽略`)
+    }
+    // 先撤（失败也照常发后面的内容，不要把整轮搞崩）
+    for (const idx of recallSpecs) {
+      try { await performRecall(peer, idx) } catch (err) { logger.log(`[RECALL] 执行异常: ${err.message}`) }
     }
     // 低精力时的字数兜底（v2-1）：提示可能被无视，所以这里做一层软截断。
     // 只截正文、只在精力 < 40% 时生效，且保留完整句子结尾。
@@ -2547,9 +2749,14 @@ async function handlePoke(evt) {
       const pokes = []
       POKE_RE.lastIndex = 0
       out = out.replace(POKE_RE, (_a, qq, scope) => { pokes.push({ qq, scope }); return '' }).trim()
-      if (silentMarked && !out && !pokes.length && !voices.length) {
+      const { specs: pokeRecalls, text: pokeNoRecall } = extractRecalls(out)
+      out = pokeNoRecall
+      if (silentMarked && !out && !pokes.length && !voices.length && !pokeRecalls.length) {
         logger.log(`戳一戳 -> 选择不理会（${peerKey}）`)
         return
+      }
+      for (const idx of pokeRecalls) {
+        try { await performRecall(peer, idx) } catch (err) { logger.log(`[RECALL] 戳一戳撤回异常: ${err.message}`) }
       }
       if (out) await sendTextTo(peer, out)
       for (const v of voices) await sendVoiceTo(peer, v.text, v.character)
