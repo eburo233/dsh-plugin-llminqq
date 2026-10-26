@@ -103,17 +103,37 @@ echo "✅ 全部通过（共 ${total_pass} 项断言）"
 
 echo
 echo "== 3. 提交 =="
-if [ -z "$(git status --porcelain)" ]; then
-  echo "  没有变更，跳过提交"
-  exit 0
+
+# ⚠️ 只提交**已暂存**的文件，绝不 git add -A。
+#
+# 为什么改：原来用 `git add -A`，多 agent 并行时会把别人未完成的工作一起裹进来。
+# 2026-10-26 一天里被踩了 5 次：
+#   bm25-dev / recall-dev / crosschannel-dev / learn-dev / Lead 自己
+# 最严重的一次：Lead 提交「日志消歧」，实际裹进了 crawl-dev 的全部语料+脚本（21 个文件）。
+#
+# 所以现在要求：**你自己 git add 要提交的文件**，然后跑这个脚本。
+# 没暂存任何东西时，脚本会拒绝提交并给出提示（而不是默默 add 全部）。
+if [ -z "$(git diff --cached --name-only)" ]; then
+  echo "  ❌ 没有已暂存的文件，拒绝提交。"
+  echo ""
+  echo "  这个脚本**不再**帮你 git add -A（会把别人未完成的工作裹进来）。"
+  echo "  请先明确暂存你要提交的文件："
+  echo ""
+  echo "    git add <你的文件> ...        # 只加你自己的"
+  echo "    bash scripts/commit.sh \"说明\"   # 再跑本脚本（会先跑全量测试）"
+  echo ""
+  echo "  当前工作树状态："
+  git status --short | sed 's/^/    /'
+  exit 1
 fi
-git status --short | sed 's/^/  /'
+
+echo "  将提交以下已暂存文件："
+git diff --cached --name-only | sed 's/^/    /'
 echo
 if [ -z "$MSG" ]; then
-  changed=$(git status --porcelain | awk '{print $2}' | head -3 | tr '\n' ' ')
+  changed=$(git diff --cached --name-only | head -3 | tr '\n' ' ')
   MSG="更新：${changed}"
 fi
-git add -A
 git commit -q -m "$MSG"
 echo "  已提交：$(git log --oneline -1)"
 echo
