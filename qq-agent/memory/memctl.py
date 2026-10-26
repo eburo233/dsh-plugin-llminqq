@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-memctl.py —— 吉祥物的记忆系统 v2（按 Stanford Generative Agents 论文重构）
+memctl.py —— 吉祥物的记忆系统 v4（按 Stanford Generative Agents 论文重构；按人归集）
 
 原 v1 的问题（实测发现的）：
   - 检索**只看时间**（半衰期衰减）→ 越新越有用。可「三小时前的一句废话」
@@ -1318,7 +1318,7 @@ def scan_log(conn, path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="吉祥物的记忆系统 v2")
+    ap = argparse.ArgumentParser(description="吉祥物的记忆系统 v4")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("ingest", help="从 bridge 日志增量抓")
