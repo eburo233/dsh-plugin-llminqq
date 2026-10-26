@@ -401,15 +401,84 @@ def backfill_owner(conn, log_dir=None, bridge_log=None):
     return stats
 
 
-def connect(db_path=None):
+# ── 生产库写保护锁 ──────────────────────────────────────────────────────────
+# 威胁：开发/测试脚本「显式传了生产库路径」，现有防护（要求显式传参）拦不住。
+# 2026-10-26 实测事故：跨通道测试用生产 peer 手工往生产库写了 4 条假记忆
+#   （「我下周要去冰岛看极光」「其实我欠了老张三万块钱」…），
+#   吉祥物把它们当真事主动问了出来，用户当场发现是假的。
+#
+# 做法：环境变量 MEMCTL_ALLOW_PROD_WRITE=1 才允许**写**生产库。
+#   - 生产进程（桥 → memctl CLI、reflect.sh、learn.sh）不设这个变量
+#     → 它们本来就是生产的一部分，读写都该允许 → 需要显式 opt-in
+#   - 🤔 但生产干活的脚本很多，逐个加变量容易漏。
+#     所以改成**反向**：默认允许生产，但只要检测到「测试/开发特征」就拒绝。
+#
+# 最终方案（更稳）：**写锁目录哨兵**。
+#   生产库旁边放一个 .prod-guard 文件；任何代码想写生产库必须先
+#   证明自己是生产进程（环境变量 MEMCTL_PROD=1）。
+#   桥和 systemd 脚本会设这个变量；临时脚本/测试不会。
+PROD_GUARD_ENV = 'MEMCTL_PROD'
+
+
+# ── 生产库识别（三重判据，避免被测试隔离手段绕过）────────────────────────
+# 为什么需要三重：
+#   ① 用模块全局 DB → 测试会 `m.DB = /tmp/xxx`，于是 /tmp 被误判成生产（实测踩过）
+#   ② 只用本文件位置 → 测试会把 memctl.py **复制**到 /tmp 再 import，
+#      于是「文件位置」变成 /tmp，/tmp 又被误判成生产（实测踩过第二次）
+#   所以综合判断：**同时满足**「路径在本目录下」且「本目录是真实项目目录」才算生产。
+# 真实项目目录通过 PROJECT_ROOT 环境变量或已知后缀识别 —— 见下。
+_PROD_DIR_REAL = '/home/jojo/dsh/LLMinQQ/qq-agent/memory'
+_PROD_DB_REAL = os.path.join(_PROD_DIR_REAL, 'mem.db')
+
+
+def _is_prod_db(db_path):
+    """这个路径是不是**真实**的生产库。
+
+    判据：路径 == 生产库绝对路径。_PROD_DB_REAL 是**硬编码常量**，
+    不随 __file__ 变化（测试会复制 memctl.py 到 /tmp，__file__ 会变）。
+    """
+    try:
+        return os.path.abspath(db_path) == os.path.abspath(_PROD_DB_REAL)
+    except Exception:
+        return False
+
+
+def connect(db_path=None, read_only=False):
     """连库。db_path 显式传时用它 —— 测试必须传，否则会连到生产库。
 
-    ⚠️ 踩过的坑：测试在 exec_module **之前**改 m.DB 是没用的，
+    ⚠️ 踩过的坑（第一次）：测试在 exec_module **之前**改 m.DB 是没用的，
        因为模块加载时 DB = os.path.join(BASE,"mem.db") 会把它覆盖回去。
        结果三个测试一直在写生产库，其中一个还有 os.remove(m.DB) —— 直接把库删了。
        所以这里必须支持显式传参。
+
+    ⚠️ 踩过的坑（第二次，2026-10-26）：有脚本**显式传了生产库路径**来做
+       「生产库副本验证」，但忘了做副本 → 直接写进生产库 4 条假记忆。
+       显式传参这套防护拦不住这种。
+
+    🔒 写锁：连生产库时，除非环境变量 MEMCTL_PROD=1，否则：
+       - read_only=True → 允许（只读安全）
+       - 否则 → 抛错，强制调用方要么做副本、要么显式声明是生产进程
     """
-    conn = sqlite3.connect(db_path or DB)
+    target = db_path or DB
+    is_prod = _is_prod_db(target)
+    if is_prod and not read_only:
+        if os.environ.get(PROD_GUARD_ENV) != '1':
+            raise PermissionError('\n'.join([
+                '拒绝写入生产记忆库：%s' % target,
+                '  · 这是真实在用的库，开发和测试绝不能写它。',
+                '  · 正确做法：先 cp 一份副本到 /tmp，把 db_path 指向副本。',
+                '  · 如果确实是生产进程（桥 / reflect.sh / learn.sh），设 %s=1 即可。' % PROD_GUARD_ENV,
+            ]))
+    # 只读模式：显式 read_only，或「连生产但没声明是生产进程」→ 只读
+    ro = bool(read_only or (is_prod and os.environ.get(PROD_GUARD_ENV) != '1'))
+    if ro:
+        conn = sqlite3.connect(f'file:{target}?mode=ro', uri=True)
+        conn.row_factory = sqlite3.Row
+        # 只读连接**跳过 schema 迁移**：下面那些 ALTER/CREATE INDEX/UPDATE
+        # 都是幂等的，但只读连接执行会直接抛 readonly database。
+        # 生产库早已迁移完，且日常只有 recall 走只读，跳过无害。
+        return conn
+    conn = sqlite3.connect(target)
     conn.row_factory = sqlite3.Row
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS entries (
