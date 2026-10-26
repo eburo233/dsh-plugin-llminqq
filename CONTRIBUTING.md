@@ -141,3 +141,29 @@ Lead 要的是能判断的三样东西：
 
 **规矩**：报指标时同时说「这个数字衡量的是什么、有什么局限」。
 没有对照组、没有基线、只挑好看的场景 → 那就是在自欺。
+
+## 11. 改运行时状态文件，必须先停进程
+
+桥的 `logs/state.json`、`qq-agent/memory/mem.db` 这类文件是**进程内存的落盘快照**。
+进程跑着的时候，你改文件没用——内存里的旧值会在下次 `saveState()` 把整个状态写回来，
+你的修改被静默覆盖。
+
+**同一个坑我踩了两次**：
+1. 删 `state.json` 里的僵尸键 `c2c:3022464706:proactive` → 删完又出现
+2. 把卡死的 `arousal: 1.00` 重置为 0.60 → 重启后又是 1.00
+
+**正确顺序**：
+```bash
+# 1. 停
+ps -eo pid,args | awk '/node bridge\/index.js/ && !/awk/ {print $1}' | xargs -r kill
+sleep 3
+# 2. 改
+python3 - <<'PY'
+import json; ...
+PY
+# 3. 启
+(setsid nohup node bridge/index.js >> logs/bridge.out 2>&1 & echo $! > logs/bridge.pid)
+```
+
+**怎么判断你踩到了**：改完重启，值又变回去了 → 就是这个。
+**保险做法**：改之前先 `saveState` 一次（等等），或者干脆停进程再改。
