@@ -1448,6 +1448,8 @@ const MOOD_DEFAULTS = {
   insultValence: -0.12,
   insultArousal: 0.10,
   addressedArousal: 0.08,
+  // 「被点名」的软上限：见 moodEvent 里 addressed 分支的注释
+  addressedSoftCap: 0.85,
   lonelyPerHour: -0.05,
   lonelyFloor: -0.25,
   decayPerHour: 0.35,
@@ -1539,7 +1541,20 @@ function moodEvent (peerKey, kind, why = '') {
       m.arousal = clampA(m.arousal + K.insultA)
       break
     case 'addressed':
-      m.arousal = clampA(m.arousal + K.addressedA)
+      // ⚠️ 2026-10-26 实测发现的缺陷：纯加法会让 arousal 无上限累加到 1.00 并且卡死。
+      //    原因：衰减依赖 at→now 的累积时间，而连续聊天时 at 每轮都刷新，
+      //    每次最多衰减 3 分钟的量，抵不过每轮 +0.08 的增量。
+      //    结果：一个正常聊天的私聊会话，arousal 永久停在 1.00（极度亢奋），很假。
+      //    修法：**边际递减**（越接近上限加得越少）+ **软上限 0.85**
+      //    （留一点余量给「真的被夸/被怼」的事件，那些才该冲到顶）。
+      const softCap = c.addressedSoftCap ?? 0.85
+      if (m.arousal < softCap) {
+        const room = (softCap - m.arousal) / softCap   // 1 → 0
+        m.arousal = clampA(m.arousal + K.addressedA * room)
+      } else {
+        // 已超软上限：只允许极小的量（不会无限涨）
+        m.arousal = clampA(Math.min(m.arousal, softCap + 0.05))
+      }
       break
     case 'lonely':
       m.valence = clamp(Math.max(c.lonelyFloor, m.valence + K.lonely))
