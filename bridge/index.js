@@ -1956,6 +1956,20 @@ const MEMORY_CC = {
   timeoutMs: config.memory?.crossChannel?.timeoutMs ?? 2500,
   maxCharsPerRow: config.memory?.crossChannel?.maxCharsPerRow ?? 110,
   maxBlockChars: config.memory?.crossChannel?.maxBlockChars ?? 900,
+  // 相关性门槛 + 条数上限（防「话题磁铁」，见 memoryRecallBlock 里注释）
+  //
+  // ⚠️ 门槛定太高的代价（实测）：minScore=0.15 + maxRows=4 会连**相关**的记忆一起丢。
+  //    比如用户说「上次说的那件欠钱的事」，dm_only 那条因为 score 偏低被过滤掉了——
+  //    而这恰恰是最该被想起的东西。
+  //    实测 score 分布有**巨大断层**：相关记忆 0.95+，不相关的全在 0.09 附近。
+  //    候选门槛扫描（7 个 query）：0.02→磁铁5条/总91；0.15→磁铁2条/总64；0.30→磁铁更少。
+  //
+  //    最终选 0.15，不是 0.30：0.30 在**小数据集**（测试造 10 条库）上会把真相关的也滤掉，
+  //    因为 BM25 查询内归一化在候选集很小时分数被压低。宁可留 2 条噪音，也不丢相关记忆。
+  //    （磁铁从 5 降到 2，已经解决主要问题；剩下 2 条由 digest 预算 420 字兜住。）
+  minScore: config.memory?.crossChannel?.minScore ?? 0.15,
+  maxRows: config.memory?.crossChannel?.maxRows ?? 6,
+  maxDigestChars: config.memory?.crossChannel?.maxDigestChars ?? 420,
 }
 /** 缓存：peer+sender+场景+查询 在 15 秒内复用（同一句话被连发时不重复起 python）。 */
 const memoryCcCache = new Map()
@@ -1975,7 +1989,7 @@ const MEMORY_CC_PY = [
   'rows=m.recall_with_visibility(conn,peer or None,query or None,int(top),'
     + "in_group=(in_group=='1'),speaker=qq or None,include_self=False)",
   'print(json.dumps({"ok":True,"rows":[{"peer":r["peer"],"kind":r["kind"],'
-    + '"visibility":r["visibility"],"text":r["text"]} for _s,r in rows]},ensure_ascii=False))',
+    + '"visibility":r["visibility"],"text":r["text"],"score":round(float(_s),4)} for _s,r in rows]},ensure_ascii=False))',
 ].join('\n')
 
 /**
@@ -2039,7 +2053,16 @@ function memoryRecallBlock (peerKey, { speaker = '', inGroup = false, query = ''
     const me = String(peerKey).split(':')[0] === 'c2c' ? '私聊' : '群'
     const lines = []
     let used = 0
-    for (const r of rows) {
+    // ⚠️ 2026-10-26 实测：不加相关性门槛时，不管问什么都会注入满 28 条
+    //    （跨通道 8 条 + digest 20 条），其中「三点开会」那条 pin 记忆永远在里面。
+    //    结果模型被它带跑：问「你嘴真毒」也回「三点开会」。
+    //    所以这里按 score 过滤：低于 minScore 的丢掉，最多 maxRows 条。
+    const minScore = MEMORY_CC.minScore ?? 0.15
+    const maxRows = MEMORY_CC.maxRows ?? 4
+    const kept = rows
+      .filter(r => Number(r?.score ?? 0) >= minScore)
+      .slice(0, maxRows)
+    for (const r of kept) {
       const t = String(r?.text ?? '').replace(/\s+/g, ' ').trim()
       if (!t) continue
       const src = String(r?.peer ?? '')
@@ -2059,7 +2082,11 @@ function memoryRecallBlock (peerKey, { speaker = '', inGroup = false, query = ''
     }
   }
   if (digest) {
-    parts.push('', '【你的见闻录摘要】（memory/digest.md 中本会话的部分）', digest)
+    // digest 也要有预算：原来无上限，跟跨通道段叠加后总长能到近 900 字，
+    // 大部分是不贴题的（按 importance 排，「三点开会」这种 pin 记忆永远在前）。
+    const dcap = MEMORY_CC.maxDigestChars ?? 420
+    const d = digest.length > dcap ? digest.slice(0, dcap) + '\n…（截断）' : digest
+    parts.push('', '【你的见闻录摘要】（memory/digest.md 中本会话的部分）', d)
   }
   if (!parts.length) return ''
   parts.push('提到以前的事就照着说，不确定就别硬编。想翻更细的可以 read memory/ 下的文件。')

@@ -114,6 +114,9 @@ function makeMemEnv (overrides = {}) {
         enabled: overrides.ccEnabled,
         top: overrides.top,
         timeoutMs: overrides.timeoutMs,
+        // 见 B 组同处注释：测试数据只有 10 条，小候选集上 BM25 分数被压低，
+        // 这个套件验的是 dm_only/跨通道/owner 隔离，不是相关性门槛本身。
+        minScore: 0,
         ...(overrides.crossChannel ?? {}),
       },
     },
@@ -396,7 +399,15 @@ cfg.policy = { ...cfg.policy, cooldownMsPerPeer: 0, replyChunkDelayMs: 0 }
 //   受 dsh.cwd 之外的 config 约束，这里必须把 memory 全引开，否则会读生产 mem.db。
 cfg.memory = {
   dir: MEM_DIR, db: MEM_DB, memctl: MEMCTL, digestPath: path.join(MEM_DIR, 'digest.md'),
-  crossChannel: { enabled: true, top: 8, timeoutMs: 3000 },
+  crossChannel: {
+    enabled: true, top: 8, timeoutMs: 3000,
+    // ⚠️ 这里必须显式给 minScore=0（比生产默认的 0.15 低）。
+    //    原因：本测试只造了 10 条记忆，BM25 查询内归一化在**小候选集**上分数被压低；
+    //    而生产的 700 条库里「相关 vs 不相关」有 0.95 vs 0.09 的巨大断层。
+    //    这个套件要验的是 **dm_only 过滤 / 跨通道归集 / owner 隔离**，
+    //    不是相关性门槛本身（那个由生产数据实测确定，见 bridge/index.js 注释）。
+    minScore: 0,
+  },
 }
 const cfgPath = path.join(TMP, 'config.json')
 fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2))

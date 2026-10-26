@@ -1317,6 +1317,54 @@ def scan_log(conn, path):
     return n
 
 
+def reindex(conn, dry_run=False):
+    """重算 fp 并合并重复条目。
+
+    为什么需要：v1 的 fp() 算法和 v2 不同，迁移时没重算旧的 fp，
+    导致「同样内容的旧条目」和「新条目」指纹不一致、去重失效。
+    实测：库里出现过两条一模一样的记忆（id=185 旧 fp / id=490 新 fp）。
+
+    ⚠️ 表上有 `UNIQUE INDEX idx_fp ON entries(peer, fp)` —— 所以不能就地 UPDATE fp，
+    会撞约束。做法：**先归档重复行（retired=1），再更新存活行的 fp**。
+    因为 retired 行不参与检索和 UNIQUE 冲突解决顺序，挪开就安全。
+
+    返回 (合并条数, 修正 fp 条数)。
+    """
+    rows = conn.execute(
+        "SELECT * FROM entries ORDER BY retired ASC, pinned DESC, importance DESC, id ASC"
+    ).fetchall()
+    groups = {}
+    for r in rows:
+        groups.setdefault((r["peer"], fp(r["text"])), []).append(r)
+
+    fixed = merged = 0
+    for _key, group in groups.items():
+        keeper, losers = group[0], group[1:]
+        for lo in losers:
+            merged += 1
+            if dry_run:
+                continue
+            conn.execute(
+                "UPDATE entries SET hits=hits+?, strength=MAX(strength,?), "
+                "importance=MAX(importance,?), pinned=MAX(pinned,?), "
+                "last_seen=MAX(last_seen,?) WHERE id=?",
+                (lo["hits"], lo["strength"], lo["importance"],
+                 lo["pinned"], lo["last_seen"], keeper["id"]),
+            )
+            # ⚠️ 光 retired=1 不够：UNIQUE INDEX 依然管着它。
+            #    把被合并行的 fp 改成「自己的旧 fp + #dup<id>」占位，
+            #    既腾出位置，又保留可回溯的原始信息。
+            conn.execute("UPDATE entries SET retired=1, fp=? WHERE id=?",
+                         (f"{lo['fp']}#dup{lo['id']}", lo["id"]))
+        nf = fp(keeper["text"])
+        if keeper["fp"] != nf:
+            fixed += 1
+            if not dry_run:
+                conn.execute("UPDATE entries SET fp=? WHERE id=?", (nf, keeper["id"]))
+    if not dry_run:
+        conn.commit()
+    return merged, fixed
+
 def main():
     ap = argparse.ArgumentParser(description="吉祥物的记忆系统 v4")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1375,6 +1423,9 @@ def main():
 
     p = sub.add_parser("scan", help="从文本文件抽记忆")
     p.add_argument("path")
+
+    p = sub.add_parser("reindex", help="重算 fp 并合并重复条目（修 v1→v2 历史遗留）")
+    p.add_argument("--dry-run", action="store_true")
 
     a = ap.parse_args()
     conn = connect()
@@ -1450,6 +1501,9 @@ def main():
         print(f"  钉住 {pin} 条 | 低价值(<0.15) {low} 条  ← 这些该清")
     elif a.cmd == "scan":
         print(f"抽取 {scan_log(conn, a.path)} 条")
+    elif a.cmd == "reindex":
+        merged, fixed = reindex(conn, dry_run=a.dry_run)
+        print(f"{'[dry-run] ' if a.dry_run else ''}修正 fp {fixed} 条，合并重复 {merged} 条")
 
 
 if __name__ == "__main__":
