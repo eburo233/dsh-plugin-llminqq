@@ -992,6 +992,40 @@ function segToPlainText(segs) {
  * 把若干 forward_id 展开成可读文本。
  * 无法展开时返回一段说明，让模型知道「有东西但看不到」，而不是假装没发生。
  */
+/**
+ * 取一条被引用消息的原文。
+ *
+ * 为什么需要：OneBot 的 `reply` 段**只有 message_id**，没有内容
+ * （实测：`{"type":"reply","data":{"id":"1021708560"}}`）。
+ * 所以「他回复了某条消息」这件事桥只知道发生了，不知道回复的是什么 ——
+ * 模型会说「你回的那条我没看到」。
+ * 这里用 `get_msg` 把内容取回来。
+ *
+ * @param {string} messageId
+ * @returns {Promise<{ok:boolean, from?:string, text?:string, reason?:string}>}
+ */
+async function quoteOf(messageId) {
+  if (!messageId) return { ok: false, reason: 'no id' }
+  try {
+    const data = await gateway.callData('get_msg', { message_id: Number(messageId) || messageId }, 10000)
+    if (!data) return { ok: false, reason: 'get_msg 返回空' }
+    const segs = Array.isArray(data.message) ? data.message : []
+    // 复用现成的段→纯文本（会标 [图片]/[表情] 等）
+    let text = segToPlainText(segs)
+    if (!text) text = String(data.raw_message ?? '').trim()
+    if (!text) return { ok: false, reason: '该消息没有文字内容' }
+    const who = data.sender?.card || data.sender?.nickname || (data.sender?.user_id ? String(data.sender.user_id) : '某人')
+    const isSelf = String(data.sender?.user_id ?? '') === String(gateway.selfId ?? '')
+    return {
+      ok: true,
+      from: isSelf ? '我' : who,
+      text: text.replace(/\s+/g, ' ').trim().slice(0, 300),
+    }
+  } catch (err) {
+    return { ok: false, reason: String(err?.message ?? err).slice(0, 100) }
+  }
+}
+
 async function expandForwards(forwardIds) {
   const blocks = []
   for (const fid of forwardIds.slice(0, 3)) { // 一次消息里最多处理 3 个转发
@@ -2561,6 +2595,19 @@ async function handleInbound(evt) {
   const senderName = evt.sender?.card || evt.sender?.nickname || String(evt.user_id)
   logger.log(`入站 ${peerKey} from=${senderName}(${evt.user_id}) text=${JSON.stringify(flat.text.slice(0, 80))} images=${flat.images.length}`)
 
+  // 引用回复：reply 段只有 message_id，得用 get_msg 取回原话
+  let quotedText = ''
+  if (flat.replyId) {
+    const q = await quoteOf(flat.replyId)
+    if (q.ok) {
+      quotedText = `${q.from}：${q.text}`
+      logger.log(`引用消息已取回 from=${q.from} len=${q.text.length}`)
+    } else {
+      logger.log(`引用消息取不到（${q.reason}）`)
+      quotedText = `（他引用了一条消息，但内容取不到：${q.reason}）`
+    }
+  }
+
   // 合并转发：展开成「谁说了什么」的纯文本，让模型能读到里面的对话
   let forwardText = ''
   if (flat.forwardIds.length) {
@@ -2755,6 +2802,14 @@ async function handleInbound(evt) {
         '  - 标题够看懂就顺着聊，别装作看过内容',
         '  - 想知道详情可以 bili_search 或搜一下标题',
         '  - 实在猜不出是什么就直说「这卡片我打不开，你说说是啥」',
+      )
+    }
+    if (quotedText) {
+      contextLines.push(
+        '',
+        '【他引用了一条消息来回复你/别人】',
+        `被引用的原文 —— ${quotedText}`,
+        '所以你回话时可以针对那条内容说，不用问「你回的是哪条」。',
       )
     }
     if (forwardText) {
