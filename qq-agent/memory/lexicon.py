@@ -99,6 +99,18 @@ WORK_RE = re.compile(
 # 聊天语料太短没有语料价值（「哦哦」「可以」）
 MIN_CHAT_CHARS = 3
 
+# 每类条数上限 —— 为什么需要：实测第一版 99 条里 expression 占 21 条，其中
+# 「笑哭类表情 / 笑哭脸 / 笑哭收尾」是同一件事，「连刷三个以上 / 同款表情三连 /
+# 同一表情连刷三遍」也是同一件事 —— 模型换个说法就说成新词条。
+# 这类**语义重复**按 text 去重抓不到（字面不同），只能靠分类配额压住，
+# 让真正有信息量的 word 不被同义堆砌挤掉。
+MAX_PER_KIND = {
+    "word": 60,
+    "meme": 20,
+    "expression": 8,   # 表情用法就那么几种情绪，多了全是换个说法的重复
+    "pattern": 6,      # 句式模板连 6 条都嫌多（见 PATTERN_CONF_FACTOR 注释）
+}
+
 # pattern（句式模板）最容易生搬硬套 —— 注入后模型会硬套模板，比学错词更出戏。
 # 所以整类压置信度：模型给的 0.8 也按 0.6x 算，让它排在词条后面、只留真正高频的。
 PATTERN_CONF_FACTOR = 0.6
@@ -606,7 +618,18 @@ def prune_entries(lex, now=None, max_entries=MAX_ENTRIES, stale_days=STALE_DAYS)
             continue
         kept.append(e)
     kept.sort(key=_score, reverse=True)
-    lex["entries"] = kept[:max_entries]
+    # 先按类配额截断（见 MAX_PER_KIND 注释：同类语义重复靠 text 去重抓不到），
+    # 再按总量截断。顺序不能反 —— 反了的话某一类会先占满总量配额。
+    by_kind = {}
+    capped = []
+    for e in kept:
+        k = e.get("kind") if e.get("kind") in KINDS else "word"
+        cap = MAX_PER_KIND.get(k, max_entries)
+        if by_kind.get(k, 0) >= cap:
+            continue
+        by_kind[k] = by_kind.get(k, 0) + 1
+        capped.append(e)
+    lex["entries"] = capped[:max_entries]
     return len(lex["entries"])
 
 
@@ -842,6 +865,9 @@ def main(argv=None):
     rp.add_argument("--max-chars", type=int, default=DEFAULT_MAX_CHARS, help="总长上限")
     rp.add_argument("--json", action="store_true", help="输出 JSON（桥用这个）")
 
+    pp2 = sub.add_parser("prune", help="按类配额+总分重新淘汰（改了配额不用重跑 learn）")
+    pp2.add_argument("--path", default=argparse.SUPPRESS, help="lexicon.json 路径")
+
     sp = sub.add_parser("stats", help="看学了多少、分类分布、更新时间")
     sp.add_argument("--path", default=argparse.SUPPRESS, help="lexicon.json 路径（也可写在子命令前）")
 
@@ -881,6 +907,14 @@ def main(argv=None):
                               "reason": info["reason"]}, ensure_ascii=False))
         else:
             print(block if block else f"（不注入：{info['reason']}，库 {info['total']} 条）")
+        return 0
+
+    if a.cmd == "prune":
+        lex = load_lexicon(a.path)
+        before = len(lex.get("entries") or [])
+        after = prune_entries(lex)
+        write_lexicon(lex, a.path)
+        print(f"词库 {before} → {after} 条（按类配额 {MAX_PER_KIND}）")
         return 0
 
     if a.cmd == "stats":

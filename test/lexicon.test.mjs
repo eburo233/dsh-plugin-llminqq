@@ -207,6 +207,33 @@ console.log('\n=== A5. 降级：坏文件不让它崩 ===')
   ok('文件不存在的原因码是 no-file', rmiss.json?.reason === 'no-file', String(rmiss.json?.reason))
 }
 
+console.log('\n=== A5b. 按类配额：同类语义重复不能挤掉有用词条 ===')
+{
+  // 实测踩到过：99 条里 expression 占 21 条，「笑哭类表情/笑哭脸/笑哭收尾」是同一件事，
+  // 「连刷三个/三连/三遍」也是 —— 模型换个说法就当新词条。text 去重抓不到字面不同的重复，
+  // 只能靠分类配额压。这条断言守的就是配额真的生效。
+  const p = freshJson('quota')
+  const entries = []
+  // 造 30 条 expression（远超配额 8）和 20 条 word
+  for (let i = 0; i < 30; i++) {
+    entries.push({ kind: 'expression', text: `表情玩法a${i}`, meaning: `含义${i}`, usage: `场合${i}`, confidence: 0.9 })
+  }
+  for (let i = 0; i < 20; i++) {
+    entries.push({ kind: 'word', text: `口语词w${i}`, meaning: `含义${i}`, usage: `场合${i}`, confidence: 0.9 })
+  }
+  fs.writeFileSync(p, JSON.stringify({ version: 1, updatedAt: null, entries }), 'utf8')
+  const r = py(['--path', p, 'prune'])
+  ok('prune 能按配额收敛（不用重跑 learn）', r.code === 0, r.text || r.stderr)
+  const out = JSON.parse(fs.readFileSync(p, 'utf8'))
+  const byKind = {}
+  for (const e of out.entries) byKind[e.kind] = (byKind[e.kind] ?? 0) + 1
+  ok('expression 被压到配额 8 条', byKind.expression === 8, JSON.stringify(byKind))
+  ok('word 不受 expression 配额影响（20 条全留）', byKind.word === 20, JSON.stringify(byKind))
+  ok('押韵重复的短词优先保留高分（留下的都是高 confidence）',
+    out.entries.filter(e => e.kind === 'expression').every(e => e.confidence >= 0.9),
+    JSON.stringify(out.entries.filter(e => e.kind === 'expression').map(e => e.confidence)))
+}
+
 console.log('\n=== A6. 工作语料 vs 聊天语料（Lead 报的真问题）===')
 {
   // 背景：772 条群语料里 SeekDee 62.9% 带工程词，信风只有 10.8%。照原样学，
