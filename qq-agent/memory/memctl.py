@@ -307,21 +307,181 @@ def recency(row, at=None):
     return 0.5 ** (age_days / hl)
 
 
-def relevance(row, query_tokens):
-    """relevance：查询词与记忆的重合度。没有 query 时返回中性 0.5。"""
-    if not query_tokens:
-        return 0.5
+# ── BM25 检索（带 IDF）───────────────────────────────────────────────────────
+# v3：把「bigram 字面重合」升级成 BM25。
+# 为什么（实测踩到的短板）：v2 的 relevance 是 inter/sqrt(|D|)，
+# **没有 IDF** —— 「觉得」「就是」这种满库都是的词，和「开会」「撤回」这种
+# 只在一两处出现的词，权重一样。于是「我觉得开会」这类查询会被
+# 「我今天觉得吧…」的长回复抢走，因为长回复命中的噪音词多。
+# BM25 用 IDF 把噪音词的权重压下去，专有词自然浮上来。
+# 参考：GroupMemBench（微软）里纯 BM25 追平/超过多数商业 agent memory。
+# 纯 Python 实现，不引依赖。
+K1 = 1.5          # 词频饱和参数（标准值）
+B = 0.75          # 文档长度归一强度（标准值）
+
+
+def term_freqs(text):
+    """BM25 用的词频表：term → 出现次数。
+
+    跟 tokenize() 的区别：tokenize 返回 set（去重，别处按「命中/没命中」用），
+    这里要**保留重复次数**（tf 是 BM25 的词频分量）。
+    分词规则跟 tokenize() 完全一致，保证两边对同一句话切出同一批词。
+    """
+    t = (text or "").lower()
+    tf = {}
+    for w in re.findall(r"[a-z0-9_]{2,}", t):
+        tf[w] = tf.get(w, 0) + 1
+    for seg in re.findall(r"[\u4e00-\u9fff]+", t):
+        if len(seg) == 1:
+            if seg not in STOPWORDS:
+                tf[seg] = tf.get(seg, 0) + 1
+            continue
+        for i in range(len(seg) - 1):
+            bg = seg[i:i + 2]
+            if bg not in STOPWORDS:
+                tf[bg] = tf.get(bg, 0) + 1
+    return tf
+
+
+class BM25Index:
+    """倒排索引 + BM25 打分（语料 = 全部未归档记忆）。
+
+    score(q, D) = Σ IDF(t) · tf(t,D)·(k1+1) / (tf + k1·(1-b + b·|D|/avgdl))
+                 IDF(t) = ln((N - n(t) + 0.5) / (n(t) + 0.5) + 1)
+
+    ⚠️ BM25 原始分没有上界，不能直接跟 importance/recency 加权，
+    所以这里做**查询内归一**：raw / 本次查询的最高分 → [0,1]。
+    同一个查询里所有条目除以同一个分母，排序不变，但尺度稳定。
+    查询词一个都不在库里命中 → max=0 → 全 0（交给上游的零重合折损规则）。
+    """
+
+    def __init__(self, docs):
+        # docs: [(id, text)]
+        self.tf = {}       # id → {term: tf}
+        self.dl = {}       # id → 文档长度（词数，含重复）
+        self.df = {}       # term → 出现在几个文档里
+        for did, text in docs:
+            tf = term_freqs(text)
+            self.tf[did] = tf
+            self.dl[did] = sum(tf.values())
+            for term in tf:
+                self.df[term] = self.df.get(term, 0) + 1
+        self.N = len(self.tf)
+        self.avgdl = (sum(self.dl.values()) / self.N) if self.N else 0.0
+        self._key = None      # 上次算分的 query 词集
+        self._scores = {}     # id → 原始 BM25 分
+        self._max = 0.0       # 该查询的最高原始分（归一化分母）
+
+    def idf(self, term):
+        n = self.df.get(term, 0)
+        return math.log((self.N - n + 0.5) / (n + 0.5) + 1.0)
+
+    def _compute(self, query_terms):
+        key = frozenset(query_terms)
+        if key == self._key:
+            return self._scores, self._max
+        scores = {}
+        for did, tf in self.tf.items():
+            dl = self.dl[did] or 1
+            norm = K1 * (1 - B + B * (dl / self.avgdl if self.avgdl else 1.0))
+            s = 0.0
+            for term in query_terms:
+                f = tf.get(term)
+                if not f:
+                    continue
+                s += self.idf(term) * (f * (K1 + 1)) / (f + norm)
+            if s > 0:
+                scores[did] = s
+        mx = max(scores.values()) if scores else 0.0
+        self._key, self._scores, self._max = key, scores, mx
+        return scores, mx
+
+    def score(self, doc_id, query_terms):
+        """单条记忆的归一化 relevance ∈ [0,1]；零重合 → 0。"""
+        scores, mx = self._compute(query_terms)
+        if not mx:
+            return 0.0
+        raw = scores.get(doc_id)
+        if not raw:
+            return 0.0
+        return min(1.0, raw / mx)
+
+
+# 进程内索引缓存：recall() 每轮都会查，重建倒排太重。
+# 失效条件 = 语料指纹变了（库文件 + 未归档条数 + 最大 id）。
+# 条数变了 / 新插入 / prune 归档 → 指纹变 → 自动重建。
+_BM25_CACHE = {"sig": None, "idx": None}
+_BM25_ACTIVE = None    # 最近一次 recall 用的索引，给 relevance(row, qt) 兜底
+
+
+def _db_file(conn):
+    """当前连接的库文件路径（测试会用不同临时库，必须分清）。"""
+    try:
+        for r in conn.execute("PRAGMA database_list"):
+            if r[1] == "main":
+                return r[2] or ":memory:"
+    except Exception:
+        pass
+    return "?"
+
+
+def bm25_signature(conn):
+    row = conn.execute(
+        "SELECT COUNT(*), IFNULL(MAX(id), 0) FROM entries WHERE retired=0"
+    ).fetchone()
+    return (_db_file(conn), row[0], row[1])
+
+
+def bm25_index(conn):
+    """取进程内索引；语料变了就重建。IDF 用全库统计（不按 peer 切）。"""
+    global _BM25_ACTIVE
+    sig = bm25_signature(conn)
+    idx = _BM25_CACHE["idx"]
+    if idx is None or _BM25_CACHE["sig"] != sig:
+        docs = [(r["id"], r["text"]) for r in conn.execute(
+            "SELECT id, text FROM entries WHERE retired=0")]
+        idx = BM25Index(docs)
+        _BM25_CACHE["sig"] = sig
+        _BM25_CACHE["idx"] = idx
+    _BM25_ACTIVE = idx
+    return idx
+
+
+def invalidate_bm25():
+    """写库后手动作废索引（指纹兜底之外，让写操作后的下一次查询直接重建）。"""
+    global _BM25_ACTIVE
+    _BM25_CACHE["sig"] = None
+    _BM25_CACHE["idx"] = None
+    _BM25_ACTIVE = None
+
+
+def _legacy_relevance(row, query_tokens):
+    """v2 的 bigram 重合度。仅在没有索引上下文时兜底（正常检索走 BM25）。"""
     mem_tokens = tokenize(row["text"])
     if not mem_tokens:
         return 0.0
     inter = len(query_tokens & mem_tokens)
     if inter == 0:
         return 0.0
-    # 命中数 / sqrt(长度)：长记忆不因长而被罚
     return min(1.0, inter / math.sqrt(len(mem_tokens)))
 
 
-def combine(row, query_tokens=None, at=None):
+def relevance(row, query_tokens, index=None):
+    """relevance：查询词与记忆的相关性 ∈ [0,1]。没有 query 时返回中性 0.5。
+
+    v3 起内部是 BM25（带 IDF + 查询内归一）；`index` 由 recall() 传入，
+    不传就用最近一次 recall 建的索引（保持旧签名可单独调用）。
+    """
+    if not query_tokens:
+        return 0.5
+    idx = index if index is not None else _BM25_ACTIVE
+    if idx is None:
+        # 完全没有索引上下文（单条直调，生产路径不会走到）→ 退回旧公式，别崩
+        return _legacy_relevance(row, query_tokens)
+    return idx.score(row["id"], query_tokens)
+
+
+def combine(row, query_tokens=None, at=None, index=None):
     """论文公式：score = α_rel·relevance + α_imp·importance + α_rec·recency
 
     加了一条论文没有的规则：**给了 query 但零重合 → 强折减**。
@@ -331,7 +491,7 @@ def combine(row, query_tokens=None, at=None):
     imp = row["importance"] if "importance" in row.keys() else 0.5
     if row["pinned"]:
         imp = max(imp, 0.8)
-    rel = relevance(row, query_tokens)
+    rel = relevance(row, query_tokens, index=index)
     base = ALPHA_RELEVANCE * rel + ALPHA_IMPORTANCE * imp + ALPHA_RECENCY * r
     # 有 query 却完全无关 → 折到 25%（排序靠后，但钉住的还能兜底出现）
     if query_tokens and rel == 0:
@@ -381,7 +541,11 @@ def remember(conn, peer, text, kind=None, pin=False, ts=None, importance=None, o
 
 
 def recall(conn, peer=None, query=None, top=8, min_score=0.05):
-    """检索：按论文三分量打分。有 query 才用 relevance。"""
+    """检索：按论文三分量打分。有 query 才用 relevance（v3 = BM25）。
+
+    IDF 统计用**全库**（跨 peer 的文档频率才准），候选条目才按 peer 过滤。
+    索引进程内缓存，语料变化时自动重建（见 bm25_index）。
+    """
     if peer:
         rows = conn.execute(
             "SELECT * FROM entries WHERE peer=? AND retired=0", (peer,)
@@ -389,7 +553,8 @@ def recall(conn, peer=None, query=None, top=8, min_score=0.05):
     else:
         rows = conn.execute("SELECT * FROM entries WHERE retired=0").fetchall()
     qt = tokenize(query) if query else None
-    scored = [(combine(r, qt), r) for r in rows]
+    idx = bm25_index(conn) if qt else None
+    scored = [(combine(r, qt, index=idx), r) for r in rows]
     scored.sort(key=lambda x: x[0], reverse=True)
     return [(s, r) for s, r in scored[:top] if s >= min_score]
 
