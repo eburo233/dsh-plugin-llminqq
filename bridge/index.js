@@ -1209,6 +1209,9 @@ const PROACTIVE_DEFAULTS = {
   nightEndHour: 1,
   nightFactor: 0.5,
   whitelist: [],
+  // 连续空转多少次后进入长冷却（见空转分支）
+  emptyCooldownAfter: 3,
+  emptyCooldownMin: 120,
   // ── 「接话窗口」（chatFollow，2026-10-26 新增；语义经过两轮纠正，别按旧注释理解）──
   //
   // 用户的原话：
@@ -1872,7 +1875,15 @@ async function proactiveTick () {
     const pEff = Math.min(c.maxProb, st.p * win.factor)
     const roll = Math.random()
     let action = 'miss'
-    if (st.missStreak + 1 >= c.guaranteeCount) action = 'guarantee'
+    // ⚠️ 保底判定必须基于「连续 miss 次数」，而 missStreak 在空转时**不增长**（上午的修改）。
+    //    于是如果只写 `missStreak+1 >= guaranteeCount`，当 missStreak 卡在 5 时
+    //    这个条件**恒为真** → 每轮都判 guarantee → 每轮都空转 → 死循环。
+    //    2026-10-26 实测：连续 5 轮全部 guarantee，全空转，missStreak 卡在 5 不动。
+    //
+    //    修法：保底触发后要**要求有新的 miss 积累**。用 misssSinceGuarantee 单独计，
+    //    空转也计入这个计数（否则「一直空转」永远不会被保底救，也永远不会停）。
+    const missesSinceGuarantee = (st.missesSinceGuarantee ?? 0)
+    if (missesSinceGuarantee + 1 >= c.guaranteeCount) action = 'guarantee'
     else if (roll < pEff) action = 'hit'
 
     logger.log(`proactive[${peerKey}] 评估：距上次 ${Number.isFinite(minsSinceSpoke) ? minsSinceSpoke.toFixed(0) + 'min' : '首次'} | p=${(st.p * 100).toFixed(0)}%${win.factor !== 1 ? ` (${win.why}→${(pEff * 100).toFixed(0)}%)` : ''} | roll=${roll.toFixed(3)} | ${action}`)
@@ -1880,6 +1891,7 @@ async function proactiveTick () {
     if (action === 'miss') {
       st.p = Math.min(c.maxProb, st.p + c.step)
       st.missStreak += 1
+      st.missesSinceGuarantee = (st.missesSinceGuarantee ?? 0) + 1
       saveState()
       continue
     }
@@ -1889,6 +1901,8 @@ async function proactiveTick () {
     if (spoke) {
       st.p = c.baseProb
       st.missStreak = 0
+      st.missesSinceGuarantee = 0
+      st.empties = 0
       st.lastProactiveAt = Date.now()
       st.lastSpokeAt = Date.now()
       st.cooldownUntil = Date.now() + c.cooldownMin * 60000
@@ -1902,9 +1916,18 @@ async function proactiveTick () {
       // 语义上：missStreak 应该表示「运气不好，一直没抽中」，
       // 而空转是「抽中了但内容上确实没什么可说的」——两者不该混为一谈。
       // 所以：空转只轻微抬 p（让下次更容易抽中，给新话题一个机会），不动 streak。
-      st.p = Math.min(c.maxProb, st.p + c.step * 0.5)
+      // 空转**不抬 p**（原来抬 0.5×step，实测导致 p 一路涨到 50% 还在涨，恶性循环）
+      // 但计入 missesSinceGuarantee，让「连续空转」也能被计数、最终走到真正的休止
       st.empties = (st.empties ?? 0) + 1
+      st.missesSinceGuarantee = (st.missesSinceGuarantee ?? 0) + 1
       st.lastEmptyAt = Date.now()
+      // 连续空转太多 → 进入长冷却（说明确实没话说，别每 20 分钟骚扰一次）
+      if (st.empties >= (c.emptyCooldownAfter ?? 3)) {
+        st.cooldownUntil = Date.now() + (c.emptyCooldownMin ?? 120) * 60000
+        logger.log(`proactive[${peerKey}] 空转 ${st.empties} 次 → 进入 ${c.emptyCooldownMin ?? 120}min 长冷却`)
+        st.empties = 0
+        st.missesSinceGuarantee = 0
+      }
       logger.log(`proactive[${peerKey}] 空转（真没话说），不累加 missStreak（当前 ${st.missStreak}，空转累计 ${st.empties}）`)
     }
     saveState()

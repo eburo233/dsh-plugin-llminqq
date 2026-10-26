@@ -34,7 +34,7 @@ echo "== 2. 跑全部测试 =="
 SUITES=(
   unit card-parse url-guard sanitize forward-path
   proactive-logic flurry-logic mood-logic mood-decay mood-traits delay-logic chain-walk
-  quote-reply memory-cross-channel arousal-cap energy-mood-link linebreak prod-db-lock recall
+  quote-reply memory-cross-channel arousal-cap energy-mood-link linebreak prod-db-lock guarantee-fix recall
   style-bank memory-cross-channel lexicon message-queue chat-follow
   # 语料池抓取：离线（假 python）、不真请求 B站，所以能安全进每次提交的测试
   crawl-bili-comments
