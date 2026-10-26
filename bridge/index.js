@@ -1902,6 +1902,125 @@ function readMemoryDigest () {
   } catch { return '' }
 }
 
+// ── 自我风格样本库（人格一致性）─────────────────────────────────────────────
+// 目的：让模型记得「自己在类似场合是怎么说的」，从而保持人格一致，而不是每轮换风格。
+// 反复写人设没用（persona drift，https://openreview.net/forum?id=Mrz9E1EcIA），
+// 有效的是给一个**风格锚**：拿当前消息检索「类似场合我的原话」，取 2-3 条进上下文。
+//
+// 存储是独立的 SQLite（memory/style.db，gitignore），不进 mem.db 的通用检索 ——
+// 那边是「关于对方的事实」，这边是「我的说话风格」，两种检索目标不同。
+// 检索算法复用 memctl.py 里那套 BM25（stylebank.py 直接 import），不另写相似度。
+//
+// 桥这侧只做三件事：
+//   ① 记录（发送成功后，把「对方那句话 + 我实际发出去的第一条正文」追加到 jsonl）
+//   ② 检索（拼 prompt 前问一次 python，拿渲染好的块）
+//   ③ 兜底（python 挂了/超时/库没样本 → 一律不注入，绝不让这一轮失败）
+const STYLE_ROOTS = (() => {
+  // 路径都可被 config.style 覆盖 —— 不只是配置灵活性：
+  // 端到端测试（recall-e2e.integration.mjs）会**真的启动一份 index.js**，它会换掉
+  // persona.path / log.file / state 目录，但改变不了 dsh.cwd。如果这里硬编码
+  // dsh.cwd/memory，测试就会往**生产** memory/ 里写假风格样本（实测踩到过：
+  // 生产 style.db 被塞进 3 条 group:9137001123 的假数据）。
+  // 所以所有落盘路径都必须可覆盖，测试才能把它们指到临时目录。
+  const base = config.style?.dir ?? path.join(config.dsh.cwd, 'memory')
+  return {
+    base,
+    script: config.style?.script ?? path.join(base, 'stylebank.py'),
+    jsonl: config.style?.jsonl ?? path.join(base, 'style-cases.jsonl'),
+    cursorDir: config.style?.cursorDir ?? path.join(config.dsh.cwd, '.bridge'),
+  }
+})()
+const STYLE = {
+  enabled: config.style?.enabled !== false,
+  script: STYLE_ROOTS.script,
+  jsonl: STYLE_ROOTS.jsonl,
+  cursorDir: STYLE_ROOTS.cursorDir,
+  n: config.style?.injectN ?? 3,
+  maxChars: config.style?.maxChars ?? 60,
+  recallTimeoutMs: config.style?.recallTimeoutMs ?? 4000,
+  cacheTtlMs: config.style?.cacheTtlMs ?? 30000,
+}
+/** peerKey -> {at, block}：同一 peer 30 秒内复用检索结果（同一句话刷屏时不重复起 python） */
+const styleCache = new Map()
+
+/**
+ * 该不该做（记 / 查是两个独立开关，别混）：
+ *   enabled=false  → 整个功能关掉
+ *   record=false   → 只停止**学习**（还在用已有样本），用来冻结风格
+ * 返回非 null 时调用方直接跳过。
+ */
+function styleSkipReason (what = 'recall') {
+  if (!STYLE.enabled) return 'disabled'
+  if (what === 'record' && config.style?.record === false) return 'record-off'
+  if (!fs.existsSync(STYLE.script)) return 'no-script'
+  return null
+}
+
+/**
+ * 把一轮对话追加进风格样本来源文件（jsonl）。
+ *
+ * context = 触发这轮回复的那条消息（对方说了什么），my_reply = 我实际发出去的第一条正文。
+ * 用 jsonl 而不是直接写 SQLite：桥是 Node、库在 Python 侧，
+ * 让桥每轮起 python 进程去写库既慢又会在桥崩时丢数据；追加一行是原子的、几乎零成本，
+ * python 那边按游标增量吃（stylebank.py ingest --jsonl）。
+ * 过滤（<4 字、剥控制标记）放在 python 侧统一做，桥不重复实现一遍规则。
+ */
+function recordStyleCase (peerKey, context, reply) {
+  if (styleSkipReason('record')) return
+  const ctx = String(context ?? '').replace(/\s+/g, ' ').trim().slice(0, 400)
+  const rep = String(reply ?? '').replace(/\s+/g, ' ').trim().slice(0, 400)
+  if (!ctx || !rep) return
+  try {
+    const line = JSON.stringify({ peer: peerKey, context: ctx, my_reply: rep, ts: Date.now() / 1000 }) + '\n'
+    fs.appendFileSync(STYLE.jsonl, line, 'utf8')
+  } catch (err) {
+    logger.debug(`style 记录失败（不影响对话）: ${err.message}`)
+  }
+}
+
+/**
+ * 检索「类似场合我上次怎么回」，返回可直接塞进 prompt 的文本块（拿不到就返回 ''）。
+ *
+ * 只注入**我的原话**，不注入当时的对方消息 —— 多点上下文会挤占 prompt，
+ * 而且「场合」已经由当前这条消息本身表达了，锚只需要锚「我怎么说话」。
+ * python 调用有硬超时（默认 4s），失败一律静默降级：风格锚是锦上添花，不是主链路。
+ */
+function styleAnchorBlock (peerKey, currentMessage) {
+  if (styleSkipReason()) return ''
+  const msg = String(currentMessage ?? '').trim()
+  if (!msg) return ''
+  const cached = styleCache.get(peerKey)
+  if (cached && Date.now() - cached.at < STYLE.cacheTtlMs && cached.msg === msg) return cached.block
+  try {
+    const out = execFileSync('python3', [
+      STYLE.script,
+      'recall',
+      '--peer', peerKey,
+      '--query', msg.slice(0, 500),
+      '--n', String(STYLE.n),
+      '--max-chars', String(STYLE.maxChars),
+      '--auto-ingest',
+      '--jsonl', STYLE.jsonl,
+      '--cursor-dir', STYLE.cursorDir,
+      '--json',
+    ], { encoding: 'utf8', timeout: STYLE.recallTimeoutMs, stdio: ['ignore', 'pipe', 'ignore'] })
+    const res = JSON.parse(String(out).trim().split('\n').pop())
+    const block = res?.injected ? String(res.block ?? '') : ''
+    styleCache.set(peerKey, { at: Date.now(), msg, block })
+    if (block) {
+      logger.log(`style ${peerKey}: 注入 ${res.matched}/${res.total} 条风格样本`)
+    } else if (res?.reason) {
+      // 冷启动 / 弱匹配都是「正常不注入」，用 debug 级：不该刷屏 info 日志
+      logger.debug(`style ${peerKey}: 不注入（${res.reason}，库 ${res.total} 条/命中 ${res.matched}）`)
+    }
+    return block
+  } catch (err) {
+    // 超时/库还没建/python 挂掉都走这里 —— 静默降级，本轮照常说话
+    logger.debug(`style 检索失败（不注入，不影响对话）: ${String(err.message).slice(0, 100)}`)
+    return ''
+  }
+}
+
 function startProactiveLoop () {
   const c = proactiveCfg()
   if (!c.enabled) { logger.log('proactive: 未启用'); return }
@@ -2381,6 +2500,10 @@ async function handleInbound(evt) {
         '提到以前的事就照着说，不确定就别硬编。想翻更细的可以 read memory/ 下的文件。',
       )
     }
+    // 风格锚：把「我在类似场合的原话」放进来（最多 3 条、每条截 60 字；样本不足不注入）。
+    // 位置在记忆之后、硬约束之前 —— 越靠后越靠近行动，但不能压住硬约束。
+    const styleBlock = styleAnchorBlock(peerKey, flat.text || forwardText || '')
+    if (styleBlock) contextLines.push('', styleBlock)
     contextLines.push(
       `【硬约束】QQ 通道不认 [表情: 描述] 文字标记；要发表情包必须用 qq-meme skill 发送真实图片文件并输出 [SEND_FILE: 绝对路径]。`,
       `【硬约束】[SEND_FILE] 只放行会话工作区 (${config.dsh.cwd}) 与暂存目录 (${STAGING_DIR}) 内的文件。`,
@@ -2572,6 +2695,11 @@ async function handleInbound(evt) {
       await sleep(dly)
     }
     if (cappedPlain) await sendTextTo(peer, cappedPlain)
+    // 风格样本记账：只记「对方那句话 → 我实际发出去的第一条正文」。
+    // 记 cappedPlain 而不是模型原始输出：语音/图片/@/撤回等标记不是「说话内容」，
+    // 而且要让记下来的就是对方真实看到的那句（否则学到的风格是没人见过的版本）。
+    // 只记第一条正文（不含 [FOLLOW] 补发）：风格锚要的是「典型一句」而不是整个话痨流水。
+    if (cappedPlain) recordStyleCase(peerKey, flat.text || forwardText || '', cappedPlain)
     for (const f of files) {
       const abs = path.isAbsolute(f) ? f : path.resolve(config.dsh.cwd, f)
       await sendImageTo(peer, abs)

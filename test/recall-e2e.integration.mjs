@@ -87,6 +87,14 @@ cfg.dsh.turnTimeoutMs = 30000
 cfg.dsh.startTimeoutMs = 15000
 cfg.dsh.failover = { ...(cfg.dsh.failover ?? {}), enabled: false }
 cfg.memory = { ...(cfg.memory ?? {}), enabled: false }
+// 风格库也要隔离：桥会真的写 style-cases.jsonl / 起 stylebank.py。
+// 不指到临时目录 → 假样本会落进生产 memory/（实测踩过）。
+cfg.style = {
+  ...(cfg.style ?? {}),
+  dir: path.join(TMP, 'memory'),
+  jsonl: path.join(TMP, 'memory', 'style-cases.jsonl'),
+  cursorDir: path.join(TMP, '.bridge'),
+}
 cfg.proactive = { ...(cfg.proactive ?? {}), enabled: false }
 cfg.energy = { ...(cfg.energy ?? {}), enabled: false }
 cfg.mood = { ...(cfg.mood ?? {}), enabled: false }
