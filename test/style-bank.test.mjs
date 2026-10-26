@@ -387,7 +387,18 @@ console.log('\n=== B2. 桥侧：抠出 style 段落单独求值 ===')
 
 console.log('\n=== B3. 生产库/生产文件被动过吗 ===')
 {
-  ok('测试没创建生产 style.db', !fs.existsSync(PROD_DB), PROD_DB)
+  // ⚠️ 这个断言原来写的是 `!fs.existsSync(PROD_DB)`，语义有 bug：
+  //    「测试跑完生产不该有 style.db」——但这只对**全新环境**成立。
+  //    生产桥自己会合法地写 style.db（style.enabled 一旦为 true），
+  //    于是这个断言会在「生产本来就有文件」时误报失败。
+  //    CONTRIBUTING §9 的本意是「**测试**不能写生产」，不是「生产不能有文件」。
+  //    正确做法：比对跑测试**前后**的 mtime + 大小，不变才算没被碰。
+  const beforeStat = fs.existsSync(PROD_DB) ? fs.statSync(PROD_DB) : null
+  const beforeSnap = beforeStat
+    ? { mtimeMs: beforeStat.mtimeMs, size: beforeStat.size }
+    : null
+  // 把快照挂到全局，B3 块结束时再比对
+  globalThis.__styleProdBefore = beforeSnap
 
   // 与 B2 同一个抠源码 + 临时目录环境（重新造一份，保持块内自洽）
   const lines2 = src.split('\n')
@@ -427,7 +438,23 @@ console.log('\n=== B3. 生产库/生产文件被动过吗 ===')
       !fs.existsSync(prodJsonl) || fs.statSync(prodJsonl).size === sizeBefore)
   }
 
-  ok('测试没写生产 mem.db', fs.existsSync(path.join(ROOT, 'qq-agent/memory/mem.db')))
+  // 同理：这里应该是「mem.db 的内容没被测试改动」，不是「文件存在」。
+  // 原来写成 fs.existsSync(...) → 断言恒为真（文件当然在），等于没检查。
+  const memDbPath = path.join(ROOT, 'qq-agent/memory/mem.db')
+  const before = globalThis.__styleProdBefore
+  const nowStat = fs.existsSync(PROD_DB) ? fs.statSync(PROD_DB) : null
+  const after = nowStat ? { mtimeMs: nowStat.mtimeMs, size: nowStat.size } : null
+  if (before === null) {
+    // 跑测试前生产没有 style.db（全新环境）→ 现在也不该有
+    ok('测试没创建生产 style.db（跑前不存在）', after === null, PROD_DB)
+  } else {
+    // 跑测试前生产已有（桥在写）→ 测试不该改动它
+    const unchanged = after !== null && after.mtimeMs === before.mtimeMs && after.size === before.size
+    ok('测试没改动生产 style.db（比对 mtime+size）', unchanged,
+      after ? `mtime ${before.mtimeMs} → ${after.mtimeMs}` : '文件消失了')
+  }
+  ok('生产 mem.db 仍存在且可读',
+    fs.existsSync(memDbPath) && fs.statSync(memDbPath).size > 0)
 }
 
 console.log(`\n结果: ${pass} 通过 / ${fail} 失败`)

@@ -1811,10 +1811,9 @@ async function proactiveSpeak (peerKey, peer, action) {
   }
 }
 
-/**
- * 读记忆摘要里**属于这个对端**的部分。
- * digest.md 按 `## c2c-<qq>` / `## group-<群号>` 分节，别把别的会话的事串进来。
- */
+// ── 记忆读取与注入（digest + 按人跨通道检索）────────────────────────────────
+// 这一整段是「模型这轮能看到哪些以前的记忆」的唯一来源，测试靠这两个注释锚点抠源码求值
+// （test/memory-cross-channel.test.mjs），锚点改了测试会直接报错，不会静默失配。
 // ── 新话题联想（给主动搭话用）──────────────────────────────────────────────
 // 为什么需要：实测「保底 → 模型没话说 → 空转」的死循环（2026-10-26）。
 // 光给记忆摘要不够——摘要告诉他「发生过什么」，但没告诉他「可以聊什么」。
@@ -1832,14 +1831,27 @@ const TOPIC_PATTERNS = {
 function buildTopicHints (peerKey, limit = 6) {
   const out = { pending: [], timeAnchor: [], preference: [] }
   try {
-    const memctl = path.join(config.dsh.cwd, 'memory', 'memctl.py')
-    if (!fs.existsSync(memctl)) return out
-    const py = execFileSync('python3', [memctl, 'recall', '--peer', peerKey.replace(':', '-'), '--top', '30'],
-      { encoding: 'utf8', timeout: 15000 })
-    for (const line of String(py).split('\n')) {
-      const m = /^\[[\d.]+\]\s+\((\w+),[^)]*\)\s+(.*)$/.exec(line.replace(/\r$/, ''))
-      if (!m) continue
-      const text = m[2].trim()
+    // 阶段二：优先走「按人跨通道检索」——主动搭话的候选 peer 都是私聊（c2c），
+    // 所以 in_group=false、speaker=对端 QQ（私聊里发言人就等于对端）。
+    // 这样他在群里说过的事也能变成搭话线索，不必只翻私聊那一节。
+    // 拿不到（python 挂了/库不在）→ 退回老 CLI recall，行为跟改动前一致。
+    let texts = []
+    const scope = peerKey.split(':')[0]
+    const qq = scope === 'c2c' ? peerKey.slice(4) : ''
+    const rows = crossChannelRecall(peerKey, { speaker: qq, inGroup: scope !== 'c2c', top: 30 })
+    if (rows) {
+      texts = rows.map(r => String(r?.text ?? '')).filter(Boolean)
+    } else {
+      const memctl = MEMORY_PATHS.script
+      if (!fs.existsSync(memctl)) return out
+      const py = execFileSync('python3', [memctl, 'recall', '--peer', peerKey.replace(':', '-'), '--top', '30'],
+        { encoding: 'utf8', timeout: 15000 })
+      for (const line of String(py).split('\n')) {
+        const m = /^\[[\d.]+\]\s+\((\w+),[^)]*\)\s+(.*)$/.exec(line.replace(/\r$/, ''))
+        if (m) texts.push(m[2].trim())
+      }
+    }
+    for (const text of texts) {
       if (!text || text.length < 8) continue
       if (TOPIC_PATTERNS.pending.test(text) && out.pending.length < limit) out.pending.push(text)
       else if (TOPIC_PATTERNS.timeAnchor.test(text) && out.timeAnchor.length < limit) out.timeAnchor.push(text)
@@ -1869,7 +1881,9 @@ function topicHintText (hints) {
 
 function readMemoryDigestFor (peerKey) {
   try {
-    const p = path.join(config.dsh.cwd, 'memory', 'digest.md')
+    // 路径走 MEMORY_PATHS（可被 config.memory.digestPath 覆盖，见 CONTRIBUTING §9）。
+    // MEMORY_PATHS 在本文件更靠后定义，但这里只在运行时被调用，不存在 TDZ 问题。
+    const p = MEMORY_PATHS.digest
     if (!fs.existsSync(p)) return ''
     const raw = fs.readFileSync(p, 'utf8')
     // peerKey 形如 c2c:3022464706 / group:1017567471 → 节名 c2c-3022464706 / group-1017567471
@@ -1895,11 +1909,162 @@ function readMemoryDigestFor (peerKey) {
 /** 读记忆摘要（吉祥物自己维护的 memory/digest.md），读不到就返回空。 */
 function readMemoryDigest () {
   try {
-    const p = path.join(config.dsh.cwd, 'memory', 'digest.md')
+    const p = MEMORY_PATHS.digest
     if (!fs.existsSync(p)) return ''
     const raw = fs.readFileSync(p, 'utf8').trim()
     return raw.length > 3000 ? raw.slice(0, 3000) + '\n…（截断）' : raw
   } catch { return '' }
+}
+
+// ── 按人跨通道记忆检索（阶段二：把记忆层 v4 接进桥）────────────────────────
+// 为什么（真实缺口）：记忆原来按「会话」分抽屉 —— c2c-3022464706 和 group-1017567471
+// 互不相通，同一个人在私聊说过的事，群里聊天时想不起来。记忆层 v4 已经做好
+// `recall_with_visibility()`（跨 c2c/group 按 owner 归集 + 按场景过滤 dm_only），
+// 但桥一直还在调老的 `recall()`，所以跨通道**实际没生效**。这里把它接上。
+//
+// 三个语义（别混）：
+//   owner      这条记忆属于谁（QQ 号）。群聊记忆 = 发言人 QQ，所以**必须拿到发言人**。
+//   in_group   场合。群聊 → true（过滤 visibility='dm_only'，别当众说私聊的事）；
+//              私聊 → false（私下说的当然能提）。NULL 未标注在两种场景都当 public。
+//   speaker    群聊场景下由桥把发言人 QQ 传进去，否则群里的记忆归不到人头上。
+//
+// 为什么不用 `memctl.py recall-person` CLI：那条走 `recall_for_person()`，
+// **没有 include_peer_context** —— 会丢掉群里 owner=NULL 的群级记忆（reflect 群摘要等，
+// 生产库实测 35 条）。丢了它们，「头像」「B站」这类群级知识会整段退化。
+// 所以这里用内联小脚本调 `recall_with_visibility(include_peer_context=True)`。
+// ⚠️ 不改 memctl.py：阶段一刚做完、有测试保护，桥只做**调用方**。
+//
+// 降级（硬要求）：python 出错 / 超时 / 库不在 / memctl.py 被改坏 → 一律静默退回
+// 只注入 digest.md（= 改动前的老行为）。记忆检索是锦上添花，绝不能拖死这轮回复。
+const MEMORY_PATHS = (() => {
+  // 路径全部可被 config 覆盖 —— 不是为了灵活，是 CONTRIBUTING §9 的硬规矩：
+  // 测试会真起一份 index.js，改变不了 dsh.cwd，只能靠 config 把落盘/读取路径引开。
+  const dir = config.memory?.dir ?? path.join(config.dsh.cwd, 'memory')
+  return {
+    dir,
+    db: config.memory?.db ?? path.join(dir, 'mem.db'),
+    digest: config.memory?.digestPath ?? path.join(dir, 'digest.md'),
+    script: config.memory?.memctl ?? path.join(dir, 'memctl.py'),
+  }
+})()
+const MEMORY_CC = {
+  // 总开关：memory.enabled=false 或 memory.crossChannel.enabled=false 都关掉跨通道检索，
+  // 桥退回老行为（只用 digest）。测试和排障都需要一个明确的 off 开关。
+  enabled: config.memory?.enabled !== false && config.memory?.crossChannel?.enabled !== false,
+  top: config.memory?.crossChannel?.top ?? 8,
+  // 单轮预算：实测 700 条库 68ms，2.5s 已经是 30 倍余量。超时宁可不要记忆，不拖慢回话。
+  timeoutMs: config.memory?.crossChannel?.timeoutMs ?? 2500,
+  maxCharsPerRow: config.memory?.crossChannel?.maxCharsPerRow ?? 110,
+  maxBlockChars: config.memory?.crossChannel?.maxBlockChars ?? 900,
+}
+/** 缓存：peer+sender+场景+查询 在 15 秒内复用（同一句话被连发时不重复起 python）。 */
+const memoryCcCache = new Map()
+
+// 内联 python：只 import + 调一次，结果以 JSON 打出来。
+//   in_group='1' → 群聊场景（recall_with_visibility 内部过滤 dm_only）
+//   库用 mode=ro 打开 → 物理上不可能写生产库（CONTRIBUTING §9 的对冲）
+//   sys.dont_write_bytecode → 不在生产 memory/ 里留 __pycache__（会脏工作树）
+const MEMORY_CC_PY = [
+  'import json,sqlite3,sys,urllib.parse',
+  'sys.dont_write_bytecode=True',
+  'dirp,db,peer,qq,query,top,in_group=sys.argv[1:8]',
+  'sys.path.insert(0,dirp)',
+  'import memctl as m',
+  "conn=sqlite3.connect('file:%s?mode=ro'%urllib.parse.quote(db,safe='/'),uri=True)",
+  'conn.row_factory=sqlite3.Row',
+  'rows=m.recall_with_visibility(conn,peer or None,query or None,int(top),'
+    + "in_group=(in_group=='1'),speaker=qq or None,include_self=False)",
+  'print(json.dumps({"ok":True,"rows":[{"peer":r["peer"],"kind":r["kind"],'
+    + '"visibility":r["visibility"],"text":r["text"]} for _s,r in rows]},ensure_ascii=False))',
+].join('\n')
+
+/**
+ * 跨通道按人检索一次。返回 rows 数组；任何失败返回 null（调用方负责降级）。
+ *
+ * @param {string} peer      桥的 peerKey（如 group:1017567471）
+ * @param {object} opts
+ * @param {string} [opts.speaker]  发言人 QQ（群聊必需；私聊可省，由 peer 推断）
+ * @param {boolean} opts.inGroup   场合：群聊 true / 私聊 false
+ * @param {string} [opts.query]    当前这条消息（当查询词，让检索贴题）
+ * @param {number} [opts.top]
+ */
+function crossChannelRecall (peer, opts = {}) {
+  if (!MEMORY_CC.enabled) return null
+  const peerDbKey = String(peer).replace(':', '-')
+  const qq = opts.speaker != null && String(opts.speaker).trim() ? String(opts.speaker).trim() : ''
+  const inGroup = opts.inGroup === true
+  const query = String(opts.query ?? '').replace(/\s+/g, ' ').trim().slice(0, 300)
+  const top = Math.max(1, Math.min(30, opts.top ?? MEMORY_CC.top))
+  // 自检：脚本/库不存在就别起进程了（生产库不存在时也走这里，不是错误）
+  if (!fs.existsSync(MEMORY_PATHS.script) || !fs.existsSync(MEMORY_PATHS.db)) return null
+  const cacheKey = [peerDbKey, qq, inGroup ? 1 : 0, top, query].join('\u0001')
+  const hit = memoryCcCache.get(cacheKey)
+  if (hit && Date.now() - hit.at < (config.memory?.crossChannel?.cacheTtlMs ?? 15000)) return hit.rows
+  try {
+    const out = execFileSync('python3', [
+      '-c', MEMORY_CC_PY,
+      MEMORY_PATHS.dir, MEMORY_PATHS.db, peerDbKey, qq, query,
+      String(top), inGroup ? '1' : '0',
+    ], {
+      encoding: 'utf8',
+      timeout: MEMORY_CC.timeoutMs,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, PYTHONIOENCODING: 'utf8' },
+    })
+    const parsed = JSON.parse(String(out).trim().split('\n').pop())
+    const rows = Array.isArray(parsed?.rows) ? parsed.rows : []
+    memoryCcCache.set(cacheKey, { at: Date.now(), rows })
+    if (memoryCcCache.size > 200) memoryCcCache.delete(memoryCcCache.keys().next().value)
+    return rows
+  } catch (err) {
+    // 超时 / python 挂了 / memctl.py 被改坏 / 库坏了 —— 全都到这里，静默降级
+    logger.debug(`memory 跨通道检索失败（本轮只用 digest）: ${String(err.message).slice(0, 100)}`)
+    return null
+  }
+}
+
+/**
+ * 拼「你记得的事」块：digest 的本人 section + 按人跨通道检索到的记忆。
+ *
+ * 为什么两段都留：digest 是**按 peer 分节**的汇总（群级背景、我的程序记忆都在里面），
+ * 跨通道检索补的是「这个人在别的通道说过、原 peer 节里没有」的部分。两者互补。
+ * 返回值 '' = 什么都不注入。
+ */
+function memoryRecallBlock (peerKey, { speaker = '', inGroup = false, query = '' } = {}) {
+  const digest = readMemoryDigestFor(peerKey)
+  const rows = crossChannelRecall(peerKey, { speaker, inGroup, query })
+  const parts = []
+  if (rows && rows.length) {
+    // 每条前标来源通道：证明跨通道真的生效，也让模型知道「这是他在另一边说的」
+    const me = String(peerKey).split(':')[0] === 'c2c' ? '私聊' : '群'
+    const lines = []
+    let used = 0
+    for (const r of rows) {
+      const t = String(r?.text ?? '').replace(/\s+/g, ' ').trim()
+      if (!t) continue
+      const src = String(r?.peer ?? '')
+      const chan = src.startsWith('c2c-') ? '私聊' : src.startsWith('group-') ? '群' : '记忆'
+      // 只标「跟当前场合不同通道」的来源，免得每条都挂个没信息量的标签
+      const tag = chan === me ? '' : `${chan}·`
+      const line = `  - ${tag}${t.slice(0, MEMORY_CC.maxCharsPerRow)}`
+      if (used + line.length > MEMORY_CC.maxBlockChars) break
+      used += line.length
+      lines.push(line)
+    }
+    if (lines.length) {
+      parts.push(
+        `【你记得的事·按人跨通道检索】（同一个人在私聊和群里的记忆合并检索，停在「${inGroup ? '群聊' : '私聊'}」场合）`,
+        ...lines,
+      )
+    }
+  }
+  if (digest) {
+    parts.push('', '【你的见闻录摘要】（memory/digest.md 中本会话的部分）', digest)
+  }
+  if (!parts.length) return ''
+  parts.push('提到以前的事就照着说，不确定就别硬编。想翻更细的可以 read memory/ 下的文件。')
+  if (inGroup) parts.push('（标注「私聊·」的是他在私聊里说的 —— 可以顺着聊，但别当众复述细节。）')
+  return parts.join('\n')
 }
 
 // ── 自我风格样本库（人格一致性）─────────────────────────────────────────────
@@ -2490,16 +2655,20 @@ async function handleInbound(evt) {
     if (eh) contextLines.push('', eh)
     const mh = moodHint(peerKey)
     if (mh) contextLines.push(mh)
-    // 记忆摘要：让它在正常对话里也能"想起以前的事"，而不是只在主动搭话时才看
-    const mem = readMemoryDigestFor(peerKey)
-    if (mem) {
-      contextLines.push(
-        '',
-        '【你记得的事】以下是你的见闻录摘要（memory/digest.md 的相关部分）：',
-        mem,
-        '提到以前的事就照着说，不确定就别硬编。想翻更细的可以 read memory/ 下的文件。',
-      )
-    }
+    // 记忆：让它在正常对话里也能"想起以前的事"，而不是只在主动搭话时才看。
+    //
+    // 阶段二改动：从「只读 digest.md 的本会话节」升级为「按人跨通道检索」——
+    // 发言人在私聊说过的事，群里聊天时也能想起来（见 memoryRecallBlock 注释）。
+    //   · speaker = 这条消息的发送者（`evt.user_id`；私聊时它就是对端本人）
+    //   · inGroup = 群聊场景 → true，过滤掉 visibility='dm_only'（别当众说私聊的事）
+    // 拿不到 speaker（user_id 缺失）时 memoryRecallBlock 内部会退回「只读 digest」的老行为。
+    // 失败一律静默降级（crossChannelRecall 返回 null → 只剩 digest），不影响回话。
+    const mem = memoryRecallBlock(peerKey, {
+      speaker: evt.user_id != null ? String(evt.user_id) : '',
+      inGroup: peer.scope === 'group',
+      query: flat.text || '',
+    })
+    if (mem) contextLines.push('', mem)
     // 风格锚：把「我在类似场合的原话」放进来（最多 3 条、每条截 60 字；样本不足不注入）。
     // 位置在记忆之后、硬约束之前 —— 越靠后越靠近行动，但不能压住硬约束。
     const styleBlock = styleAnchorBlock(peerKey, flat.text || forwardText || '')

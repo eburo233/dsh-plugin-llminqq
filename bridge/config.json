@@ -212,5 +212,9 @@
       "model": "glm-5.3-flashx",
       "reasoningEffort": null
     }
+  },
+  "style": {
+    "enabled": false,
+    "record": false
   }
 }

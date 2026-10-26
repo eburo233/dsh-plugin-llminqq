@@ -34,7 +34,7 @@ echo "== 2. 跑全部测试 =="
 SUITES=(
   unit card-parse url-guard sanitize forward-path
   proactive-logic flurry-logic mood-logic mood-decay mood-traits delay-logic chain-walk recall
-  style-bank
+  style-bank memory-cross-channel
 )
 total_pass=0
 total_fail=0
