@@ -53,6 +53,24 @@ for t in "${SUITES[@]}"; do
   fi
 done
 
+# 整机集成测试（自己起 mock OneBot + 独立端口的 bridge 子进程，隔离于生产）
+# 命名规则：test/*.integration.mjs
+for f in test/*.integration.mjs; do
+  [ -f "$f" ] || continue
+  t="$(basename "$f" .integration.mjs)"
+  out=$(node "$f" 2>&1)
+  line=$(printf '%s' "$out" | grep -E "^结果:" | tail -1)
+  if printf '%s' "$line" | grep -q "0 失败"; then
+    echo "  ✓ ${t} (integration)  ${line}"
+    n=$(printf '%s' "$line" | grep -oE "[0-9]+ 通过" | grep -oE "[0-9]+")
+    total_pass=$((total_pass + ${n:-0}))
+  else
+    echo "  ✗ ${t} (integration)  ${line:-（跑失败）}"
+    printf '%s\n' "$out" | tail -8 | sed 's/^/      /'
+    total_fail=$((total_fail + 1))
+  fi
+done
+
 # Python 记忆系统测试（隔离到临时库）
 echo
 echo "== 2.5 记忆系统测试 =="
