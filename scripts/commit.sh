@@ -36,6 +36,8 @@ SUITES=(
   proactive-logic flurry-logic mood-logic mood-decay mood-traits delay-logic chain-walk
   quote-reply memory-cross-channel arousal-cap energy-mood-link linebreak recall
   style-bank memory-cross-channel lexicon message-queue chat-follow
+  # 语料池抓取：离线（假 python）、不真请求 B站，所以能安全进每次提交的测试
+  crawl-bili-comments
 )
 total_pass=0
 total_fail=0

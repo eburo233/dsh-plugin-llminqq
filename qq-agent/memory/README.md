@@ -455,16 +455,63 @@ MAX_PER_KIND = {"word": 60, "meme": 20, "expression": 8, "pattern": 6}
 python3 memory/lexicon.py prune   # 按现配额重新淘汰
 ```
 
+### 语料池（跨分区，`crawl-bili-comments.mjs` + `--corpus-dir`）
+
+**为什么要有语料池 —— 语料池 ≠ 单次输入量**（这是这块最容易踩的坑）：
+
+```
+实测：learn 一轮 12 段 / ~7000 字 → 520s（8分46秒）→ 产出 83 条
+换算：4000 条评论 ≈ 10 万字 ≈ 170 段 ≈ 2 小时 → 必然超时 + 模型后半段质量退化
+```
+
+所以拆成两件事：
+
+| 环节 | 干什么 | 频率 | 产物 |
+|---|---|---|---|
+| `scripts/crawl-bili-comments.mjs` | 把评论**攒进池子**（慢、要限速、可断点续抓） | `llminqq-crawl.timer` 每天 2 次 × 2-3 个新视频 | `qq-agent/memory/corpus/bili-<bvid>.json` |
+| `lexicon.py learn --corpus-dir` | 每轮**只吃预算内的一小段**，用游标往后推 | `llminqq-learn.timer` 每 12h | `lexicon.json` + `.learn-cursor.json` |
+
+单轮双闸（`config.learning.corpusRoundSegments` / `corpusRoundChars`）：
+**18 段 / 12000 字**（≈8-10 分钟）。池子几百段也不会一夜跑 2 小时。
+
+**为什么必须跨分区**：评论区语料量按分区极度不均（游戏/影视/科技能是历史/科普的十倍）。
+随机抽的话冷门分区直接被淹没，学出来的还是「热门分区那套」。所以按 `domain` 分组、
+**每个领域单轮最多 2 段**（`corpusPerDomain`）——热门领域文件再多也只能拿 2 段。
+动画区只放 1 个源：吉祥物自己在二次元圈，学多了会过拟合到「本来的样子」。
+
+**游标为什么记在「段」维度而不是「文件」维度**：一个文件 100 条评论能切 10 段，
+按文件记的话要么一次吃 10 段（超预算），要么永远只吃第一段。
+
+**source 记成 `bili:<domain>`**（不是一律 `bili`）：这是排查「学歪了是哪个领域带偏的」
+的唯一线索。写进词条前会校验格式（`_source_ok`），模型瞎写的 source 被丢弃。
+
+**抓取侧的三条防限流**（写死在 `scripts/crawl-bili-comments.mjs`）：
+- 视频间随机 sleep 3-5s；每 3 个视频歇 15-20s
+- 遇到限流（接口返回 `error`）→ **立刻停、退出码 3、不重试**。重试只会把风控拖长
+- 已有文件的 BV 直接跳过（`--force` 才重抓）—— 池子是攒的，重复抓没有增量只有风险
+- 「接口 0 条」和「风控/网络错」必须分开：前者是这视频真没评论，后者是没抓到。
+  混成一个的话定时任务会每天静默写空语料，池子永远长不大还看不出来。
+
+清洗（`_crawl_clean`，进 prompt 之前洗）：B站表情 `[大笑]` / 动态表情包名
+`[米雪儿·绮星梦使 应援装扮_哈气]` 全部剥掉（**QQ 发不出去**，留着模型会学成字面量）、
+`回复 @某某 :` 前缀和 `@人` 剥掉（评论区脚手架不是说话内容）、URL 剥掉。
+⚠️ 表情括号宽度要放宽到 40 字：窄正则漏掉带 `·`/`_` 的动态表情包名，
+它们会以长串原样进 prompt，比不洗更糟（模型会当「表情玩法」学）。
+
 ### 落盘 / 注入 / 降级
 
 ```
-scripts/learn.sh                 → python3 memory/lexicon.py learn
+scripts/crawl.sh      → node scripts/crawl-bili-comments.mjs   （每天 2 次，写 corpus/）
+scripts/learn.sh      → python3 memory/lexicon.py learn --corpus-dir memory/corpus
+~/.config/systemd/user/llminqq-crawl.timer（11:20 / 23:20）
 ~/.config/systemd/user/llminqq-learn.timer（05:40 / 17:40，避开反思的 02/10/18:15）
 桥 bridge/index.js lexiconBlock() → python3 memory/lexicon.py render --json
 ```
 
-- **路径全 config 可覆盖**（CONTRIBUTING §9）：`config.learning.{dir,script,json,maxChars,injectN}`。
-  端到端测试 `test/lexicon.integration.mjs` 会把 lexicon.json 指到 `/tmp`。
+- **路径全 config 可覆盖**（CONTRIBUTING §9）：`config.learning.{dir,script,json,maxChars,injectN}`，
+  语料池那一路 `config.learning.{corpusDir,crawlSources,crawlPython,crawlNum,corpusRoundSegments,corpusRoundChars,corpusPerDomain}`。
+  端到端测试 `test/lexicon.integration.mjs` 会把 lexicon.json 指到 `/tmp`；
+  `test/crawl-bili-comments.test.mjs` 用假 python（离线）测抓取落盘。
 - **冷启动闸**：库 <3 条不注入（不硬凑）。
 - **静默降级**：文件不存在/坏 JSON/结构不对/python 挂 → 不注入，桥照常回话。
 - **故障可见**：词库坏了走 **WARN**，不能被当成正常冷启动静默掉。
@@ -476,11 +523,16 @@ scripts/learn.sh                 → python3 memory/lexicon.py learn
 
 1. **B站语料是陌生人围观**，学得到梗和表情用法，**学不到熟人接话逻辑**。
    熟人那路看 `memory/log/*.jsonl`。
-2. **`top_replies` 只有前 2 条**，翻页/风控成本高，所以每轮只用 3 个 BV 号、各 8 条。
-3. **梗有保质期**。`STALE_DAYS=90` + 按分数淘汰，但「过气梗」的判定靠时间不靠语义
+2. **`top_replies` 只有前 2 条**（接口一次只回 2-3 条楼中楼，翻子评论要额外请求）。
+   所以楼中楼覆盖不全 —— 但那是「接话」最集中的地方，属于已知缺口。
+   现在抓取侧每个视频 100 条一级评论（`crawlNum`），比原来现抓的 8 条多得多。
+3. **`MAX_ENTRIES=120` 是硬上限**：池子变大后词条会顶到上限按分数淘汰。
+   `hits` 只在同 kind+text 重复出现时累加，跨领域同义但不同字面的词仍然会被配额/上限挤掉。
+   跑完 `lexicon.py stats` 看一眼分布，别只看总数。
+4. **梗有保质期**。`STALE_DAYS=90` + 按分数淘汰，但「过气梗」的判定靠时间不靠语义
    —— 三个月还在被说、但已经不好笑了的梗，它还是照用。
-4. **词库只学「怎么说」，不学「什么时候别说」**。分寸感仍靠人设与上下文。
-5. **没有效果证据**（同 stylebank 那条：指标方差 >> 效应量）。
+5. **词库只学「怎么说」，不学「什么时候别说」**。分寸感仍靠人设与上下文。
+6. **没有效果证据**（同 stylebank 那条：指标方差 >> 效应量）。
    能确认的是「学出来的词条有含义+场合、正经答题不硬塞」；
    **不能**确认「说话更像人」。要下结论得跑几十组盲评，成本远超本次范围。
 

@@ -611,11 +611,20 @@ def corpus_segments(groups, cursor=None, max_segments=None, max_chars=None,
             start = int(cursor.get(doc["_name"]) or 0)
             if start >= len(segs):
                 continue
-            q.append((doc, segs, start))
+            q.append([doc, segs, start])
         if q:
             queues[dom] = q
 
     segments = []
+    # picks 与 segments 一一对应：(文件名, 段序号)。**为什么要把位置带出去**：
+    # 学习主循环才知道「这一段是不是真的学到了」——模型超时/调用失败的那一段，
+    # 游标绝不能往前推，否则这段语料以后永远轮不到（实测踩到过：13 段里有 1 段
+    # ACP 调用失败，游标照样把它标记成已消费）。
+    picks = []
+    # skipped_by_budget：因为字数预算放不下而跳过的段。这些**可以**直接推进游标 ——
+    # 它们不是「没学到」，是「留着也永远放不进预算」（一段就超过单轮上限），
+    # 不推进会让队列卡死在同一段上。
+    skipped_by_budget = []
     chars = 0
     taken_by_domain = {}
     doms = sorted(queues)
@@ -639,9 +648,11 @@ def corpus_segments(groups, cursor=None, max_segments=None, max_chars=None,
             if len(text) > max_chars - chars:
                 taken_by_domain[dom] = taken_by_domain.get(dom, 0) + 1
                 cursor[doc["_name"]] = start + 1
+                skipped_by_budget.append((doc["_name"], start))
                 _advance(q)
                 continue
             segments.append((text, f"bili:{dom}"))
+            picks.append((doc["_name"], start))
             chars += len(text)
             taken_by_domain[dom] = taken_by_domain.get(dom, 0) + 1
             cursor[doc["_name"]] = start + 1
@@ -652,17 +663,64 @@ def corpus_segments(groups, cursor=None, max_segments=None, max_chars=None,
 
     exhausted = not any(q for q in queues.values())
     info = {"domains": sorted({s.split(":", 1)[1] for _, s in segments}),
-            "segments": len(segments), "chars": chars, "exhausted": exhausted}
+            "segments": len(segments), "chars": chars, "exhausted": exhausted,
+            "picks": picks, "skippedByBudget": skipped_by_budget}
     return segments, cursor, info
 
 
+def _advance_cursor(prev_cursor, learned_picks, skipped_by_budget=None):
+    """按「真的学到的段」重建游标，而不是照抄采样时算出来的那个。
+
+    为什么不能直接用 corpus_segments 返回的 cursor：那个游标是「取到哪了」，
+    不是「学到哪了」。模型超时/ACP 挂掉的那一段，如果游标照样往前走，
+    这段语料就**永远轮不到**了（下次从后面开始）—— 实测踩到过：
+    13 段里 animation 那段 ACP 调用失败，第一版把 13 段全标成已消费。
+
+    语义：游标 = 这个文件「连续学到第几段」。所以推进必须保持连续：
+    从上一轮的位置往后走，遇到没学到的位置就停在那儿，下轮从那儿重来
+    （宁可重复学一点，不能漏 —— 漏掉的语料没有任何补救机制）。
+    「因预算放不下而跳过」的段算已消费：它们重来也一样放不进预算，
+    不算的话队列会永远卡在同一段上。
+    """
+    prev = {}
+    for name, v in (prev_cursor or {}).items():
+        try:
+            prev[name] = max(0, int(v))
+        except Exception:
+            continue
+    ok = {}
+    for name, idx in (learned_picks or []):
+        ok.setdefault(name, set()).add(int(idx))
+    for name, idx in (skipped_by_budget or []):
+        ok.setdefault(name, set()).add(int(idx))
+
+    cursor = dict(prev)
+    for name, positions in ok.items():
+        n = prev.get(name, 0)
+        while n in positions:
+            n += 1
+        if n > prev.get(name, 0):
+            cursor[name] = n
+    return cursor
+
+
 def _advance(queue):
-    """把某个 domain 的队列往前推一段：当前文件读完就换下一个文件、从第 0 段起。"""
+    """把某个 domain 的队列往前推**一段**（不是「读完整个文件才推」）。
+
+    ⚠️ 第一版写的是「start+1 >= len(segs) 才 pop」，等于同一个文件只有整套读完
+    才会换下一个 —— 结果同一个 domain 在同一轮里第二次取段时，拿到的还是第 0 段
+    （实测：4 段里 2 段重复，白烧一次模型调用）。分段游标的意义就是「段」粒度，
+    推进也必须按段。
+    队列元素是可变 list：[doc, segs, start]，start 原地 +1。
+    """
     if not queue:
         return
-    doc, segs, start = queue[0]
+    entry = queue[0]
+    doc, segs, start = entry[0], entry[1], entry[2]
     if start + 1 >= len(segs):
         queue.pop(0)
+    else:
+        entry[2] = start + 1
 
 
 def _corpus_doc_segments(doc, seg_chars=None):
@@ -984,6 +1042,9 @@ def learn(sources=("group", "bili"), path=None, cfg=None, caller=None,
             segs, new_cursor, corpus_info = corpus_segments(
                 groups, cursor=old_cursor,
                 max_segments=corpus_segments_max, max_chars=corpus_chars_max)
+            # 语料池这一段在 segments 里的起点：学习循环要靠它把 picks 跟
+            # 「这一段成功/失败」对齐（失败的不许推进游标）
+            corpus_offset = len(segments)
             for seg, src in segs:
                 segments.append((seg, src))
             corpus_info["cursor"] = new_cursor
@@ -1002,7 +1063,8 @@ def learn(sources=("group", "bili"), path=None, cfg=None, caller=None,
     candidates = []
     t0 = time.monotonic()
     ok_batches = failed = 0
-    for seg, source in segments:
+    learned_picks = []                 # 真的学到东西的那几段（游标只认这些）
+    for i, (seg, source) in enumerate(segments):
         if time.monotonic() - t0 > total_timeout:
             errors.append(f"总耗时超过 {total_timeout}s，停止后续 {len(segments) - result['batches']} 段")
             break
@@ -1014,16 +1076,24 @@ def learn(sources=("group", "bili"), path=None, cfg=None, caller=None,
             errors.append(f"{source} 段失败: {str(e)[-120:]}")
             continue
         ok_batches += 1
+        if corpus_info is not None:
+            pi = i - corpus_offset
+            if 0 <= pi < len(corpus_info.get("picks") or []):
+                learned_picks.append(corpus_info["picks"][pi])
         ents = _parse_entries(raw)
         result["llm_entries"] += len(ents)
         for ent in ents[:MAX_LLM_ENTRIES]:
             if isinstance(ent, dict):
                 ent = dict(ent)
                 ent.setdefault("source", source)
-                # 里层 source 若被模型瞎写，以实际来源为准。
-                # 语料池那一路的来源是 "bili:<domain>"（分层采样要能追溯领域），
-                # 所以这里不能只认 "group"/"bili" 两个字面量。
-                if not _source_ok(ent.get("source")):
+                # source 一律以**实际来源**为准，不信模型的。
+                # 为什么：prompt 的例子写的是 source:"bili"，模型就照抄 "bili" ——
+                # 那样语料池那一路的领域信息（bili:<domain>）全丢了，事后想查
+                # 「学歪了是哪个领域带偏的」就查不出来（实测第一轮 65 条新增全是
+                # "bili"，白瞎了分层采样的作用）。domain 是数据里的事实，模型猜不得。
+                if source.startswith("bili:"):
+                    ent["source"] = source
+                elif not _source_ok(ent.get("source")):
                     ent["source"] = source
             candidates.append(ent)
     result["batches_ok"] = ok_batches
@@ -1054,11 +1124,17 @@ def learn(sources=("group", "bili"), path=None, cfg=None, caller=None,
         lex["updatedAt"] = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
         lex["updatedBy"] = "lexicon.py"
         write_lexicon(lex, path)
-        # 游标跟着落盘走：**只在真的学到东西之后**推进。dry_run 不推、
-        # 全失败不推 —— 否则「模型挂了但游标往前走」= 这段语料永远学不到。
+        # 游标跟着落盘走：**只推进真的学到的那几段**。dry_run 不推、全失败不推，
+        # 部分失败时失败那段也不推 —— 否则「模型挂了但游标往前走」= 这段语料
+        # 永远轮不到（实测：13 段里 ACP 挂 1 段，第一版把 13 段全标成已消费）。
         if commit_cursor and corpus_info and corpus_info.get("cursor") is not None \
                 and (added or merged):
-            write_cursor(corpus_info["cursor"], corpus_dir)
+            next_cursor = _advance_cursor(corpus_info["prevCursor"] or {},
+                                          learned_picks,
+                                          corpus_info.get("skippedByBudget") or [])
+            corpus_info["cursor"] = next_cursor
+            corpus_info["consumed"] = len(learned_picks)
+            write_cursor(next_cursor, corpus_dir)
     return result
 
 

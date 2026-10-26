@@ -614,6 +614,56 @@ print(json.dumps([L._crawl_clean(c) for c in cases], ensure_ascii=False))
   ok('--dry-run 不推进游标（预览不消耗语料）',
     JSON.stringify(curBefore) === JSON.stringify(curAfter), '游标被推进了')
 
+  // ⑥b 模型挂了的段不许推进游标（实测踩到的真 bug：13 段挂 1 段，
+  //     第一版把 13 段全标成已消费 → 那段语料永远学不到）
+  {
+    const outDir2 = path.join(TMP, 'corpus-failseg')
+    fs.mkdirSync(outDir2, { recursive: true })
+    for (const [bv, dom] of [['BVfa1', 'history'], ['BVfa2', 'science']]) {
+      fs.writeFileSync(path.join(outDir2, `bili-${bv}.json`),
+        JSON.stringify(mkDoc(bv, dom, 30)), 'utf8')
+    }
+    const pf = freshJson('failseg')
+    // 用假模型 + 假 caller：先跑一遍没问题，然后用「调用就抛」的 caller 模拟 ACP 挂掉
+    // 注意：llm-partial 时 python CLI 退出码是 1，execFileSync 会抛 —— 自己接住 stdout
+    let rOk = { json: null, text: '' }
+    try {
+      rOk.text = pyL(`
+import sys, json
+sys.path.insert(0, ${JSON.stringify(path.join(ROOT, 'qq-agent/memory'))})
+import lexicon as L
+ctrl = {"n": 0}
+def caller(prompt, timeout):
+    ctrl["n"] += 1
+    if ctrl["n"] == 1:
+        raise RuntimeError("ACP 调用失败（模拟）")
+    return json.dumps({"entries": [{"kind": "word", "text": "学到的词",
+        "meaning": "m", "usage": "u", "confidence": 0.8}]})
+res = L.learn(sources=["corpus"], path=${JSON.stringify(pf)}, caller=caller,
+              corpus_dir=${JSON.stringify(outDir2)}, timeout=5, total_timeout=60,
+              corpus_segments_max=4, corpus_chars_max=100000)
+cur = L.read_cursor(${JSON.stringify(outDir2)})
+print(json.dumps({"mode": res["mode"], "added": res["added"],
+                  "picks": res["corpus"]["picks"], "cursor": cur,
+                  "consumed": res["corpus"].get("consumed")}, ensure_ascii=False))
+`)
+      rOk.json = JSON.parse(rOk.text.trim().split('\n').pop())
+    } catch (e) {
+      rOk.text = String(e.stdout || '')
+      try { rOk.json = JSON.parse(rOk.text.trim().split('\n').pop()) } catch {}
+    }
+    ok('部分段失败时仍是 llm-partial（不算整体失败）', rOk.json?.mode === 'llm-partial', JSON.stringify(rOk.json))
+    const failPick = rOk.json?.picks?.[0]           // 第一段就是挂掉的那段
+    const failFile = failPick?.[0]
+    const failIdx = failPick?.[1]
+    const curFail = rOk.json?.cursor || {}
+    ok('挂掉那段所在的文件游标没被跳过（下轮还能重学）',
+      failFile && (curFail[failFile] ?? 0) <= failIdx,
+      `pick=${JSON.stringify(failPick)} cursor=${JSON.stringify(curFail)}`)
+    ok('成功学到的段游标确实推进了（不是全都不推）',
+      Object.values(curFail).some(v => v > 0), JSON.stringify(curFail))
+  }
+
   // ⑦ 路径可覆盖（CONTRIBUTING §9）：corpusDir 指到哪读哪
   {
     const elseDir = path.join(TMP, 'corpus-elsewhere')

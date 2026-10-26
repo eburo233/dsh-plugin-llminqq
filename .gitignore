@@ -56,3 +56,6 @@ qq-agent/tools/tmp/
 #    进库的话每 12 小时就有一次噪音提交。模板见 qq-agent/memory/lexicon.json.example
 qq-agent/memory/lexicon.json
 qq-agent/memory/.lexicon-*
+# 语料池的**游标**：跟 lexicon.json 同性质（每次 learn 都会改，进库就是每 12h 一次噪音提交）。
+# 但 corpus/bili-*.json 本体**要进库**：那是抓取成果，重新抓要再付一次风控风险。
+qq-agent/memory/corpus/.learn-cursor.json
