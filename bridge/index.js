@@ -3996,6 +3996,27 @@ async function main() {
   const apiServer = startApiServer()
   pruneStaging()
   setInterval(pruneStaging, 3600 * 1000).unref()
+
+  // 启动前清理「孤儿 ACP 进程」。
+  // 桥每次重启都会 spawn 一个新的 `dsh --profile llminqq-acp`，但如果桥被
+  // SIGKILL / 异常退出，子进程会变孤儿一直挂着（每个约 240MB）。
+  // 实测：一天下来积了 30 个占 7.2G，最老挂了 21 小时。
+  // 清理脚本只杀「PPid=1 的真孤儿」+「profile 名精确匹配」，不会误杀活着的桥的子进程。
+  try {
+    const { execFileSync } = await import('node:child_process')
+    const script = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'cleanup-orphan-acp.mjs')
+    if (fs.existsSync(script)) {
+      const out = execFileSync(process.execPath, [script, '--kill', '--profile', config.dsh?.profile ?? 'llminqq-acp'],
+        { encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'] })
+      for (const line of String(out).split('\n')) {
+        if (line.includes('孤儿') || line.includes('已杀')) logger.log(line.replace('[cleanup-acp] ', 'acp清理: '))
+      }
+    }
+  } catch (err) {
+    // 清理失败不影响启动
+    logger.log(`acp 孤儿清理跳过（不影响启动）: ${String(err.message).slice(0, 100)}`)
+  }
+
   startProactiveLoop()
   startEnergyLoop()
   startMoodLoop()
