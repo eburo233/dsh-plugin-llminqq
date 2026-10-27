@@ -14,13 +14,21 @@ const run = (args = []) => execFileSync(process.execPath, [SCRIPT, ...args], { e
 
 const alive = (pid) => { try { return fs.existsSync(`/proc/${pid}`) } catch { return false } }
 
-/** 造一个真孤儿：setsid + detached，父进程立即脱离 → PPid 变 1 */
+/**
+ * 造一个真孤儿：必须走 **setsid**（新 session leader），
+ * 然后让它**与测试进程脱离**，最终被 init 收养（PPid=1）。
+ *
+ * ⚠️ 踩过：`spawn(bash -c "exec -a ...")` + detached 是不够的 ——
+ * 那个 bash/sleep 的 PPid 仍然是测试进程，永远变不成孤儿，
+ * 于是「dry-run 报待杀」这个断言必然失败（实测 12 通过 / 1 失败）。
+ * 必须显式 setsid，且父 shell 立刻退出。
+ */
 const makeOrphan = (profile, secs = 300) => {
-  const child = spawn('bash', ['-c', `exec -a "node /home/jojo/.local/bin/dsh --profile ${profile}" sleep ${secs}`], {
-    detached: true,
-    stdio: 'ignore',
-  })
-  child.unref()
+  // setsid 让子进程成为新 session leader；外层的 sh -c 立刻返回，
+  // 于是 setsid 出来的进程被 init(1) 收养。
+  execFileSync('/bin/sh', ['-c',
+    `setsid /bin/bash -c 'exec -a "node /home/jojo/.local/bin/dsh --profile ${profile}" sleep ${secs}' </dev/null >/dev/null 2>&1 &`])
+  execFileSync('sleep', ['0.3'])
   // 等它被 init 收养（PPid 真的变成 1）
   for (let i = 0; i < 50; i++) {
     const pids = findPids(profile)
