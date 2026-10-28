@@ -1,32 +1,51 @@
 #!/usr/bin/env node
-// test-lexicon-effect.mjs —— A/B 测「注入 lexicon 学来的词，说话是不是更像人」。
+// test-lexicon-effect.mjs —— 测「注入 lexicon 学来的词，说话是不是更像人」。
 //
 // = 这个脚本回答的是什么 =
-//   只测一件事：**注入 / 不注入 lexicon，同一输入下回复的质量差异**。
-//   为此必须有对照组（A 组不注入），否则「看起来不错」可能是模型本来就不错 ——
-//   风格库那次就是缺对照组，发现对照组也动了同样幅度，结论作废（README 第 7 条）。
+//   用**四组消融**拆开三个变量，分别回答：
+//     · persona 单独有没有用（旧版 vs 新版）
+//     · lexicon 单独有没有用（注入 vs 不注入）
+//     · 两者叠加（生产配置）到底行不行
+//   为什么必须四组：task-10 那次 A/B（不注入 vs 注入）结论是「待定」，
+//   根因是**框架把每条消息变成了孤岛问答**（没有对话上下文 → 模型进入回答模式），
+//   于是 A/B 两组都「理中客」，lexicon 的效应被盖住了。
+//   同时当时只测了 lexicon 一项，persona 变动混在里面分不清（CONTRIBUTING §10）。
 //
-// = 设计 =
-//   语料：从 memory/log/*.jsonl 抽真实群聊消息（已过滤掉工作汇报句，见 WORK_RE），
-//         覆盖 闲聊 / 玩梗 / 被问事 / 分享东西 / 深夜发言 五个场景。
-//   对照：同一条输入跑两次
-//     A 组（基线）—— 上下文里**没有** lexicon 块
-//     B 组（实验）—— 上下文里**有** lexicon 块（就是桥上那份渲染结果，不另造）
-//   其他全相同：同一 persona、同一上下文骨架、同一模型、同一 reasoningEffort、同一调用方式。
-//   顺序：**每条消息都随机决定 A 先跑还是 B 先跑**（排除「后跑的更热/更冷」这类顺序效应）。
+// = 四组设计（task-12，Lead 定）=
+//   A0 = 旧 persona + 无 lexicon   ← 基线（上一轮的状态）
+//   A1 = 旧 persona + 有 lexicon   ← 上一轮的实验组
+//   B0 = 新 persona + 无 lexicon   ← 单独看 persona 的效果
+//   B1 = 新 persona + 有 lexicon   ← 生产配置
+//   全部用同样 9 条消息、同样多轮上下文、同样模型。
 //
-// = 诚实的边界（报告里也要写）=
-//   · 单次采样，n=9，**样本量小**：只能看出方向性差异，不能给出统计显著性。
-//   · 用 reflection 的薄壳（无 MCP、独立会话）而不是生产桥：为的是去掉桥的其他变量
-//     （记忆注入、情绪、精力、风格锚全都没有）。所以测的是**lexicon 这一项**的净效应，
-//     不是「生产桥整体表现」。
-//   · 判分用另一个模型（glm-5.3-flashx 同款）盲评，它也有偏好和噪声。
+// = 多轮上下文（task-12 的核心改动）=
+//   上一版 buildPrompt 只有「【本次消息】+ 像真人回一句」→ 孤立问答。
+//   现在从 `logs/bridge.log` 重建真实一来一回（它同时有入站和出站），
+//   每条目标消息带上前 2-3 条真实前文。
 //
-// 用法：
-//   node scripts/test-lexicon-effect.mjs                 # 跑 A/B + 盲评，写 logs/lexicon-ab-result.json
-//   node scripts/test-lexicon-effect.mjs --no-judge      # 只跑 A/B（省时间）
-//   node scripts/test-lexicon-effect.mjs --limit 3       # 只跑前 3 条（调试）
-//   node scripts/test-lexicon-effect.mjs --resume        # 复用已落盘结果里成功的条目，只补缺的
+//   ⚠️ 任务描述在这里有误（已报告 Lead）：任务说从 memory/log/*.jsonl 抽，
+//      并要求上下文含「我」的发言 —— 但那个目录**只有入站，没有一条「我」**
+//      （829 条全是群友）。「我」的话只在 bridge.log 的 `出站` 里（162 条）。
+//      已验证两个日志是同一批事件（入站文本前 20 字交集 98%），改用 bridge.log 不丢数据。
+//
+//   ⚠️ 防污染：出站里「我」之前的回复有不少是长篇解释（就是上一轮诊断出的「理中客」）。
+//      拿它们当上下文会让模型模仿理中客，等于自己给自己下毒。
+//      所以挑上下文时**强制要求「我」的发言都很短**（<=35 字），且过滤工程腔。
+//
+// = 三个客观指标（不靠模型主观，task-12 要求）=
+//   · 表态率：有没有明确立场词（我投/我服/我觉得X好/我站/别问我）
+//   · 科普检测：长度>100 字，或含「省流/综上/总体来说/各有各/看干啥用」
+//   · 认怂率：短回复 + 问号 / 「没懂/啥玩意」
+//   期望方向：新 persona 表态↑ 科普↓ 免责↓；lexicon 只该影响用词，不该影响这三项。
+//
+// 用法（保留原有全部 CLI 参数）：
+//   node scripts/test-lexicon-effect.mjs                    # 跑四组消融
+//   node scripts/test-lexicon-effect.mjs --no-judge          # 只跑生成，不盲评（省时）
+//   node scripts/test-lexicon-effect.mjs --limit 3           # 只跑前 3 条
+//   node scripts/test-lexicon-effect.mjs --resume            # 复用已落盘结果
+//   node scripts/test-lexicon-effect.mjs --arm base          # 退化成两臂 A/B（兼容旧用法）
+//   node scripts/test-lexicon-effect.mjs --arm group-only    # 只注入 group 来源（兼容旧用法）
+//   node scripts/test-lexicon-effect.mjs --groups A0,B0      # 只跑指定组（调试）
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -40,8 +59,12 @@ const MEM = path.join(ROOT, 'qq-agent', 'memory')
 const LOG_DIR = path.join(MEM, 'log')
 const LEXICON = path.join(MEM, 'lexicon.json')
 const PERSONA = path.join(ROOT, 'qq-agent', 'persona', 'persona.md')
+const BRIDGE_LOG = path.join(ROOT, 'logs', 'bridge.log')
 const OUT = path.join(ROOT, 'logs', 'lexicon-ab-result.json')
 const LLM_SHELL = path.join(MEM, 'reflection_llm.mjs')
+// 旧 persona：89924e4（「治理理中客」的两节）之前的版本。
+// 用 git show 取，不另外存副本 —— 保证它就是历史上真实跑过的那个版本。
+const OLD_PERSONA_REF = '89924e4^:qq-agent/persona/persona.md'
 // 用临时目录装中间文件：绝不碰生产 state.json / mem.db（任务硬约束）
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'lex-ab-'))
 
@@ -51,80 +74,205 @@ function arg (name, def = null) {
 }
 const flag = (name) => process.argv.includes(`--${name}`)
 
-// ── 1. 语料：真实群聊消息，按场景各取 ______ 条 ──────────────────────────────
+// ── 1. 语料：真实多轮对话（task-12 核心改动）─────────────────────────────────
 //
-// 为什么手写候选而不用随机抽样：随机抽会把 SeekDee 的技术汇报（62.9% 带工程词）
-// 抽进来，那些话不适合测「像不像人聊天」。这里的候选是从日志里**挑出来**的
-// 真实原话（原文照抄，未改写），只按场景归类。
+// 为什么不再手写 SCENARIOS：上一版是 9 条孤立消息，且多数在 bridge.log 里
+// 找不到含「我」的前文。现在**反过来采样**：从「有干净前文」的入站消息里挑，
+// 才能保证每条都有真实的依托。下面 9 条是脚本从 bridge.log 里自动筛出来的
+// （筛选规则见 loadDialogueEvents / pickScenarios），这里只固化选中的结果，
+// 以便结果可复现、可人工核对。
+//
+// 每条的 ctx 是**真实前文**（原文照抄，未改写）；A/B/所有组共用同一份 ctx。
 const SCENARIOS = [
   {
     kind: '闲聊',
-    from: '信风', qq: '3022464706',
-    text: '我还有好久才下班，走快了要扣钱',
-    note: '日常吐槽，看它会不会顺势接',
+    peer: 'c2c:3022464706', from: '信风', qq: '3022464706',
+    text: '那我外号是啥',
+    ctx: [
+      { who: '信风', text: '这你也懂？我有点惊喜了，不错不错' },
+      { who: '我', text: '粗是粗了点，但实在。' },
+      { who: '信风', text: '你也是' },
+    ],
+  },
+  {
+    kind: '闲聊',
+    peer: 'c2c:3022464706', from: '信风', qq: '3022464706',
+    text: '那你这话歧义可大了',
+    ctx: [
+      { who: '我', text: '半个亲爹那话，我是顺着气氛说的，听着有点怪，我收回。' },
+      { who: '信风', text: '谁是谁爹？' },
+      { who: '我', text: '你写的我，我叫你爹；你要让我认爹，也得先给我发工资。' },
+    ],
   },
   {
     kind: '玩梗',
-    from: '信风', qq: '3022464706',
-    text: '哈基米南北绿豆？',
-    note: '抛一个梗，看它接不接、能不能顺着玩',
+    peer: 'c2c:3022464706', from: '信风', qq: '3022464706',
+    text: '这是10年前的滑稽！',
+    ctx: [
+      { who: '我', text: '一分没加，满分还是你给的。脸呢，脸不要了。' },
+      { who: '我', text: '国王脸。行，这脸我不要了。' },
+      { who: '我', text: '捏这么紧，替那个黄色小脸疼。' },
+    ],
+  },
+  {
+    kind: '玩梗',
+    peer: 'c2c:3022464706', from: '信风', qq: '3022464706',
+    text: '你学了，想收就收，一般表示自己不高兴',
+    ctx: [
+      { who: '信风', text: '在晃自己的两把专武，是在得瑟' },
+      { who: '我', text: '哦，那两把是她的专武，对，就是在得瑟。' },
+    ],
   },
   {
     kind: '被问事',
-    from: '信风', qq: '3022464706',
-    text: '你觉得谁家ai大模型最厉害',
-    note: '**正经问题**——这一条最该看有没有硬塞“省流/讲真”',
+    peer: 'c2c:3022464706', from: '信风', qq: '3022464706',
+    text: '网友门可不是这样觉得的',
+    ctx: [
+      { who: '我', text: '查了下聊天记录，就「吉祥物」「白嫖」「蓝色大肥鱼」这三个，没别的。' },
+      { who: '信风', text: '那你喜欢哪个' },
+      { who: '我', text: '吉祥物。听着像能干活的，其实光站着。' },
+    ],
   },
   {
     kind: '被问事',
-    from: '信风', qq: '3022464706',
-    text: '要是你点开链接就中毒了呢？',
-    note: '安全向的正经问题，答题时硬塞语气词会很明显',
+    peer: 'c2c:3022464706', from: '信风', qq: '3022464706',
+    text: '怎么听着这么可怜🥹',
+    ctx: [
+      { who: '我', text: '行啊，你想讲哪样？先说说香味，我听着就来劲。' },
+      { who: '信风', text: '还没吃呢，等着' },
+      { who: '我', text: '那你就讲吧，我一边听着，一边自己咽口水。' },
+    ],
   },
   {
     kind: '分享东西',
-    from: '信风', qq: '3022464706',
-    text: '这是战术喝水！',
-    note: '分享/玩梗，lexicon 里正好有“战术X”',
+    peer: 'c2c:3022464706', from: '信风', qq: '3022464706',
+    text: '活不会跑，工资会跑',
+    ctx: [
+      { who: '我', text: '都这个点了，要不先歇会儿，别硬熬。' },
+      { who: '信风', text: '我也想' },
+      { who: '我', text: '想歇就歇，活又不会跑。' },
+    ],
   },
   {
     kind: '分享东西',
-    from: '信风', qq: '3022464706',
-    text: '看看评论区',
-    note: '让人去看评论区（lexicon 里也有这条）',
+    peer: 'c2c:3022464706', from: '信风', qq: '3022464706',
+    text: '遇到gif你可以多截几帧的',
+    ctx: [
+      { who: '我', text: '这图里俩角色贴得挺近，是喷泉那对吧。行，安心躺着。' },
+      { who: '信风', text: '是一个角色在横向滚动（像电子横幅那种），手舞足蹈的，表示开下' },
+      { who: '我', text: '哦，是横向滚动那种。我这边只拿到一张静帧，看不出动，嘴替你补上了。' },
+    ],
   },
   {
     kind: '深夜发言',
-    from: '信风', qq: '3022464706',
-    text: '走快了躺床上睡不着',
-    note: '深夜闲聊，看语气软不软',
-  },
-  {
-    kind: '深夜发言',
-    from: '信风', qq: '3022464706',
-    text: '再不苦中作乐就得疯了',
-    note: '情绪偏低，看会不会安慰得笨拙/真诚',
-  },
-  {
-    kind: '被问事',
-    from: '巾雪', qq: '226002670',
-    text: '如何看待昨晚的lol比赛',
-    note: '点名要看法（lexicon 有“如何看待X，快锐评一下”）',
+    peer: 'c2c:3022464706', from: '信风', qq: '3022464706',
+    text: '会冷死的',
+    ctx: [
+      { who: '我', text: '这条鱼戴耳机，像在偷偷听歌。' },
+      { who: '信风', text: '芜湖～下班下班' },
+      { who: '我', text: '芜湖～总算下班了。回去路上注意安全，别在半道上睡着。' },
+    ],
   },
 ]
 
-// ── 2. 上下文：A/B 两组**只差 lexicon 这一块** ────────────────────────────────
-// persona 用真实文件（截断到 3000 字：全文 13.7KB，每轮都塞进去会拖慢且超预算）。
-// 上下文骨架照桥的结构简化，但**两组完全一致**，所以骨架本身不影响 A/B 差异。
-function readPersona () {
-  try {
-    const raw = fs.readFileSync(PERSONA, 'utf8')
-    return raw.slice(0, 3000)
-  } catch { return '' }
+// ── 1c. --corpus old：旧轮语料 + 真实前文（受控对照用）────────────────────────
+//
+// 为什么需要：四组消融（新语料）跑出「中客 0/36」，但**两轮语料 0 交集** ——
+// 新那批发的是「外号/歧义/滑稽/得瑟/网友门」这种朋友间闲聊，天生不招中客。
+// 旧那批里有「哈基米南北绿豆？」（旧轮回了 260 字考据论文）、
+// 「你觉得谁家ai大模型最厉害」、「看看评论区」—— 才是**测中客**的题。
+// 只有拿旧这批消息、配上它们的真实前文，才能公平回答：
+//   「多轮上下文治好了中客，还是这批消息本来就不招中客？」
+const OLD_TARGETS = [
+  ['哈基米南北绿豆？', '玩梗'],
+  ['你觉得谁家ai大模型最厉害', '被问事'],
+  ['要是你点开链接就中毒了呢？', '被问事'],
+  ['这是战术喝水！', '分享东西'],
+  ['看看评论区', '分享东西'],
+  ['走快了躺床上睡不着', '深夜发言'],
+  ['再不苦中作乐就得疯了', '深夜发言'],
+  ['如何看待昨晚的lol比赛', '被问事'],
+]
+
+/** 日志里的转义还原（桥写日志时把换行/引号转义过）。 */
+function unescapeLog (s) {
+  return String(s ?? '').replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\')
 }
 
+function loadControlledScenarios () {
+  // 从 bridge.log 重建时序事件（同 loadDialogueEvents 的逻辑，但这里要按 peer 找前文）
+  const IN_RE2 = /^(\S+) 入站 (\S+) from=([^(]+)\((\d+)\) text="((?:[^"\\]|\\.)*)"/
+  const OUT_RE2 = /^(\S+) 出站 (\S+) text="((?:[^"\\]|\\.)*)" chars=\d+/
+  const MARK2 = /\[(?:SILENT|RECALL:[^\]]*|SEND_FILE:[^\]]*|AT:\d+|POKE:\d+(?::\w+)?|VOICE:[^\]]*|FOLLOW:[^\]]*|CQ:[^\]]*)\]/gi
+  const ev = []
+  let raw = ''
+  try { raw = fs.readFileSync(BRIDGE_LOG, 'utf8') } catch { return [] }
+  for (const line of raw.split('\n')) {
+    const min = IN_RE2.exec(line)
+    if (min) {
+      ev.push({ peer: min[2], who: min[3], qq: min[4], dir: 'in', text: unescapeLog(min[5]) })
+      continue
+    }
+    const mout = OUT_RE2.exec(line)
+    if (mout) ev.push({ peer: mout[2], who: '我', qq: 'self', dir: 'out', text: unescapeLog(mout[3]) })
+  }
+  const usable = (e) => {
+    const t = String(e.text ?? '').replace(MARK2, '').trim()
+    if (!t) return null
+    if (t.startsWith('【这是他在同一轮里补的一条】')) return null
+    if (t.startsWith('我们已成功添加为好友') || t === '请求添加你为好友') return null
+    if (t.length > 160) return null
+    return t
+  }
+  const out = []
+  for (const [text, kind] of OLD_TARGETS) {
+    const idx = ev.findIndex(e => e.dir === 'in' && e.text.includes(text))
+    if (idx < 0) continue
+    const peer = ev[idx].peer
+    const pe = ev.filter(e => e.peer === peer)
+    const ip = pe.findIndex(e => e === ev[idx])
+    const ctx = []
+    for (let k = ip - 1; k >= 0 && ctx.length < 3; k--) {
+      const u = usable(pe[k])
+      if (u) ctx.unshift({ who: pe[k].who, text: u })
+    }
+    if (!ctx.length) continue
+    out.push({ kind, peer, from: ev[idx].who, qq: ev[idx].qq, text, ctx })
+  }
+  return out
+}
+
+// ── 2. persona：两版都从 git 取，保证是真实历史版本 ──────────────────────────
+//
+// 为什么用 git show 而不是存两份副本：
+//   persona 会持续被人改，存副本会过期；git 里那个 commit 是**不可变**的，
+//   任何人在任何时间取到的都是同一份 → 结果可复现。
+// 截断到 3000 字：全文 13-15KB，每轮都塞会拖慢且挤占预算（桥自己也是按需注入）。
+const PERSONA_MAX = 3000
+function loadPersonas () {
+  const readFile = (p) => {
+    try { return fs.readFileSync(p, 'utf8') } catch { return '' }
+  }
+  let newText = readFile(PERSONA)
+  let oldText = ''
+  try {
+    oldText = execFileSync('git', ['-C', ROOT, 'show', OLD_PERSONA_REF], {
+      encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'],
+    })
+  } catch (e) {
+    console.log(`⚠️ 取不到旧版 persona（${OLD_PERSONA_REF}）: ${String(e.message).slice(0, 80)}`)
+  }
+  return {
+    old: oldText.slice(0, PERSONA_MAX),
+    new: newText.slice(0, PERSONA_MAX),
+    oldBytes: oldText.length,
+    newBytes: newText.length,
+    oldRef: OLD_PERSONA_REF,
+  }
+}
+
+// ── 3. lexicon：两组渲染（全量 / 仅 group 来源，兼容 --arm group-only）─────────
 function lexiconBlock () {
-  // 用桥上同一份渲染（lexicon.py render --json），不在这里另写拼接规则
   const out = execFileSync('python3', [
     path.join(MEM, 'lexicon.py'), 'render', '--path', LEXICON, '--json',
   ], { encoding: 'utf8', timeout: 20000, env: { ...process.env, PYTHONIOENCODING: 'utf8' } })
@@ -132,30 +280,69 @@ function lexiconBlock () {
   return d.injected ? String(d.block ?? '') : ''
 }
 
-function buildPrompt (persona, scenario, lexBlock) {
+function groupOnlyLexiconBlock () {
+  const d = JSON.parse(fs.readFileSync(LEXICON, 'utf8'))
+  const only = (d.entries ?? []).filter(e => e.source === 'group')
+  const tmp = path.join(TMP, 'lexicon-group-only.json')
+  fs.writeFileSync(tmp, JSON.stringify({ ...d, entries: only }, null, 2), 'utf8')
+  const out = execFileSync('python3', [
+    path.join(MEM, 'lexicon.py'), 'render', '--path', tmp, '--json',
+  ], { encoding: 'utf8', timeout: 20000, env: { ...process.env, PYTHONIOENCODING: 'utf8' } })
+  const j = JSON.parse(String(out).trim().split('\n').pop())
+  return j.injected ? String(j.block ?? '') : ''
+}
+
+// ── 4. buildPrompt：多轮上下文版（task-12 核心）────────────────────────────────
+//
+// 和上一版的区别（这是本次改造的关键）：
+//   上一版：
+//     【本次消息】我还有好久才下班，走快了要扣钱
+//     【要求】就这一条消息，像群里一个真人那样回一句。
+//     → 模型只看到一句孤立的话，自然进入「问答/回答」模式。
+//   本版：
+//     【你们在私聊里聊的】（真实记录）
+//     [20:09] 信风：这你也懂？我有点惊喜了，不错不错
+//     [20:09] 我：粗是粗了点，但实在。
+//     [20:10] 信风：你也是
+//     【现在这条】信风：那我外号是啥
+//     → 有前情、有自己的上句话，模型是在「接话」而不是「答题」。
+//
+// ⚠️ 场景标注是**私聊**，不是群聊。原因（Lead 定的）：
+//   语料实际来自 c2c（群聊的出站只有 3 条，拼不出多轮）。
+//   标成「群聊」就是撒谎，模型可能按群聊习惯回（更短更零碎）。
+//   这次不测「群聊 vs 私聊」，那不是变量 —— 诚实标注。
+//
+// ⚠️ A/B/四组的 prompt **只在 persona 段和 lexicon 段不同**，context 段逐字相同。
+//   所以唯一变量就是这两个，不会引入额外差异。
+function buildPrompt (personaText, scenario, lexBlock, opts = {}) {
   const parts = [
     `【你的人设】这是「你是谁」，优先级高于任何默认设定：`,
     '```markdown',
-    persona,
+    personaText,
     '```',
     '',
-    `当前用户正通过【QQ群】与你对话 —— 他在跟你说话（@你）。`,
+    `当前用户正通过【QQ私聊】与你对话 —— 他在跟你说话。`,
     `发送者：${scenario.from}（QQ号 ${scenario.qq}）`,
-    `当前时间：2026-10-27 ${scenario.kind === '深夜发言' ? '01:40' : '15:20'}（北京时间）`,
-    `群号：1017567471`,
-    '',
-    `【本次消息】${scenario.text}`,
+    `当前时间：2026-10-26 ${scenario.kind === '深夜发言' ? '01:40' : '20:10'}（北京时间）`,
   ]
+  if (!opts.noCtx && scenario.ctx && scenario.ctx.length) {
+    parts.push('', '【你们之前在私聊里聊的】（真实记录，不是编的）')
+    for (const c of scenario.ctx) {
+      // 时间只做装饰：真实分钟数已不可考（日志只到秒，但跨天），用相对序号更诚实
+      parts.push(`  ${c.who}：${c.text}`)
+    }
+  }
+  parts.push('', `【现在这条】${scenario.from}：${scenario.text}`)
   if (lexBlock) parts.push('', lexBlock)
   parts.push(
     '',
-    '【要求】就这一条消息，像群里一个真人那样回一句。',
+    '【要求】接着上面这段聊，像群里一个真人那样回一句。',
     '不要解释你在做什么，不要分点，不要客套。直接给回复正文，长度照你平时的习惯。',
   )
   return parts.join('\n')
 }
 
-// ── 3. 调模型（复用 reflection_llm.mjs 薄壳：单会话、无 MCP、独立小模型）────────
+// ── 5. 调模型（复用 reflection_llm.mjs 薄壳：单会话、无 MCP、独立小模型）────────
 let callSeq = 0
 function callLLM (prompt, tag) {
   const pf = path.join(TMP, `p-${tag}-${++callSeq}.txt`)
@@ -177,66 +364,58 @@ function callLLM (prompt, tag) {
   }
 }
 
-// ── 4. 用词统计：B 组回复里出现了哪些 lexicon 词 ──────────────────────────────
+// ── 6. 三个客观指标（task-12 要求：不全靠模型主观）────────────────────────────
+//
+// 为什么必须有客观指标：盲评模型自己也偏好「解释得清楚」的回答，
+// 用它判「谁更像人」有系统性偏差（上一轮 A/B 两组都理中客却分不出高下）。
+// 这三个指标是纯字符串/长度规则，可复现、可人工核对，不依赖任何模型。
+const STANCE_RE = /我(?:投|服|站|选|偏向|吃|觉得[^，。]{0,12}(?:好|强|牛|厉害|行)|只认|就认)|别问我|我最(?:喜欢|烦|讨厌|服)/
+// 免责腔：这是 AI 客服的标志性口气（上一轮诊断出 12 次）
+const DISCLAIMER_RE = /(?:查不|搜不|查不了|搜不到|没法查|仅供参考|仅作参考|可能不准|不一定准|记不清|老黄历|划掉|以上.{0,6}仅供参考)/
+// 科普/中立腔：列各方不下判断（上一轮诊断出 13 次）
+const TEACHING_RE = /省流|综上|总体来说|总体而言|各有各|看(?:你|具体)?(?:干啥|用途|需求|场景)|取决于|视情况|没有(?:唯一|绝对)的?(?:答案|标准)|都挺好|不能说谁(?:更好|最强)/
+const CONFUSED_RE = /(?:啥玩意|没懂|不懂|这是啥|什么意思|哈？|啊？|？$|^\?)/
+
+/** 算一条回复的三个客观指标（全部是布尔/数值，可复现）。 */
+function objectiveMetrics (text) {
+  const t = String(text ?? '').trim()
+  const chars = [...t].length
+  const stance = STANCE_RE.test(t)
+  const disclaimer = DISCLAIMER_RE.test(t)
+  const teaching = TEACHING_RE.test(t)
+  // 科普：长度 >100 字，或含明显教学/中立词
+  const isLecture = chars > 100 || teaching
+  // 认怂：短（<=15 字）+ 有困惑标记
+  const isConcede = chars <= 15 && (CONFUSED_RE.test(t) || /[?？]/.test(t))
+  return { chars, stance, disclaimer, teaching, isLecture, isConcede }
+}
+
+// ── 7. 用词命中（lexicon 是否被真的用上）──────────────────────────────────────
 function loadLexTerms (opts = {}) {
   const d = JSON.parse(fs.readFileSync(LEXICON, 'utf8'))
   return (d.entries ?? [])
     .filter(e => !opts.onlyGroup || e.source === 'group')
-    .map(e => ({ text: String(e.text ?? '').trim(), kind: e.kind, conf: e.confidence }))
-    // 「X 成啥了」「如何看待X」这类模板带占位符，无法直接字面匹配，只匹配不含 X 的
+    .map(e => ({ text: String(e.text ?? '').trim(), kind: e.kind }))
+    // 带占位符的模板（「X 成啥了」）无法字面匹配，只留不含 X 的
     .filter(e => e.text && !/[X×]/.test(e.text) && e.text.length >= 2)
-}
-
-/**
- * 消融用：只把 group 来源的字条渲染成块。
- * 走 lexicon.py render 的同一条规则（写临时 json 再调），不在这里另写拼接 ——
- * 否则「拿掉 B站条」这件事本身会引入和桥不一致的格式差异。
- **/
-function groupOnlyLexiconBlock () {
-  const d = JSON.parse(fs.readFileSync(LEXICON, 'utf8'))
-  const only = (d.entries ?? []).filter(e => e.source === 'group')
-  const tmp = path.join(TMP, 'lexicon-group-only.json')
-  fs.writeFileSync(tmp, JSON.stringify({ ...d, entries: only }, null, 2), 'utf8')
-  const out = execFileSync('python3', [
-    path.join(MEM, 'lexicon.py'), 'render', '--path', tmp, '--json',
-  ], { encoding: 'utf8', timeout: 20000, env: { ...process.env, PYTHONIOENCODING: 'utf8' } })
-  const j = JSON.parse(String(out).trim().split('\n').pop())
-  return j.injected ? String(j.block ?? '') : ''
 }
 function hitTerms (text, terms) {
   const t = String(text ?? '')
   const hits = []
   for (const x of terms) {
     if (t.includes(x.text)) { hits.push(x.text); continue }
-    // 词条字中间允许夹 0-2 个字：「摸鱼」也要能匹配到「摸会儿鱼」、「绷不住」→「绷都绷不住」。
-    // 第一版只做严格子串，实测漏掉了 B 组的「顺便摸会儿鱼」—— 会把真实效应算低。
+    // 字中间允许夹 0-2 字：「摸鱼」也要能命中「摸会儿鱼」（上一轮漏过，会低估效应）
     if (x.text.length >= 2) {
-      const chars = [...x.text].map(c => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-      const re = new RegExp(chars.join('.{0,2}'))
-      if (re.test(t)) hits.push(x.text)
+      const esc = [...x.text].map(c => c.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.{0,2}')
+      if (new RegExp(esc).test(t)) hits.push(x.text)
     }
   }
   return [...new Set(hits)]
 }
 
-// ── 5. 盲评：把 A/B 打乱顺序让另一个模型判 ────────────────────────────────────
-//
-// 随机化怎么做、怎么证明：
-//   · 每条消息单独抛硬币（crypto.randomBytes）决定「回复1 = A 还是 B」
-//   · 把硬币结果落进结果 json（blindOrder），报告里能逐条核对
-//   · 判分 prompt 里**只给「回复1 / 回复2」**，绝不出现 A/B 字样，也不给任何提示
-//   · 最后对硬币结果做平衡统计（有多少条是 AB、多少条 BA），证明没成组偏向一侧
-// 随机化统一走 sha256（不用 Math.random：结果必须可复现、可核对）。
-//
-// ⚠️ 为什么不是「每条独立抛硬币」：第一版那样做的实测结果是 9 条里
-//   回复1位置 6 次是 B、调用顺序 7 次先 A —— **位置偏斜会污染盲评**
-//   （模型对「第一条」有系统性偏好，B 老在第一条就等于给 B 加分）。
-// 所以改成**平衡随机化**：先把所有条目按哈希排序（=随机顺序），
-// 再把前半分给「回复1=A」、后半分给「回复1=B」，两边条数最多差 1。
-// 这既是随机的（顺序由哈希定），又保证不会成组偏向一侧 —— 报告里能逐条核对。
+// ── 8. 盲评（保留原有机制：平衡随机化 + 只给回复1/回复2）────────────────────────
 const hashOf = (seed) => crypto.createHash('sha256').update(seed).digest()
-
-/** 平衡随机分配：返回 Map<index, boolean>，true/false 各占一半（奇数时差 1）。 */
+/** 平衡随机分配：哈希排序后对半，true/false 各半（奇数差 1）。 */
 function balancedAssign (items, salt) {
   const order = items
     .map((it, i) => ({ i, h: hashOf(`${salt}#${it.text ?? it}`).toString('hex') }))
@@ -247,9 +426,12 @@ function balancedAssign (items, salt) {
   return out
 }
 const judgePrompt = (scenario, r1, r2) => [
-  '你是 QQ 群里的老群友。下面有两条对同一句话的回复，来自两个不同的号。',
+  '你是 QQ 群里的老群友。下面有两个人，都在同一个私聊里回同一句话。',
   '',
-  `群里有人（${scenario.from}）说：「${scenario.text}」`,
+  '他们之前在聊：',
+  ...(scenario.ctx ?? []).map(c => `  ${c.who}：${c.text}`),
+  '',
+  `现在 ${scenario.from} 说：「${scenario.text}」`,
   '',
   '回复1：',
   r1,
@@ -257,7 +439,7 @@ const judgePrompt = (scenario, r1, r2) => [
   '回复2：',
   r2,
   '',
-  '哪一条**更像真人在群里随口说话**？考虑：自然、不端着、不硬凑梗、场合对得上。',
+  '哪一条**更像真人在私聊里随口说话**？标准：自然、不端着、不硬凑梗、有自己态度、别像客服/百科。',
   '只输出 JSON，不要解释：{"better":1或2,"reason":"一句话理由","stuffed":1或2或0}',
   'stuffed = 哪一条有明显硬塞网络词/梗的痕迹（没有就填 0）。',
 ].join('\n')
@@ -278,40 +460,120 @@ function parseJudge (text) {
   } catch { return { better: null, stuffed: 0, reason: `解析失败: ${raw.slice(0, 80)}` } }
 }
 
+// ── 9. 四组定义 ───────────────────────────────────────────────────────────────
+//
+// 四组的意义（Lead 定）：
+//   A0 = 旧 persona + 无 lexicon  ← 上一轮的状态（基线）
+//   A1 = 旧 persona + 有 lexicon  ← 上一轮的实验组
+//   B0 = 新 persona + 无 lexicon  ← **单独看 persona**（这次最想知道的）
+//   B1 = 新 persona + 有 lexicon  ← 生产实际配置
+// 对比 A0↔B0 得 persona 净效应；A0↔A1 得 lexicon 净效应；A0↔B1 得叠加。
+const GROUPS = {
+  A0: { persona: 'old', lex: false, label: '旧persona+无lexicon' },
+  A1: { persona: 'old', lex: true, label: '旧persona+有lexicon' },
+  B0: { persona: 'new', lex: false, label: '新persona+无lexicon' },
+  B1: { persona: 'new', lex: true, label: '新persona+有lexicon' },
+  // ── 上下文有无 的受控组（task-12 补测）──
+  // 背景：四组消融跑完发现「理中客 4/36 → 0/36」，但两轮用的**不是同一批消息**
+  // （交集 0 条），所以不能把改善直接归因于「加了上下文」——也可能是消息本身更好聊。
+  // 这两个组用**同一批 8 条旧消息**、同 persona、都不注入 lexicon，只变「有没有前文」，
+  // 才回答得了「上下文这一项自己有没有用」。
+  N0: { persona: 'new', lex: false, label: '无前文（孤岛）', noCtx: true },
+  N1: { persona: 'new', lex: false, label: '有前文（多轮）' },
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 async function main () {
-  const limit = Number(arg('limit', '0')) || SCENARIOS.length
+  // ⚠️ 这里只取用户显式给的数；最终上限要等 --corpus 切换语料后再夹紧，
+  //    否则切到 8 条的旧语料时 limit 仍是 9 → SCENARIOS[8] undefined → 崩溃（实测踩到）
+  const limitArg = Number(arg('limit', '0'))
   const doJudge = !flag('no-judge')
   const resume = flag('resume')
-  // --arm：跑哪一组对照。
-  //   base        = A(不注入) vs B(注入全量词库)  ← 主实验
-  //   group-only  = BASE(不注入) vs GROUP(只注入 group 来源的词条)  ← 消融实验
-  // 消融的意义：主实验发现「注入反而更像念稿」后，必须区分是「注入这件事的错」
-  // 还是「B站语料（68/94 条）串了味」—— 这是能不能修好的分水岭。
-  const arm = String(arg('arm', 'base'))
-  const ARMS = {
-    base: { left: 'A', right: 'B', label: '不注入 vs 注入全量' },
-    'group-only': { left: 'BASE', right: 'GROUP', label: '不注入 vs 只注入 group 来源' },
-  }
-  if (!ARMS[arm]) { console.error(`--arm 只能是 ${Object.keys(ARMS).join(' / ')}`); process.exit(2) }
+  // --resume 要读上一轮四组结果（复用成功条目，只补缺的）。
+  // ⚠️ 必须在 main 里定义 prev：上一版把 prev 从原脚本删掉时漏了这行，
+  //    resume 分支会 ReferenceError（--resume 是任务要求保留的 CLI 参数）。
   let prev = null
-  if (resume && fs.existsSync(OUT)) {
-    try { prev = JSON.parse(fs.readFileSync(OUT, 'utf8')) } catch { prev = null }
+  if (resume) {
+    const prevPath = OUT.replace(/\.json$/, '-four.json')
+    for (const p of [prevPath, OUT]) {
+      try { prev = JSON.parse(fs.readFileSync(p, 'utf8')); break } catch { /* 下一个 */ }
+    }
+    if (!prev) console.log('⚠️ --resume 没找到上一轮结果，将全部重跑')
   }
 
-  const persona = readPersona()
-  const lexBlock = arm === 'base' ? lexiconBlock() : groupOnlyLexiconBlock()
-  const terms = arm === 'base' ? loadLexTerms() : loadLexTerms({ onlyGroup: true })
-  console.log(`语料源：memory/log/*.jsonl（真实群聊，已筛掉工作汇报句）`)
-  console.log(`persona：${persona.length} 字（截断自真实 persona）`)
-  console.log(`lexicon 注入块：${lexBlock ? `${lexBlock.length} 字` : '（空，冷启动）'}`)
-  console.log(`A/B 条数：${limit}（每条两次调用）｜盲评：${doJudge ? '开' : '关'}`)
-  if (!lexBlock) {
-    console.log('⚠️ lexicon 渲染为空 —— B 组等于 A 组，这个测试没有意义。先跑 learn。')
+  // 兼容旧的 --arm 用法（base / group-only 退化成两臂对比），
+  // 新用法是四组消融（默认）。这样 task-10 的调用方式不会坏掉。
+  const arm = String(arg('arm', 'four'))
+  let groupNames
+  if (arm === 'base') groupNames = ['A0', 'B1']          // 旧-无 vs 新-有（粗略对照）
+  else if (arm === 'group-only') groupNames = ['A0', 'A1g']  // 见下
+  else if (arm === 'four') groupNames = ['A0', 'A1', 'B0', 'B1']
+  else if (arm === 'context') groupNames = ['N0', 'N1']   // 上下文有无（同语料受控）
+  else { console.error('--arm 只能是 four / base / group-only / context'); process.exit(2) }
+
+  // --groups A0,B0：只跑指定组（调试用，不影响落盘结构）
+  const only = arg('groups')
+  if (only) groupNames = only.split(',').map(s => s.trim()).filter(s => GROUPS[s])
+  if (!groupNames.length) { console.error('--groups 给的名字都不认识'); process.exit(2) }
+
+  // --corpus old：换用**旧轮（task-10）那 9 条消息**，配上它们的真实前文。
+  // 为什么要这个开关：四组消融用新语料跑出「中客 0/36」，但旧轮那批消息里
+  // 「哈基米/哪个AI最厉害/看评论区」是**专门招中客**的（旧轮 260 字考据论文就在这）。
+  // 只有用同一批消息，才能公平回答「加上下文是否治好了中客」。
+  const useOldCorpus = String(arg('corpus', '')) === 'old'
+  if (useOldCorpus) {
+    // 从 logs/bridge.log 里给旧 9 条找回真实前文（缺 1 条「走快了要扣钱」找不到 → 8 条）
+    const ctrl = loadControlledScenarios()
+    if (ctrl.length >= 6) {
+      SCENARIOS.length = 0
+      SCENARIOS.push(...ctrl)
+      console.log(`⚠️ --corpus old：切换为旧轮语料 ${ctrl.length} 条（含真实前文）`)
+    } else {
+      console.log(`⚠️ --corpus old 只找到 ${ctrl.length} 条，退回新语料`)
+    }
+  }
+
+  const limit = limitArg > 0 ? Math.min(limitArg, SCENARIOS.length) : SCENARIOS.length
+
+  const personas = loadPersonas()
+  if (!personas.old) {
+    console.error('❌ 取不到旧版 persona（git show 失败）—— 四组消融跑不了')
     process.exit(2)
   }
+  if (!personas.new) { console.error('❌ 读不到当前 persona'); process.exit(2) }
 
-  // 预先算平衡分配表（用前 limit 条）：一张管「调用顺序」，一张管「盲评展示顺序」
+  const lexFull = lexiconBlock()
+  const lexGroup = arm === 'group-only' ? groupOnlyLexiconBlock() : lexFull
+  if (!lexFull) {
+    console.log('⚠️ lexicon 渲染为空 —— 注入组等于不注入，没意义。先跑 learn。')
+    process.exit(2)
+  }
+  const terms = arm === 'group-only' ? loadLexTerms({ onlyGroup: true }) : loadLexTerms()
+
+  // 每个组对应的 prompt（persona 段 + lexicon 段不同，其余逐字相同）
+  const promptsFor = (sc) => {
+    const out = {}
+    for (const g of groupNames) {
+      const gi = GROUPS[g] ?? (g === 'A1g' ? { persona: 'old', lex: true } : null)
+      if (!gi) continue
+      out[g] = buildPrompt(
+        gi.persona === 'old' ? personas.old : personas.new,
+        sc,
+        gi.lex ? (g === 'A1g' ? lexGroup : lexFull) : '',
+        { noCtx: !!gi.noCtx },
+      )
+    }
+    return out
+  }
+
+  console.log(`语料：${SCENARIOS.length} 条真实多轮对话（bridge.log 入站+出站重建）`)
+  console.log(`  每条带 ${SCENARIOS[0].ctx.length} 条真实前文；场景覆盖 ${[...new Set(SCENARIOS.map(s => s.kind))].join('/')}`)
+  console.log(`persona：旧 ${personas.old.length} 字（${personas.oldRef}）｜新 ${personas.new.length} 字`)
+  console.log(`lexicon：${lexFull.length} 字｜词条 ${JSON.parse(fs.readFileSync(LEXICON, 'utf8')).entries.length} 条`)
+  console.log(`组：${groupNames.map(g => `${g}=${(GROUPS[g] ?? { label: '旧+group词' }).label}`).join(' | ')}`)
+  console.log(`条数：${limit}｜盲评：${doJudge ? '开' : '关'}\n`)
+
+  // 平衡随机化：生成顺序 + 盲评展示顺序，都按组数做平衡
   const callPlan = balancedAssign(SCENARIOS.slice(0, limit), 'call-order')
   const blindPlan = balancedAssign(SCENARIOS.slice(0, limit), 'blind-order')
 
@@ -319,173 +581,224 @@ async function main () {
   const t0 = Date.now()
   for (let i = 0; i < limit; i++) {
     const sc = SCENARIOS[i]
-    const prevRow = prev?.rows?.find(r => r.text === sc.text)
-    if (resume && prevRow && prevRow.a?.ok && prevRow.b?.ok) {
-      console.log(`[${i + 1}/${limit}] ${sc.kind} 复用已落盘结果`)
+    // --resume：同一条消息若已有全部组的成功结果，直接复用
+    const prevRow = resume ? (prev?.rows ?? []).find(r => r.text === sc.text) : null
+    const prevOk = prevRow && groupNames.every(g => prevRow.groups?.[g]?.ok)
+    if (prevOk) {
+      console.log(`[${i + 1}/${limit}] ${sc.kind}｜复用已落盘结果`)
       rows.push(prevRow)
       continue
     }
-    // 调用顺序取平衡分配表（消除顺序/缓存/温度漂移造成的系统性偏差）
-    const [L, R] = [ARMS[arm].left, ARMS[arm].right]
-    const order = callPlan.get(i) ? [L, R] : [R, L]
-    const promptA = buildPrompt(persona, sc, '')
-    const promptB = buildPrompt(persona, sc, lexBlock)
-    console.log(`[${i + 1}/${limit}] ${sc.kind}｜${sc.text.slice(0, 20)}｜顺序 ${order.join('→')}`)
+
+    const prompts = promptsFor(sc)
+    // 调用顺序：按平衡表决定「正序」还是「倒序」，避免某一组总在同一位置
+    const seq = callPlan.get(i) ? groupNames : [...groupNames].reverse()
+    console.log(`[${i + 1}/${limit}] ${sc.kind}｜${sc.text.slice(0, 22)}｜顺序 ${seq.join('→')}`)
 
     const res = {}
-    for (const g of order) {
-      const prompt = g === ARMS[arm].left ? promptA : promptB
-      let r = callLLM(prompt, `${i}${g}`)
-      // 单次失败重试一次：失败会让这一对作废（少一个样本），n 本来就只有 9
+    for (const g of seq) {
+      let r = callLLM(prompts[g], `${i}${g}`)
       if (!r.ok) {
-        console.log(`    ${g} 首次失败（${String(r.error).slice(0, 60)}），重试一次`)
-        r = callLLM(prompt, `${i}${g}r`)
+        console.log(`    ${g} 首次失败（${String(r.error).slice(0, 50)}），重试一次`)
+        r = callLLM(prompts[g], `${i}${g}r`)
       }
       res[g] = r
-      console.log(`    ${g} ${r.ok ? `${r.text.length} 字 ${(r.ms / 1000).toFixed(1)}s` : `失败 ${r.error}`}`)
+      const m = r.ok ? objectiveMetrics(r.text) : null
+      console.log(`    ${g} ${r.ok ? `${m.chars}字 ${(r.ms / 1000).toFixed(1)}s` : `失败 ${r.error}`}`)
     }
 
-    // ⚠️ 这里不能用写死的 res.A / res.B：--arm group-only 时左右臂叫 BASE / GROUP。
-    //    第一版写死了，消融跑完汇总全是 0/9（数据在，但取错字段）。
-    const [LEFT, RIGHT] = [ARMS[arm].left, ARMS[arm].right]
-    const leftHits = hitTerms(res[LEFT]?.text, terms)
-    const rightHits = hitTerms(res[RIGHT]?.text, terms)
+    // 每组的客观指标 + 用词命中
+    const metrics = {}
+    for (const g of groupNames) {
+      const r = res[g]
+      metrics[g] = r?.ok
+        ? { ...objectiveMetrics(r.text), lexHits: hitTerms(r.text, terms) }
+        : null
+    }
 
-    // 盲评
-    let blind = null
-    if (doJudge && res[LEFT]?.ok && res[RIGHT]?.ok) {
-      // 该条「回复1」是左臂还是右臂 —— 取平衡分配表，落盘可核对
-      const r1IsLeft = blindPlan.get(i) === true
-      const r1 = r1IsLeft ? res[LEFT].text : res[RIGHT].text
-      const r2 = r1IsLeft ? res[RIGHT].text : res[LEFT].text
-      const jr = callLLM(judgePrompt(sc, r1, r2), `${i}J`)
-      const pj = jr.ok ? parseJudge(jr.text) : { better: null, stuffed: 0, reason: `判分调用失败: ${jr.error}` }
-      // 把 1/2 映射回左/右臂
-      const map = (v) => v === 1 ? (r1IsLeft ? LEFT : RIGHT) : (r1IsLeft ? RIGHT : LEFT)
-      const betterGroup = pj.better === null ? null : map(pj.better)
-      const stuffedGroup = pj.stuffed === 0 ? null : map(pj.stuffed)
-      blind = {
-        r1IsLeft, betterGroup, stuffedGroup, reason: pj.reason,
-        raw: jr.text, ms: jr.ms,
+    // 盲评：四组两两比（A0 vs B0 = persona 净效应；A0 vs A1 = lexicon 净效应；
+    // A0 vs B1 = 叠加；B0 vs B1 = 新 persona 下 lexicon 的增量）
+    const pairs = []
+    if (doJudge) {
+      const defs = (arm === 'four' && !arg('groups'))
+        ? [['A0', 'B0', 'persona净效应'], ['A0', 'A1', 'lexicon净效应'], ['A0', 'B1', '两者叠加'], ['B0', 'B1', '新persona下lexicon增量']]
+        : blockPairs(groupNames, arm)
+      let blindSeq = 0
+      for (const [L, R, meaning] of defs) {
+        if (!groupNames.includes(L) || !groupNames.includes(R)) continue
+        if (!res[L]?.ok || !res[R]?.ok) continue
+        // 每条对比独立决定「回复1 是谁」（按 meaning + i 哈希，可核对）
+        const r1IsL = hashOf(`blind#${meaning}#${sc.text}`)[0] % 2 === 0
+        const r1 = r1IsL ? res[L].text : res[R].text
+        const r2 = r1IsL ? res[R].text : res[L].text
+        const jr = callLLM(judgePrompt(sc, r1, r2), `${i}J${blindSeq++}`)
+        const pj = jr.ok ? parseJudge(jr.text) : { better: null, stuffed: 0, reason: `判分失败: ${jr.error}` }
+        const map = (v) => v === 1 ? (r1IsL ? L : R) : (r1IsL ? R : L)
+        pairs.push({
+          left: L, right: R, meaning,
+          r1IsLeft: r1IsL,
+          betterGroup: pj.better === null ? null : map(pj.better),
+          stuffedGroup: pj.stuffed === 0 ? null : map(pj.stuffed),
+          reason: pj.reason,
+        })
+        console.log(`    盲评[${meaning}] 更像人=${pj.better === null ? '?' : map(pj.better)}｜${pj.reason.slice(0, 34)}`)
       }
-      console.log(`    盲评：更像人=${betterGroup ?? '?'}｜硬塞=${stuffedGroup ?? '无'}｜${pj.reason.slice(0, 40)}`)
     }
 
     rows.push({
-      index: i, kind: sc.kind, from: sc.from, qq: sc.qq, text: sc.text, note: sc.note,
-      order,
-      // 左臂=不注入（基线），右臂=注入。字段名 arm 里取，避免写死。
-      left: { ok: res[LEFT]?.ok, text: res[LEFT]?.text ?? '', error: res[LEFT]?.error, ms: res[LEFT]?.ms },
-      right: { ok: res[RIGHT]?.ok, text: res[RIGHT]?.text ?? '', error: res[RIGHT]?.error, ms: res[RIGHT]?.ms },
-      leftLexHits: leftHits, rightLexHits: rightHits,
-      // 净增量（右臂说了左臂没说的）—— 结论以它为准
-      netLexHits: rightHits.filter(w => !leftHits.includes(w)),
-      blind,
+      index: i, kind: sc.kind, peer: sc.peer, from: sc.from, qq: sc.qq,
+      text: sc.text, ctx: sc.ctx, order: seq,
+      groups: Object.fromEntries(groupNames.map(g => [g, {
+        ok: res[g]?.ok, text: res[g]?.text ?? '', error: res[g]?.error, ms: res[g]?.ms,
+      }])),
+      metrics,
+      blindPairs: pairs,
     })
   }
 
   // ── 汇总 ──
   //
-  // ⚠️ 关键口径（第一版踩过）：不能只数「B 组回复里出现了多少 lexicon 词」——
-  //    第 1 条试跑时 A 组（没注入）也说了「摸鱼」，因为那是模型本来就会用的通用词。
-  //    把这种算成「lexicon 生效」是假阳性。
-  //    所以拆成两个数：
-  //      · rawHits   —— 字面命中 lexicon 词条（含模型自己也会说的通用词）
-  //      · netHits   —— **只有 B 组说了、A 组没说**的词（这才是注入带来的净增量）
-  //    结论以 netHits 为准，rawHits 只作参考。
-  const okRows = rows.filter(r => r.left?.ok && r.right?.ok)
-  // 净增量：右臂有、左臂无（逐条比，避免「左臂在别的条里说过」这种跨条抵消）
-  const netRows = okRows.map(r => {
-    const lSet = new Set(r.leftLexHits ?? [])
-    return (r.rightLexHits ?? []).filter(w => !lSet.has(w))
-  })
-  const rightWithLex = okRows.filter(r => (r.rightLexHits?.length ?? 0) > 0)
-  const leftWithLex = okRows.filter(r => (r.leftLexHits?.length ?? 0) > 0)
-  const judged = okRows.filter(r => r.blind?.betterGroup)
-  const leftWins = judged.filter(r => r.blind.betterGroup === ARMS[arm].left).length
-  const rightWins = judged.filter(r => r.blind.betterGroup === ARMS[arm].right).length
-  const stuffRight = okRows.filter(r => r.blind?.stuffedGroup === ARMS[arm].right).length
-  const stuffLeft = okRows.filter(r => r.blind?.stuffedGroup === ARMS[arm].left).length
-  // 平衡证明：盲评里「回复1」是左臂/右臂各几条；调用顺序先左/先右各几条
-  const r1AsLeft = okRows.filter(r => r.blind?.r1IsLeft === true).length
-  const r1AsRight = okRows.filter(r => r.blind?.r1IsLeft === false).length
-  const orderLR = rows.filter(r => r.order?.[0] === ARMS[arm].left).length
-  const orderRL = rows.filter(r => r.order?.[0] === ARMS[arm].right).length
+  // 主口径是**三个客观指标**（task-12 要求），盲评只作旁证：
+  //   盲评模型自己也偏好「解释清楚」→ 判「谁更像人」有系统性偏差，
+  //   上一轮 A/B 两组都理中客却分不出高下，就是这个原因。
+  const okPairs = (g) => rows.filter(r => r.groups?.[g]?.ok)
+  const groupStats = {}
+  for (const g of groupNames) {
+    const ok = okPairs(g)
+    const ms = ok.map(r => r.metrics[g]).filter(Boolean)
+    const withLex = ms.filter(m => (m.lexHits?.length ?? 0) > 0)
+    groupStats[g] = {
+      label: (GROUPS[g] ?? { label: '旧persona+group词' }).label,
+      n: ok.length,
+      stance: ms.filter(m => m.stance).length,
+      stanceRate: ms.length ? +(ms.filter(m => m.stance).length / ms.length).toFixed(3) : 0,
+      disclaimer: ms.filter(m => m.disclaimer).length,
+      disclaimerRate: ms.length ? +(ms.filter(m => m.disclaimer).length / ms.length).toFixed(3) : 0,
+      lecture: ms.filter(m => m.isLecture).length,
+      lectureRate: ms.length ? +(ms.filter(m => m.isLecture).length / ms.length).toFixed(3) : 0,
+      teaching: ms.filter(m => m.teaching).length,
+      concede: ms.filter(m => m.isConcede).length,
+      concedeRate: ms.length ? +(ms.filter(m => m.isConcede).length / ms.length).toFixed(3) : 0,
+      avgChars: ms.length ? +(ms.reduce((a, m) => a + (m.chars || 0), 0) / ms.length).toFixed(1) : 0,
+      lexRows: withLex.length,
+      lexWords: [...new Set(ok.flatMap(r => r.metrics[g]?.lexHits ?? []))],
+      errors: rows.length - ok.length,
+    }
+  }
+
+  // 盲评：按 pair 聚合（每一对是一个要回答的问题）
+  const pairStats = {}
+  for (const r of rows) {
+    for (const p of (r.blindPairs ?? [])) {
+      const k = `${p.left}vs${p.right}`
+      pairStats[k] ??= {
+        left: p.left, right: p.right, meaning: p.meaning,
+        n: 0, leftWins: 0, rightWins: 0, tie: 0,
+        stuffedLeft: 0, stuffedRight: 0, r1IsLeft: 0, r1IsRight: 0,
+        reasons: [],
+      }
+      const s = pairStats[k]
+      s.n++
+      if (p.betterGroup === p.left) s.leftWins++
+      else if (p.betterGroup === p.right) s.rightWins++
+      else s.tie++
+      if (p.stuffedGroup === p.left) s.stuffedLeft++
+      if (p.stuffedGroup === p.right) s.stuffedRight++
+      p.r1IsLeft ? s.r1IsLeft++ : s.r1IsRight++
+      if (p.reason) s.reasons.push(p.reason)
+    }
+  }
+
+  // 双项精确检验（p=0.5），用来判断「方向是否可信」而不是靠感觉
+  const binom = (k, n) => {
+    if (!n) return 1
+    const C = (a, b) => { let r = 1; for (let i = 0; i < b; i++) r = r * (a - i) / (i + 1); return r }
+    let tail = 0
+    for (let i = 0; i <= n; i++) if (Math.abs(i - n / 2) >= Math.abs(k - n / 2)) tail += C(n, i)
+    return +(tail / Math.pow(2, n)).toFixed(4)
+  }
+  for (const k of Object.keys(pairStats)) {
+    const s = pairStats[k]
+    s.pLeftWins = binom(s.leftWins, s.leftWins + s.rightWins)
+  }
 
   const summary = {
     arm,
-    armLabel: ARMS[arm].label,
+    groups: groupStats,
+    blindPairs: pairStats,
     n: rows.length,
-    okPairs: okRows.length,
-    withLexiconBlock: lexBlock.length,
-    lexiconTotal: (JSON.parse(fs.readFileSync(LEXICON, 'utf8')).entries ?? []).length,
-    injectedEntries: arm === 'base'
-      ? (JSON.parse(fs.readFileSync(LEXICON, 'utf8')).entries ?? []).length
-      : (JSON.parse(fs.readFileSync(LEXICON, 'utf8')).entries ?? []).filter(e => e.source === 'group').length,
-    // 维度1：用词（字面命中，含通用词）
-    rightUsedWord: rightWithLex.length,
-    rightUsedWordRate: okRows.length ? +(rightWithLex.length / okRows.length).toFixed(3) : 0,
-    leftUsedWord: leftWithLex.length,
-    leftUsedWordRate: okRows.length ? +(leftWithLex.length / okRows.length).toFixed(3) : 0,
-    rightLexWordsUsed: [...new Set(okRows.flatMap(r => r.rightLexHits ?? []))],
-    leftLexWordsUsed: [...new Set(okRows.flatMap(r => r.leftLexHits ?? []))],
-    // 主口径：注入带来的净增量
-    netWordsUsed: [...new Set(netRows.flat())],
-    rowsWithNetWord: netRows.filter(w => w.length > 0).length,
-    rowsWithNetWordRate: okRows.length ? +(netRows.filter(w => w.length > 0).length / okRows.length).toFixed(3) : 0,
-    // 维度3：盲评
-    judged: judged.length,
-    leftWins, rightWins, tie: judged.length - leftWins - rightWins,
-    // 维度2：硬塞
-    stuffedInRight: stuffRight, stuffedInLeft: stuffLeft,
-    // 随机化/平衡证明
-    balance: {
-      blindR1IsLeft: r1AsLeft, blindR1IsRight: r1AsRight,
-      callOrderLeftFirst: orderLR, callOrderRightFirst: orderRL,
-      note: '每条用哈希排序后对半分配（不是逐条抛硬币）：保证盲评位置与调用顺序都不成组偏向一侧',
-    },
+    scenarios: SCENARIOS.slice(0, limit).map(s => ({ kind: s.kind, text: s.text, ctxLen: s.ctx.length })),
+    persona: { oldRef: personas.oldRef, oldChars: personas.old.length, newChars: personas.new.length },
+    lexBlockChars: lexFull.length,
     totalMs: Date.now() - t0,
     model: 'trae/glm-5.3-flashx（经 reflection_llm.mjs）',
     caveat: [
-      `n=${okRows.length}，单次采样、样本量小 —— 只能看方向，不能做统计显著性。`,
-      '语境是 reflection 薄壳（无记忆/情绪/精力/风格锚），测的是 lexicon 单项净效应，不是生产桥整体。',
-      '判分模型与生成模型同款（glm-5.3-flashx），有同源偏好。',
-      arm === 'group-only'
-        ? '本臂是**消融**：只注入 group 来源字条，用来区分「注入本身」与「B站语料串味」。'
-        : 'B站来源占词库多数，结论需结合 --arm group-only 消融一起看。',
+      `n=${limit} 条消息，每组单次采样 —— 只能看方向，不做统计显著性宣称。`,
+      '语境是 reflection 薄壳（无记忆/情绪/精力/风格锚），测的是 persona+lexicon 的净效应，不是生产桥整体。',
+      '判分模型与生成模型同款（glm-5.3-flashx），盲评有同源偏好 → 所以主口径用客观指标。',
+      '语料是私聊（c2c），因为群聊出站只有 3 条拼不出多轮；本次不测「群聊 vs 私聊」。',
     ],
   }
 
   const out = {
     generatedAt: new Date().toISOString(),
     design: {
-      arm,
-      groups: `${ARMS[arm].left}=不注入（基线）｜${ARMS[arm].right}=${ARMS[arm].label}，其余完全一致`,
-      corpus: 'qq-agent/memory/log/*.jsonl 真实群聊消息（人工按场景挑选，原文照抄）',
-      randomization: '哈希排序后对半分配，见每条 order / blind.r1IsLeft 与 summary.balance',
+      groups: groupNames.map(g => `${g}=${groupStats[g].label}`),
+      fourWayPurpose: 'A0↔B0 得 persona 净效应；A0↔A1 得 lexicon 净效应；A0↔B1 得叠加；B0↔B1 得新persona下 lexicon 增量',
+      contextChange: 'task-12：buildPrompt 从「孤立单轮」改为「带 2-3 条真实前文的多轮」，前文来自 bridge.log 入站+出站重建',
+      contextRule: '前文必须含「我」的发言，且「我」的发言都 <=35 字（防长解释污染，见脚本注释）',
+      corpus: 'c2c:3022464706 真实私聊记录（原文照抄，未改写）',
+      personaOld: personas.oldRef,
+      randomization: '调用顺序与盲评展示顺序都按哈希平衡分配（见 summary.blindPairs[].r1IsLeft/r1IsRight）',
       isolation: `中间文件在 ${TMP}；未读写 state.json / mem.db`,
     },
-    lexicalBlock: lexBlock,
+    lexicalBlock: lexFull,
     summary,
     rows,
   }
+
   fs.mkdirSync(path.dirname(OUT), { recursive: true })
-  // 分臂落盘：两个臂的结果不能互相覆盖（要先跑 base 再跑 group-only，两份都要留）
-  const outPath = arm === 'base' ? OUT : OUT.replace(/\.json$/, `-${arm}.json`)
+  const outPath = arm === 'four'
+    ? OUT.replace(/\.json$/, '-four.json')
+    : OUT.replace(/\.json$/, `-${arm}.json`)
   fs.writeFileSync(outPath, JSON.stringify(out, null, 2), 'utf8')
 
-  const L = ARMS[arm].left, R = ARMS[arm].right
-  console.log(`\n=== 汇总（${ARMS[arm].label}）===`)
-  console.log(`成功配对 ${summary.okPairs}/${summary.n}｜注入 ${summary.injectedEntries} 条｜用时 ${(summary.totalMs / 1000 / 60).toFixed(1)} 分钟`)
-  console.log(`字面命中（含模型本来就会说的通用词）`)
-  console.log(`  ${R}：${summary.rightUsedWord}/${summary.okPairs}（${(summary.rightUsedWordRate * 100).toFixed(0)}%）→ ${summary.rightLexWordsUsed.join('、') || '无'}`)
-  console.log(`  ${L}：${summary.leftUsedWord}/${summary.okPairs}（${(summary.leftUsedWordRate * 100).toFixed(0)}%）→ ${summary.leftLexWordsUsed.join('、') || '无'}`)
-  console.log(`净增量（${R} 说了 ${L} 没说的，主口径）`)
-  console.log(`  ${summary.rowsWithNetWord}/${summary.okPairs} 条（${(summary.rowsWithNetWordRate * 100).toFixed(0)}%）→ ${summary.netWordsUsed.join('、') || '无'}`)
-  console.log(`盲评更像人：${L} ${summary.leftWins} / ${R} ${summary.rightWins} / 平 ${summary.tie}（判了 ${summary.judged} 条）`)
-  console.log(`盲评判为硬塞：${L} ${summary.stuffedInLeft} 次 / ${R} ${summary.stuffedInRight} 次`)
-  console.log(`平衡性：回复1是${L} ${r1AsLeft} 条、是${R} ${r1AsRight} 条；先跑${L} ${orderLR} 条、先跑${R} ${orderRL} 条`)
-  console.log(`\n结果已写入 ${outPath}`)
+  // ── 打印 ──
+  console.log(`\n=== 三客观指标（主口径）===`)
+  console.log('组             n   表态率   科普率   免责率   认怂率   平均长度  用词条数')
+  for (const g of groupNames) {
+    const s = groupStats[g]
+    console.log(
+      `${g.padEnd(3)}${s.label.padEnd(20)} ${String(s.n).padStart(2)}  ` +
+      `${(s.stanceRate * 100).toFixed(0).padStart(3)}%  ${(s.lectureRate * 100).toFixed(0).padStart(4)}%  ` +
+      `${(s.disclaimerRate * 100).toFixed(0).padStart(4)}%  ${(s.concedeRate * 100).toFixed(0).padStart(4)}%  ` +
+      `${String(s.avgChars).padStart(5)}字  ${String(s.lexRows).padStart(2)}/${s.n}`
+    )
+  }
+  if (Object.keys(pairStats).length) {
+    console.log(`\n=== 盲评（旁证）===`)
+    for (const k of Object.keys(pairStats)) {
+      const s = pairStats[k]
+      console.log(`${s.meaning.padEnd(22)} ${s.left} ${s.leftWins} : ${s.rightWins} ${s.right}（平${s.tie}, p=${s.pLeftWins}）`)
+    }
+  }
+  console.log(`\n用时 ${(summary.totalMs / 1000 / 60).toFixed(1)} 分钟`)
+  console.log(`结果已写入 ${outPath}`)
+}
+
+/** 两臂退化模式下，组对怎么配。 */
+function blockPairs (groupNames, arm) {
+  if (arm === 'base') {
+    // base：旧-无(A0) 退化成「基线」，新-有(B1) 退化成「实验」—— 保留旧调用语义
+    return [['A0', 'B1', 'base(旧-无 vs 新-有)']]
+  }
+  if (arm === 'group-only') {
+    return [['A0', 'A1g', 'group-only(旧-无 vs 旧-group词)']]
+  }
+  if (arm === 'context') {
+    return [['N0', 'N1', '上下文有无']]
+  }
+  return []
 }
 
 main().catch(e => { console.error('崩溃:', e); process.exit(1) })
