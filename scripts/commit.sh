@@ -36,6 +36,8 @@ SUITES=(
   proactive-logic flurry-logic mood-logic mood-decay mood-traits delay-logic chain-walk
   quote-reply memory-cross-channel arousal-cap energy-mood-link linebreak prod-db-lock guarantee-fix cleanup-orphan-acp recall
   style-bank memory-cross-channel lexicon message-queue chat-follow
+  # 官方 QQ Bot 适配层：纯函数，不连网不读凭据，所以能安全进每次提交的测试
+  official-bot
   # 语料池抓取：离线（假 python）、不真请求 B站，所以能安全进每次提交的测试
   crawl-bili-comments
 )
