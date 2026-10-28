@@ -6,7 +6,7 @@
 # 数据卷落在 ./data 下，登录态可复用。
 services:
   napcat:
-    image: mlikiowa/napcat-docker:latest
+    image: mlikiowa/napcat-docker:v4.15.19
     container_name: llminqq-napcat
     restart: unless-stopped
     environment:
