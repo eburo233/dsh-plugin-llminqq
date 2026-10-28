@@ -242,3 +242,50 @@ PY
 
 **怎么判断你踩到了**：改完重启，值又变回去了 → 就是这个。
 **保险做法**：改之前先 `saveState` 一次（等等），或者干脆停进程再改。
+
+---
+
+## 12. 多 agent 并行时，`git index` 是共享资源（会互相踩）
+
+### 事实
+
+`git add` / `git restore --staged` / `git commit` 都在操作**同一个全局 index**。
+多个 agent 同时干活时，`index` 没有互斥。
+
+### 这导致两种事故
+
+**事故 A（已发生，2026-10-26）**：`git add -A` 把别人未完成的工作一起提交，一天 5 次。
+→ 已修：`commit.sh` 不再 `git add -A`，只提交已暂存文件。
+
+**事故 B（已发生，2026-10-28）：别人可能把你的暂存撤掉**
+
+真实时间线：
+```
+Lead    git add persona           → index: {persona}
+dev     git add CONTRIBUTING      → index: {persona, CONTRIBUTING}
+Lead    commit.sh                 → 开始跑全量测试（耗时 60-90 秒！）
+dev     git restore --staged persona  → index: {CONTRIBUTING}   ← 它想避免裹进自己的提交
+Lead    commit.sh 完成 → commit     → 提交的是 {CONTRIBUTING}
+结果：persona 留在工作树没进库，但 commit message 写的是「fix(persona)」
+```
+
+**关键问题**：`commit.sh` 跑全量测试要 **60-90 秒**，这期间 index 完全暴露在别人操作下。
+**「先 add 再跑 commit.sh」这条规矩防不了这个。**
+
+### 规矩
+
+1. **index 是共享的**，不是你的私有暂存区。add 了不代表它会在你 commit 时还在。
+2. **`commit.sh` 现在支持 `COMMIT_EXPECT`**，提交前核对 index：
+   ```bash
+   COMMIT_EXPECT="qq-agent/persona/persona.md" bash scripts/commit.sh "说明"
+   ```
+   不一致会拒绝提交（而不是静默提交错的内容）。
+3. **多个 agent 同时要提交时，串行来**——不要在别人跑 `commit.sh` 期间 `git add` 或 `git restore --staged`。
+4. **提交后看一眼** `git show --name-status HEAD`，确认文件清单和 message 对得上。
+   这次事故就是靠 `learn-dev` 做这一步发现的。
+
+### 为什么值得记
+
+因为它是**静默的**：commit 成功了、测试全绿、exit 0，**没有人会怀疑**。
+只有事后查 `git show` 才发现 message 和内容不符。
+而 `git log` 会一直误导后来的人。

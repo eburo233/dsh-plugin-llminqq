@@ -132,10 +132,29 @@ fi
 echo "  将提交以下已暂存文件："
 git diff --cached --name-only | sed 's/^/    /'
 echo
-if [ -z "$MSG" ]; then
-  changed=$(git diff --cached --name-only | head -3 | tr '\n' ' ')
-  MSG="更新：${changed}"
+
+# ⚠️ 防竞态：index 是多 agent 共享资源，`git add` 和 `git commit` 之间可能有别人操作。
+# 2026-10-28 真实事故：Lead `git add persona` 后，learn-dev 同时 `git restore --staged persona`
+# （它想避免自己的提交裹进 persona）。结果 Lead 的 commit 只提交了 CONTRIBUTING，
+# persona 留在工作树没进库，但 commit message 写的是「fix(persona)」—— log 误导。
+#
+# 修法：如果调用方用 `--expect` 给了预期文件清单，提交前重新核对 index；
+#      不一致就拒绝，让人重来（而不是静默提交错的内容）。
+EXPECT="${COMMIT_EXPECT:-}"
+if [ -n "$EXPECT" ]; then
+  actual=$(git diff --cached --name-only | sort | tr '\n' ' ')
+  want=$(printf '%s' "$EXPECT" | tr ' ' '\n' | grep -v '^$' | sort | tr '\n' ' ')
+  if [ "$actual" != "$want" ]; then
+    echo "  ❌ index 内容与预期不符，拒绝提交（可能是并发操作改动了暂存区）"
+    echo "     预期: $want"
+    echo "     实际: $actual"
+    echo "     请重新 git add 后再试。"
+    exit 1
+  fi
+  echo "  ✅ index 内容与预期一致"
 fi
+
+# 提交窗口尽量短：从上面 git diff 到下面的 commit 之间不做耗时操作
 git commit -q -m "$MSG"
 echo "  已提交：$(git log --oneline -1)"
 echo
