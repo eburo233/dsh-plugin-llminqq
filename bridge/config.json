@@ -199,15 +199,7 @@
     "sanitizeUntrustedText": true
   },
   "mood": {
-    "enabled": true,
-    "traits": {
-      "sensitivity": 1.15,
-      "sootheRate": 1.2,
-      "showOff": 1.6,
-      "grudge": 0.45,
-      "clingy": 1.1,
-      "steady": 1.0
-    }
+    "enabled": true
   },
   "memory": {
     "reflection": {
@@ -228,7 +220,6 @@
     "totalTimeout": 900,
     "maxGroupMessages": 160,
     "groupBatch": 40,
-
     "corpusDir": "qq-agent/memory/corpus",
     "corpusRoundSegments": 18,
     "corpusRoundChars": 12000,
@@ -236,25 +227,87 @@
     "crawlNum": 100,
     "crawlOnly": 3,
     "crawlSources": [
-      { "bvid": "BV1s8aA6wEwb", "domain": "history" },
-      { "bvid": "BV1h6HQ6pEd5", "domain": "history" },
-      { "bvid": "BV1Enpxz5Ef3", "domain": "tech" },
-      { "bvid": "BV1BG4y137mG", "domain": "tech" },
-      { "bvid": "BV1nE411R7CS", "domain": "tech" },
-      { "bvid": "BV15p4y1d7am", "domain": "food" },
-      { "bvid": "BV1CG411w74X", "domain": "food" },
-      { "bvid": "BV1ZbKVzaEg5", "domain": "food" },
-      { "bvid": "BV13CiqBLEwt", "domain": "game" },
-      { "bvid": "BV1Ev4y1A7EC", "domain": "game" },
-      { "bvid": "BV1TcKuzKE7n", "domain": "life" },
-      { "bvid": "BV1eV4y127FP", "domain": "life" },
-      { "bvid": "BV1ZJ9CY4EzR", "domain": "science" },
-      { "bvid": "BV1quVd6DEA2", "domain": "science" },
-      { "bvid": "BV1MNYy6WEgY", "domain": "animation" }
+      {
+        "bvid": "BV1s8aA6wEwb",
+        "domain": "history"
+      },
+      {
+        "bvid": "BV1h6HQ6pEd5",
+        "domain": "history"
+      },
+      {
+        "bvid": "BV1Enpxz5Ef3",
+        "domain": "tech"
+      },
+      {
+        "bvid": "BV1BG4y137mG",
+        "domain": "tech"
+      },
+      {
+        "bvid": "BV1nE411R7CS",
+        "domain": "tech"
+      },
+      {
+        "bvid": "BV15p4y1d7am",
+        "domain": "food"
+      },
+      {
+        "bvid": "BV1CG411w74X",
+        "domain": "food"
+      },
+      {
+        "bvid": "BV1ZbKVzaEg5",
+        "domain": "food"
+      },
+      {
+        "bvid": "BV13CiqBLEwt",
+        "domain": "game"
+      },
+      {
+        "bvid": "BV1Ev4y1A7EC",
+        "domain": "game"
+      },
+      {
+        "bvid": "BV1TcKuzKE7n",
+        "domain": "life"
+      },
+      {
+        "bvid": "BV1eV4y127FP",
+        "domain": "life"
+      },
+      {
+        "bvid": "BV1ZJ9CY4EzR",
+        "domain": "science"
+      },
+      {
+        "bvid": "BV1quVd6DEA2",
+        "domain": "science"
+      },
+      {
+        "bvid": "BV1MNYy6WEgY",
+        "domain": "animation"
+      }
     ]
   },
   "style": {
     "enabled": false,
     "record": false
+  },
+  "affection": {
+    "enabled": true,
+    "start": 30,
+    "checkinBase": 0.5,
+    "streakMulMax": 2.0,
+    "streakCapDays": 30,
+    "praiseGain": 1.0,
+    "praiseCooldownMs": 14400000,
+    "insultPenalty": 0.5,
+    "insultDailyMax": 3,
+    "insultWeeklyThreshold": 5,
+    "decayPerDay": 1.2,
+    "decayFloor": 20,
+    "dailyGainCap": 10,
+    "splitChars": 30,
+    "splitMaxParts": 2
   }
 }

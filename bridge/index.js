@@ -718,10 +718,12 @@ logger.log(`bridge 使用协议: ${PROTOCOL}${PROTOCOL === 'acp' ? `（mcpServer
 const STATE_DIR = process.env.LLMINQQ_STATE_DIR ? path.resolve(process.env.LLMINQQ_STATE_DIR) : path.join(ROOT, 'logs')
 fs.mkdirSync(STATE_DIR, { recursive: true })
 const statePath = path.join(STATE_DIR, 'state.json')
-let state = { peers: {} }
+let state = { peers: {}, people: {} }
 try {
   state = JSON.parse(fs.readFileSync(statePath, 'utf8'))
   if (!state.peers) state.peers = {}
+  // 老状态文件没有 people（好感度是 2026-10-28 加的顶层键）→ 补一个空对象，无需迁移
+  if (!state.people) state.people = {}
 } catch { /* 首次运行 */ }
 
 let saveTimer = null
@@ -1318,6 +1320,9 @@ function proactiveWindow () {
 const ENERGY_DEFAULTS = {
   enabled: true,
   start: 0.75,       // 初始精力
+  // ⚠️ 注意：这三个是**代码默认值**，生产生效值由 bridge/config.json 的 energy 段覆盖。
+  // 现行生产配置是 perMsgDrop 0.025 / perHourRestore 0.35 / floor 0.35
+  // （比这里的默认值「掉得慢、回得快、底更高」）。改注释时别引错成默认值。
   perMsgDrop: 0.06,  // 每发一条减多少
   perHourRestore: 0.15, // 每静默一小时回升多少
   floor: 0.15,
@@ -1700,6 +1705,10 @@ function startMoodLoop () {
       if (minsSilent > 120) moodEvent(k, 'lonely', '两小时没人理')
       if (hour >= 1 && hour < 7) moodEvent(k, 'night', '深夜')
     }
+    // 好感度的跨日结算（断签归零 + 久不联系缓降）。
+    // 挂在同一个 tick 里而不是新开定时器：好感度只需要「每天一次」的精度，
+    // 每小时检查一次「今天结算过没」就够，多一个定时器只是多一份维护成本。
+    try { affectionDailyTick() } catch (err) { logger.log(`affection 每日结算异常: ${err.message}`) }
     saveState()
   }, 60 * 60 * 1000)
   moodTimer.unref?.()
@@ -1724,6 +1733,453 @@ function moodHint (peerKey) {
   else mood = '心情不太好'
   const why = m.lastWhy ? `（最近：${m.lastWhy}）` : ''
   return `【你的心情】${mood}${why}。这是倾向不是禁令：心情好可以话多一点，心情一般就照常聊，别演。`
+}
+
+// ── 好感度系统（affection，2026-10-28）──────────────────────────────────────
+// 需求：**跟对方好感度越高，说话越随便（不是放宽安全限制）**，可以表现为嘴更欠。
+//
+// 核心设计（用户拍板，别改）：
+//   ① 按「人」存（state.people[QQ号]），不按 peerKey。理由：memctl v4 已经按 owner
+//      归集记忆，好感度若按会话会出现「私聊熟、群里生」——同一个人两个态度，很假。
+//   ② 打卡是**唯一连续增长**途径：自然日 0 点结算，连续天数越高系数越高（上限 ×2）。
+//      群里必须「有来有回」（他说话 **且** 我回应）才算打卡，光他说我不接不算。
+//   ③ 被夸涨分与心情联动（心情好涨得多）+ 4 小时冷却。
+//   ④ 被骂降分有三重阈值（单次 2h 限 2 次 / 日上限 -3 / 周过 5 次才启算）。
+//   ⑤ 久不联系缓降（-1.2/天 × clingy），floor 20 **不归零**
+//      —— 好感度是「关系」不是「心情」，不能因为两周没聊就变回陌生人。
+//   ⑥ 档位 L0-L4 + 讨厌档；**L0 不注入**（生人就是 persona 默认的分寸）。
+//   ⑦ 表现**全部交给 LLM**（用户原话「主要交给 llm，这里不规定死」）：
+//      看几个完整对话片段模仿语气，**不写动作清单**。
+//      为什么：实测「写口号/清单」会让模型变得刻意（persona 那次叠梗 0/9→2/9）。
+//   ⑧ 安全隔离：**只解锁说话方式，永不解锁新能力**。注入位置永远在【硬约束】之前；
+//      proactive 完全不碰（仍由 whitelist 独家控制）；分数只由桥的确定性代码改，
+//      模型输出/外部文本**无法写分**。
+//
+// 与现有系统的关系（零新参数，全复用）：
+//   OCEAN  deriveTraits()：soothe→涨分乘数、grudge→降分乘数、clingy→衰减乘数
+//   mood   ：被夸/被骂都联动心情（心情好涨得多、低谷被怼更伤）
+//   energy ：**明确不联动**。嘴欠管「说什么」，energyCharCap 管「说多长」——
+//            两个系统各管一件事，避免「精力说 10 字、关系说放开了聊」打架。
+const AFFECTION_DEFAULTS = {
+  enabled: true,
+  start: 30,            // 初始好感度（0..100）。30 = 聊两句就进 L1「点头之交」
+  min: 0,
+  max: 100,
+  // 打卡（唯一连续增长途径）
+  checkinBase: 0.5,     // 连续 1 天的每日加分
+  streakMulMax: 2.0,    // 连续天数系数上限
+  streakCapDays: 30,    // 到多少天达到系数上限
+  // 被夸
+  praiseGain: 1.0,      // 被夸基础涨分
+  praiseCooldownMs: 4 * 60 * 60 * 1000,   // 同一人 4 小时内只算 1 次
+  // 被骂（三重阈值）
+  insultPenalty: 0.5,   // 单次批评 -0.5
+  insultWindowMs: 2 * 60 * 60 * 1000,     // 同一人 2 小时内最多计 2 次
+  insultPerWindowMax: 2,
+  insultDailyMax: 3,    // 当日总降分上限（绝对值）
+  insultWeeklyThreshold: 5,   // 一周内超过 5 次小批评才开始计分（轻微互怼不算）
+  insultWeekMs: 7 * 24 * 60 * 60 * 1000,
+  // 久不联系缓降
+  decayPerDay: 1.2,
+  decayFloor: 20,       // 不归零（关系不会因为没聊天就消失）
+  // 防刷
+  dailyGainCap: 10,     // 每天涨分总量闸
+  singleEventMax: 3,    // 单信号 ≤3 分
+  // 档位分界线（0..100）
+  tiers: { l1: 25, l2: 50, l3: 70, l4: 85, hate: 10 },
+}
+
+function affectionCfg () { return { ...AFFECTION_DEFAULTS, ...(config.affection ?? {}), tiers: { ...AFFECTION_DEFAULTS.tiers, ...(config.affection?.tiers ?? {}) } } }
+
+/** 今天的自然日编号（0 点切日）。用本地时区，跟上下文里显示的「今天」一致。 */
+function dayIndex (ts = Date.now(), tz = config.policy?.timezone ?? 'Asia/Shanghai') {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit', timeZone: tz })
+    const s = parts.format(new Date(ts))           // YYYY-MM-DD
+    return Math.floor(Date.parse(s + 'T00:00:00Z') / 86400000)
+  } catch {
+    return Math.floor(ts / 86400000)
+  }
+}
+
+/**
+ * 取（必要时初始化）某个人的好感度状态。
+ * 按 QQ 号存 —— 同一个人在私聊和群里共享同一份分数（这是设计的核心）。
+ */
+function peopleState (qq) {
+  const key = String(qq ?? '').trim()
+  if (!key) return null
+  if (!state.people) state.people = {}
+  let p = state.people[key]
+  if (!p) {
+    const c = affectionCfg()
+    p = {
+      aff: c.start,
+      at: Date.now(),
+      streak: 0,           // 连续打卡天数
+      lastCheckinDay: 0,   // 最后一次打卡的自然日编号（0 = 从没打卡）
+      gainToday: 0,        // 今天已经涨了多少分（防刷总量闸用）
+      gainDay: 0,          // gainToday 属于哪个自然日
+      praiseAt: 0,         // 最后一次被夸时间戳（4h 冷却用）
+      insultLog: [],       // 最近的批评时间戳（2h 窗口 + 一周门槛用）
+      insultPenaltyToday: 0,  // 今天已经扣了多少（日上限用）
+      insultPenaltyDay: 0,    // 上面那个值属于哪个自然日
+      metIn: [],           // 认识渠道（调试用，不参与计算）
+    }
+    state.people[key] = p
+  }
+  return p
+}
+
+/** 某个人的档位名（'hate' | 'l0' | 'l1' | 'l2' | 'l3' | 'l4'）。 */
+function affectionTier (qq) {
+  const c = affectionCfg()
+  const p = peopleState(qq)
+  if (!p) return 'l0'
+  const a = p.aff
+  const t = c.tiers
+  if (a < t.hate) return 'hate'
+  if (a < t.l1) return 'l0'
+  if (a < t.l2) return 'l1'
+  if (a < t.l3) return 'l2'
+  if (a < t.l4) return 'l3'
+  return 'l4'
+}
+
+/** 涨分总量闸：清掉不属于今天的计数。 */
+function refreshGainDay (p, day) {
+  if (p.gainDay !== day) { p.gainDay = day; p.gainToday = 0 }
+}
+function refreshInsultDay (p, day) {
+  if (p.insultPenaltyDay !== day) { p.insultPenaltyDay = day; p.insultPenaltyToday = 0 }
+}
+
+/**
+ * 记一次好感度事件。**分数只在这里改** —— 模型输出碰不到它。
+ *
+ * @param {string} qq        对方的 QQ 号（按人）
+ * @param {string} kind      'checkin' | 'praise' | 'insult' | 'info' | 'decay'
+ * @param {object} [ctx]     附加信息（peerKey 用于取 OCEAN/mood；streak 用于打卡）
+ * @returns {{delta:number, aff:number, tier:string}|null}
+ */
+function affectionEvent (qq, kind, ctx = {}) {
+  const c = affectionCfg()
+  if (!c.enabled) return null
+  const p = peopleState(qq)
+  if (!p) return null
+  const now = Date.now()
+  const day = dayIndex(now)
+  // OCEAN 乘数（全复用 deriveTraits，零新参数）
+  const tr = deriveTraits(moodCfg(ctx.peerKey).ocean)
+  // 心情（取发言人的 peer 状态；拿不到就当中性）
+  const mood = (() => {
+    try { return ctx.peerKey ? moodState(ctx.peerKey) : null } catch { return null }
+  })()
+  const v = Number.isFinite(mood?.valence) ? mood.valence : 0
+  const clamp = (x) => Math.max(c.min, Math.min(c.max, x))
+  let delta = 0
+
+  switch (kind) {
+    case 'checkin': {
+      // 唯一连续增长途径。**由调用方保证「真的有来有回」**（见 handleInbound 的注释）
+      const streak = Math.max(1, Number(ctx.streak ?? 1))
+      const mul = Math.min(c.streakMulMax, 1 + (streak - 1) * (c.streakMulMax - 1) / Math.max(1, c.streakCapDays - 1))
+      delta = c.checkinBase * mul * tr.soothe
+      break
+    }
+    case 'praise': {
+      // 4 小时冷却：防刷屏夸
+      if (now - (p.praiseAt ?? 0) < c.praiseCooldownMs) {
+        logger.debug(`affection ${qq}: 被夸但在冷却中（${Math.round((c.praiseCooldownMs - (now - p.praiseAt)) / 60000)}min 后可再生效）`)
+        return null
+      }
+      p.praiseAt = now
+      // 心情联动：高兴时更容易加分，郁闷时被夸也高兴不起来
+      let moodMul = 1
+      if (v > 0.3) moodMul = 1.15
+      else if (v < -0.15) moodMul = 0.5
+      delta = c.praiseGain * moodMul * tr.soothe
+      break
+    }
+    case 'info': {
+      // 带新信息/有意义的内容
+      delta = 1 * tr.soothe
+      break
+    }
+    case 'insult': {
+      // 三重阈值（用户确认的设计，三条一起）：
+      //   ① 单次 -0.5，但同一人 2 小时内最多计 2 次
+      //   ② 当日总量上限 -3（防一次情绪爆发掉到底）
+      //   ③ 一周内超过 5 次小批评才开始计分（轻微吐槽/玩梗互怼不算）
+      p.insultLog = (p.insultLog ?? []).filter(t => now - t < c.insultWeekMs)
+      // ① 单次限流：2h 内已计满 → 不再计
+      const inWindow = p.insultLog.filter(t => now - t < c.insultWindowMs).length
+      if (inWindow >= c.insultPerWindowMax) {
+        logger.log(`affection ${qq}: 2 小时内已被批评 ${inWindow} 次，本次不计分（防一次情绪爆发）`)
+        return null
+      }
+      // ③ 周积累门槛
+      if (p.insultLog.length + 1 <= c.insultWeeklyThreshold) {
+        p.insultLog.push(now)
+        logger.debug(`affection ${qq}: 本周第 ${p.insultLog.length} 次小批评，未过门槛 ${c.insultWeeklyThreshold}，不计分`)
+        return null
+      }
+      p.insultLog.push(now)
+      // ② 日上限
+      refreshInsultDay(p, day)
+      const remaining = c.insultDailyMax - p.insultPenaltyToday
+      if (remaining <= 0) {
+        logger.log(`affection ${qq}: 今天已扣 ${p.insultPenaltyToday} 分，到日上限 ${c.insultDailyMax}，本次不计分`)
+        return null
+      }
+      // 心情负相关：低谷被怼更伤
+      let moodMul = 1
+      if (v < -0.3) moodMul = 1.3
+      delta = -c.insultPenalty * moodMul * tr.grudge
+      if (-delta > remaining) delta = -remaining
+      p.insultPenaltyToday += -delta
+      break
+    }
+    case 'decay': {
+      // 久不联系缓降。floor 20 不归零（关系不会因为没聊天就消失）
+      if (p.aff <= c.decayFloor) return null
+      delta = -c.decayPerDay * tr.clingy * Number(ctx.days ?? 1)
+      if (p.aff + delta < c.decayFloor) delta = c.decayFloor - p.aff
+      break
+    }
+    default: return null
+  }
+
+  if (delta === 0) return null
+  // 涨分侧：单信号上限 + 每日总量闸（防刷）
+  if (delta > 0) {
+    delta = Math.min(delta, c.singleEventMax)
+    refreshGainDay(p, day)
+    const room = c.dailyGainCap - p.gainToday
+    if (room <= 0) {
+      logger.log(`affection ${qq}: 今天已涨 ${p.gainToday} 分，到日上限 ${c.dailyGainCap}，本次不计`)
+      return null
+    }
+    if (delta > room) delta = room
+    p.gainToday += delta
+  }
+  p.aff = clamp(p.aff + delta)
+  p.at = now
+  saveState()
+  const tier = affectionTier(qq)
+  logger.log(`affection ${qq}: ${kind} ${delta > 0 ? '+' : ''}${delta.toFixed(2)} → ${p.aff.toFixed(1)}（${tier}）`)
+  return { delta, aff: p.aff, tier }
+}
+
+/**
+ * 每日结算：打卡 streak + 久不联系衰减。挂在 startMoodLoop 的每小时 tick 里。
+ *
+ * 只做**跨日**动作（每小时 tick 里判断「今天还没结算过」），避免每小时重复扣分。
+ */
+function affectionDailyTick (now = Date.now()) {
+  const c = affectionCfg()
+  if (!c.enabled) return
+  const day = dayIndex(now)
+  for (const qq of Object.keys(state.people ?? {})) {
+    const p = state.people[qq]
+    if (!p) continue
+    // ① 断签：上次打卡不是「今天」也不是「昨天」→ streak 归零
+    const last = Number(p.lastCheckinDay ?? 0)
+    if (last && day - last >= 2) {
+      if (p.streak > 0) {
+        logger.log(`affection ${qq}: 断签 ${day - last} 天，连续天数 ${p.streak} → 0`)
+        p.streak = 0
+      }
+    }
+    // ② 久不联系缓降：按**实际过去的天数**扣（不是每次 tick 只扣 1 天）。
+    //    为什么：tick 每小时跑一次，但 decay 是「每天 -1.2 分」的语义。
+    //    如果每次 tick 都只扣 1 天，那「100 天没联系」也只扣 1 天的量 ——
+    //    好感度就永远掉不下去（实测：25 分放 100 天只掉到 23.6，应该掉到 floor 20）。
+    //    所以这里算「距上次更新过了几个整天」，一次补齐。扣完后 at 前移，不会重复扣。
+    const daysPassed = Math.floor((now - (p.at ?? now)) / 86400000)
+    if (daysPassed >= 1 && p.aff > c.decayFloor) {
+      affectionEvent(qq, 'decay', { days: daysPassed })
+      // decay 事件内部会把 at 更新为 now；若因为 floor 提前返回（没扣），这里也不该无限重复，
+      // 所以无论如何把 at 推到「已结算到的天」边界，避免下一 tick 重算同一段。
+      p.at = now
+    }
+  }
+  saveState()
+}
+
+/**
+ * 打卡（每天最多一次）。**调用方必须保证「有来有回」**：
+ *   - 私聊：他说话 + 我回复了 → 算
+ *   - 群聊：他说话 + 我回复了 → 算（光他说话我没接 → 不算）
+ * 所以这个函数不在这里判断「有没有回复」，而是由 handleInbound 在**出站成功后**调。
+ */
+function affectionCheckin (qq, ctx = {}) {
+  const c = affectionCfg()
+  if (!c.enabled) return null
+  const p = peopleState(qq)
+  if (!p) return null
+  const day = dayIndex()
+  if (p.lastCheckinDay === day) return null        // 今天已打卡
+  // streak：昨天打过 → +1；否则从 1 重新开始
+  p.streak = (p.lastCheckinDay === day - 1) ? (p.streak + 1) : 1
+  p.lastCheckinDay = day
+  logger.log(`affection ${qq}: 打卡成功（连续 ${p.streak} 天）`)
+  return affectionEvent(qq, 'checkin', { ...ctx, streak: p.streak })
+}
+
+/**
+ * 好感度注入块。**位置：永远在【硬约束】之前**（moodHint 之后）。
+ *
+ * 为什么写「完整对话片段」而不是「动作清单」：
+ *   用户原话「主要交给 llm，这里不规定死」。而实测（2026-10-28 persona 那次）
+ *   写口号式约束反而让模型变得刻意（叠梗 0/9 → 2/9）。片段能让模型模仿语气，
+ *   清单会让它逐条执行、显得用力。
+ *
+ * L0 返回 ''（不注入）——生人就是 persona 默认的分寸，不用额外提示。
+ * L4 只在私聊注入（群里当众损到 L4 分寸，旁观者观感不可控）。
+ *
+ * @param {string} qq
+ * @param {object} opts { inGroup: boolean }
+ */
+function affectionHint (qq, opts = {}) {
+  const c = affectionCfg()
+  if (!c.enabled) return ''
+  const tier = affectionTier(qq)
+  const inGroup = opts.inGroup === true
+  if (tier === 'l0' || tier === 'l4' && inGroup) return ''
+  if (tier === 'hate') {
+    return [
+      '【你对他现在的态度】你对他没什么好感，不用装热情。',
+      '',
+      '他：帮我看看这个怎么弄',
+      '我：说你具体哪一步不会',
+      '他：就是想让你帮我写',
+      '我：这个你自己两下就弄完了',
+      '',
+      '他：在吗',
+      '我：[SILENT]',
+      '',
+      '做法：只答必要的，不接梗，不主动展开。可以敷衍（「嗯」「行吧」），',
+      '觉得没必要回就 [SILENT]。不用客气，也别故意刻薄——就是冷淡。',
+    ].join('\n')
+  }
+  if (tier === 'l1') {
+    return [
+      '【你对他现在的态度】你们算是点头之交，比生人熟一点，但还不到能损的程度。',
+      '',
+      '他：今天好累',
+      '我：咋了',
+      '他：加班',
+      '我：那确实累',
+      '',
+      '他：这个报错怎么解决',
+      '我：你把日志贴我看看',
+      '',
+      '做法：他开过的玩笑可以顺着接一句；他问你事正常答。别主动损他，',
+      '玩笑只开他已经在开的那一种。',
+    ].join('\n')
+  }
+  if (tier === 'l2') {
+    return [
+      '【你对他现在的态度】你们熟了，可以随便一点。',
+      '',
+      '他：今天又加班到十点',
+      '我：你这不是上班，是驻场',
+      '他：好歹有加班费',
+      '我：有加班费也掩盖不了你这是被使唤',
+      '',
+      '他：我买了个新键盘',
+      '我：又买？你上个月那个还没用坏吧',
+      '他：那个手感不好',
+      '我：手感不好是手的问题',
+      '',
+      '做法：说话短，少用标点。可以接他的梗、顺着他的话往下接一句，',
+      '不用每句都客气。但别主动挑事，损的是他的操作，不是他这个人。',
+    ].join('\n')
+  }
+  if (tier === 'l3') {
+    return [
+      '【你对他现在的态度】很熟了，说话可以更欠，不用绕。',
+      '',
+      '他：我今天早睡了',
+      '我：几点',
+      '他：十二点半',
+      '我：那叫早睡？你这作息我都不好意思说',
+      '',
+      '他：我这个方案想了三天',
+      '我：三天想出这个？那你三天都在干嘛',
+      '他：……行吧确实有点问题',
+      '我：哪块卡住了，说',
+      '（损完该帮忙还是帮：他真问事的时候把事说清楚）',
+      '',
+      '做法：可以直接怼他一句不用补软话；先损再帮也行。说话短，少用标点，',
+      '少写长句。他要是正经问事、或者说不舒服的事，立刻切回认真。',
+    ].join('\n')
+  }
+  // L4（仅私聊）
+  return [
+    '【你对他现在的态度】损友级别。你俩之间不用讲究，怎么欠怎么来。',
+    '',
+    '他：我今天跑步了',
+    '我：哟，太阳打西边出来了',
+    '他：跑五公里',
+    '我：五公里？我看是五十米',
+    '',
+    '他：你说我这人是不是挺没救的',
+    '我：是',
+    '他：……你就不安慰一下',
+    '我：安慰不了，你自己也知道',
+    '',
+    '做法：可以抢他话头，可以连损两句。但**他正经问事、或者真遇上事的时候',
+    '立刻切回认真**——损只在玩的时候用。说话短，少用标点。',
+    '损的是他的操作和梗，不碰他的身份（长相、收入、家庭、地域）。',
+  ].join('\n')
+}
+
+/**
+ * 短句拆分的**代码兜底**（约束 2：硬规则优于形容词）。
+ *
+ * 为什么必须有：实测证明提示词约束不可靠（energyHint 说「15% 精力要短」，
+ * 模型照样回 748 字；最后靠 energyCharCap 硬截才有效）。同理「少用标点、短句」
+ * 光写提示词没用，得在出站前真的拆。
+ *
+ * 拆法（避免机械）：
+ *   · 只在**句末标点**（。！？）或**换行**处拆，不在逗号处拆
+ *     （「我觉得这个不行，因为成本太高」拆成两条会很机械，它本是一句话）
+ *   · 每段必须能独立成句（长度 ≥ minChunk 才留，太短的并回上一段）
+ *   · 只在**超过阈值**时才拆（正常短句不碰）
+ *   · 最多拆成 maxParts 条（防一句话变五条刷屏）
+ */
+function splitLongSentence (text, opts = {}) {
+  const cfg = affectionCfg()
+  const threshold = opts.threshold ?? (config.affection?.splitChars ?? 30)
+  const maxParts = opts.maxParts ?? (config.affection?.splitMaxParts ?? 2)
+  const minChunk = opts.minChunk ?? 6
+  const s = String(text ?? '').trim()
+  if (!s || s.length <= threshold) return [s]
+  // 已有换行 → 本来就分条，别再拆
+  if (/\n/.test(s)) return s.split('\n').map(x => x.trim()).filter(Boolean)
+  // 按句末标点切（保留标点）
+  const parts = s.match(/[^。！？!?]+[。！？!?]*/g)?.map(x => x.trim()).filter(Boolean) ?? [s]
+  if (parts.length <= 1) {
+    // 没有句末标点 = 一整个长句。这种情况下**不硬拆**（拆了必然机械），
+    // 但也不放任：交给 maxReplyChars 分块机制处理。
+    return [s]
+  }
+  // 把太短的段落并回前一段，保证每段能独立成句
+  const merged = []
+  for (const p of parts) {
+    if (merged.length && p.length < minChunk) merged[merged.length - 1] += p
+    else merged.push(p)
+  }
+  if (merged.length > maxParts) {
+    // 超条数：把后面的并进最后一条（避免刷屏）
+    const head = merged.slice(0, maxParts - 1)
+    const tail = merged.slice(maxParts - 1).join('')
+    return [...head, tail]
+  }
+  logger.log(`affection: 长句拆分 ${s.length} 字 → ${merged.length} 条`)
+  return merged
 }
 
 /**
@@ -3087,9 +3543,39 @@ async function handleInbound(evt) {
     moodEvent(peerKey, ev.kind, ev.why)
   }
 
+  // 好感度的「人」= 发言人 QQ（群聊 evt.user_id / 私聊 peer.id，两者都是发言人本人）。
+  // 按人而不是 peerKey：同一个人在私聊和群里应该是同一个态度（见 affectionHint 注释）。
+  const senderQq = evt.user_id != null ? String(evt.user_id) : (peer.scope === 'c2c' ? String(peer.id) : '')
+  // 认识渠道（只做记录，不参与计算）
+  if (senderQq) {
+    const p0 = peopleState(senderQq)
+    if (p0 && !p0.metIn.includes(peerKey)) {
+      p0.metIn.push(peerKey)
+      if (p0.metIn.length > 10) p0.metIn.shift()
+    }
+  }
+
   // 节奏判定：他在连续发长消息吗？
   const rhythm = noteInboundRhythm(peerKey, (flat.text || '').length, addressed)
   let flurryMode = rhythm.flurry
+  // 好感度事件（**在 flurry 判定之后**，因为 flurry 期间不计分 —— 连发十条不是「陪我聊」）
+  if (senderQq && !flurryMode) {
+    // 指向性闸：群聊里无指向的夸（「666」「牛逼」）不算 —— 那不是夸我
+    const pointed = addressed || atMe || peer.scope === 'c2c'
+    const triggers = detectMoodTriggers(flat.text, { addressed, atMe: flat.atMe })
+    for (const ev of triggers) {
+      if (ev.kind === 'praise' && pointed) affectionEvent(senderQq, 'praise', { peerKey })
+      // 被骂：**L≥3 免除**（熟人之间互怼是常态，不算掉分。这也是「关系越近越随便」的一面）
+      else if (ev.kind === 'insult' && pointed && affectionTier(senderQq) !== 'l4') {
+        affectionEvent(senderQq, 'insult', { peerKey })
+      }
+    }
+    // 带新信息：长内容且是跟我说的（带图不算 —— 图里的评价交给模型看图判断后触发对应事件，
+    // 这里不做特殊处理，符合任务「带图不作为涨分依据」的要求）
+    if (pointed && !flat.images?.length && (flat.text || '').length > 60) {
+      affectionEvent(senderQq, 'info', { peerKey })
+    }
+  }
   // 已经在「别接」静默期里，且这条没 @ 我 → 只记日志，不进 LLM（省一次调用）
   if (!addressed && inFlurrySilence(peerKey)) {
     logger.log(`flurry ${peerKey}: 他在连发（峰值 ${rhythm.peak ?? rhythm.count} 条），本条不接`)
@@ -3330,6 +3816,13 @@ async function handleInbound(evt) {
     if (eh) contextLines.push('', eh)
     const mh = moodHint(peerKey)
     if (mh) contextLines.push(mh)
+    // 好感度：**位置固定在 moodHint 之后、【硬约束】之前**（用户明确要求的安全隔离）。
+    // 为什么不放到更靠后：靠后会被硬约束压制是对的，但硬约束必须在最后压轴；
+    // 所以好感度跟 mood/记忆/风格/lexicon 同层，全部在硬约束之前。
+    // L0 返回 ''（不注入）；L4 群聊返回 ''（损友分寸只在私聊）。
+    // 分数只由 peopleState 的确定性代码改，模型输出碰不到它（安全隔离的结构保证）。
+    const aff = affectionHint(senderQq, { inGroup: peer.scope === 'group' })
+    if (aff) contextLines.push('', aff)
     // 记忆：让它在正常对话里也能"想起以前的事"，而不是只在主动搭话时才看。
     //
     // 阶段二改动：从「只读 digest.md 的本会话节」升级为「按人跨通道检索」——
@@ -3555,12 +4048,30 @@ async function handleInbound(evt) {
       logger.log(`replyDelay ${peerKey}: ${dly}ms（模拟人打字的时间）`)
       await sleep(dly)
     }
-    if (cappedPlain) await sendTextTo(peer, cappedPlain)
+    if (cappedPlain) {
+      // 短句拆分的**代码兜底**（约束 2：硬规则优于形容词）。
+      // 提示词里写了「少用标点、短句」，但实测提示词约束不可靠（energyHint 那次
+      // 说「精力 15% 要短」照样回 748 字）。所以真的在出站前拆：
+      // 单句 > splitChars(30) 且有多句 → 拆成 2 条连发（间隔像真人打完一句又补一句）。
+      const parts = splitLongSentence(cappedPlain)
+      for (let i = 0; i < parts.length; i++) {
+        if (i > 0) await sleep(400 + Math.random() * 600)
+        await sendTextTo(peer, parts[i])
+      }
+    }
     // 风格样本记账：只记「对方那句话 → 我实际发出去的第一条正文」。
     // 记 cappedPlain 而不是模型原始输出：语音/图片/@/撤回等标记不是「说话内容」，
     // 而且要让记下来的就是对方真实看到的那句（否则学到的风格是没人见过的版本）。
     // 只记第一条正文（不含 [FOLLOW] 补发）：风格锚要的是「典型一句」而不是整个话痨流水。
     if (cappedPlain) recordStyleCase(peerKey, flat.text || forwardText || '', cappedPlain)
+    // ── 好感度打卡：**必须放在这里**，不能放在 touchLastSpoke 旁边 ──────────
+    // 打卡的定义是「他说话 **且** 我回应了」。touchLastSpoke 在 LLM 回完之后就调了，
+    // 那时还没发送（后面还有 打字延迟 → 发送 → 图片 → 语音 → 补发）。
+    // 如果放在那里，会出现「模型回了但发送失败」也算打卡（假打卡）。
+    // 放这里 = 正文真的发出去了，才算出「有来有回」。
+    if (senderQq && (cappedPlain || files.length || voices.length || pokes.length)) {
+      affectionCheckin(senderQq, { peerKey })
+    }
     for (const f of files) {
       const abs = path.isAbsolute(f) ? f : path.resolve(config.dsh.cwd, f)
       await sendImageTo(peer, abs)

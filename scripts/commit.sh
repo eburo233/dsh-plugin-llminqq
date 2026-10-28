@@ -38,6 +38,8 @@ SUITES=(
   style-bank memory-cross-channel lexicon message-queue chat-follow
   # 官方 QQ Bot 适配层：纯函数，不连网不读凭据，所以能安全进每次提交的测试
   official-bot
+  # 好感度：抠源码求值 + 假时钟，不读生产 state.json，能安全进每次提交的测试
+  affection
   # 语料池抓取：离线（假 python）、不真请求 B站，所以能安全进每次提交的测试
   crawl-bili-comments
 )
