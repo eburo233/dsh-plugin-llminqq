@@ -1,0 +1,53 @@
+{
+  "name": "dsh-plugin-llminqq",
+  "version": "0.5.0",
+  "description": "让 LLM 接管一个真实 QQ 号：NapCat(OneBot 11) 桥 + 设置页（扫码登录 / 模型路由 / 降级链 / 人格 / 策略）",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client.js",
+    "vendor",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md",
+    "THIRD-PARTY-NOTICES.md",
+    "INSTALL-PLUGIN.md",
+    "DESKTOP.md",
+    "update-windows.ps1",
+    "where-is-loaded.ps1",
+    "find-all-copies.ps1"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  }
+}

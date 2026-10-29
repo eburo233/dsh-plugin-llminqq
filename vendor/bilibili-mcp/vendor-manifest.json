@@ -1,0 +1,28 @@
+{
+  "name": "bilibili-mcp",
+  "version": "embedded-in-dsh-bili-scroll@2.3.0",
+  "source": {
+    "type": "vendored-from-npm-package",
+    "package": "dsh-bili-scroll",
+    "version": "2.3.0",
+    "path": "vendor/bilibili-mcp"
+  },
+  "upstream": "https://github.com/c1overzz/dsh-bili-scroll",
+  "license": "MIT",
+  "author": "AGI_Ananas (bilibili-mcp), c1overzz (dsh-bili-scroll)",
+  "purpose": "B站工具组：搜索/字幕/评论/封面/视频帧等 20+ MCP 工具（Python，需 venv）",
+  "files": [
+    "mcp_server.py",
+    "requirements.txt",
+    "LICENSE",
+    "README.md"
+  ],
+  "adaptations": [
+    "零改动（原样复制）"
+  ],
+  "upgradeNotes": [
+    "它没有独立 npm 发布，只能从 dsh-bili-scroll 的 vendor/bilibili-mcp/ 里取",
+    "不要复制 __pycache__（Python 字节码缓存，跟平台/Python 版本绑定，进包会变大且可能失效）",
+    "替换后重跑 test/bilibili-mcp.test.mjs（如果有）；至少确认 mcp_server.py 能 --help 起来"
+  ]
+}

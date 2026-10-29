@@ -1,0 +1,31 @@
+{
+  "name": "dsh-video-storyboard",
+  "version": "0.4.4",
+  "source": {
+    "type": "npm",
+    "package": "dsh-video-storyboard",
+    "registry": "https://registry.npmjs.org"
+  },
+  "upstream": "https://github.com/SAOS-3624/dsh-video-storyboard",
+  "license": "MIT",
+  "author": "SAOS-3624",
+  "purpose": "看长视频：把整片压成一张带编号+时间戳的宫格图（成本约一张图的 token），配合 video_probe 先探测再决定要不要跑",
+  "files": [
+    "src/",
+    "bin/",
+    "package.json",
+    "README.md",
+    "LICENSE",
+    "CREDITS.md",
+    "NOTICE"
+  ],
+  "adaptations": [
+    "删除 src/index.js（dsh 插件入口，依赖 @deepseek-ai/dsh-tools，本项目只当独立 CLI 用）",
+    "不带入 cordis.patch.yml / dsh.plugin.json / docs/ / scripts/ / README.zh.md / README.en.md / CHANGELOG.md（dsh 插件元数据与文档，运行不需要）"
+  ],
+  "upgradeNotes": [
+    "升级前先 grep -rn \"@deepseek\" src/ bin/ 确认新版的 src/*、bin/* 仍零 dsh 硬依赖（命中应只有注释）",
+    "确认 src/index.js 仍是叶子模块（CLI 链路 bin/*.mjs 不 import 它）后再删除",
+    "替换后必须重跑 test/storyboard-mcp.test.mjs"
+  ]
+}

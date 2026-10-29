@@ -1,0 +1,16 @@
+node_modules/
+logs/
+*.log
+_dist/
+.preview/
+__pycache__/
+*.pyc
+.venv/
+venv/
+state/
+*.db
+*.db-
+.DS_Store
+Thumbs.db
+dist/
+*.zip

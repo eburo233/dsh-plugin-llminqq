@@ -1,0 +1,12 @@
+# dsh-plugin-llminqq bundle patch
+#
+# 「可热挂载」：insert(id/name) 不写死任何机器相关的路径/凭据，
+# 所以同一个 patch 在任何机器上都能用。配置全部由插件在运行时读写
+# ~/.dsh/dsh-plugin-llminqq/（设置页改的就是那个），或从宿主注入。
+#
+# 为什么不在 patch 里写 config（历史教训，来自 dsh-expression）：
+#   patch 里硬编码某台机器的目录/账号，别人装上后指向不存在的路径，
+#   插件直接起不来，而且报错看不出是「配置不适用于我」。
+- insert:
+    - id: dsh-plugin-llminqq
+      name: dsh-plugin-llminqq
