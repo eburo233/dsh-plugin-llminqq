@@ -1050,12 +1050,14 @@ window.__ModuleLoader__.load({
               })),
             h(Field, {
               label: 'OneBot Token',
-              sub: 'NapCat 网络配置里的 Token，没配就留空',
+              sub: 'NapCat 网络配置里的 Token；后端不回显真值，留空 = 不修改',
             },
               h(TextInput, {
-                value: cfg.onebot?.token || '',
+                // 后端把 token 打码成 ••••（见 lib/index.js maskConfigForUi）：
+                // 直接把点显示在输入框里既难看又容易被当成真值，这里只显示空 + 提示。
+                value: /^[•●*]+$/.test(String(cfg.onebot?.token || '')) ? '' : (cfg.onebot?.token || ''),
                 onCommit: v => saveConfig({ onebot: { token: v } }),
-                placeholder: '留空 = 不鉴权',
+                placeholder: cfg.onebot?.token ? '已配置（不回显）；留空 = 不修改' : '留空 = 不鉴权',
               })),
           ),
           h('div', { className: 'hint' },
@@ -1394,7 +1396,7 @@ window.__ModuleLoader__.load({
           ),
           h(Field, { label: '同一人最小回复间隔（毫秒）', sub: '防止对方连发时也跟着刷屏' },
             h(NumberInput, {
-              value: p.cooldownMsPerPeer ?? 800, min: 0, max: 60000,
+              value: p.cooldownMsPerPeer ?? 1500, min: 0, max: 60000,
               onCommit: v => saveConfig({ policy: { cooldownMsPerPeer: v } }),
             })),
           h(Field, { label: '时区' },

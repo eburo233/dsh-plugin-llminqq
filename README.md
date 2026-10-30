@@ -79,7 +79,7 @@ NapCat 负责登录 QQ 和收发消息，插件把消息交给配置好的模型
 4. 重启 `dsh --profile web`，刷新浏览器，打开 **设置 → QQ 通道**。启动日志应出现：
 
    ```
-   [llminqq] v0.5.1 已加载 · 代码在 <插件目录> · 数据目录 <数据目录>
+   [llminqq] v0.5.2 已加载 · 代码在 <插件目录> · 数据目录 <数据目录>
    [llminqq] 设置页 API 已挂载
    ```
 
@@ -94,6 +94,15 @@ NapCat 负责登录 QQ 和收发消息，插件把消息交给配置好的模型
 4. **人格页**：`persona.md` 决定它是谁、什么风格；默认骨架能用，建议改成你要的人设。
 5. **运行页 → 启动桥**。桥起来后日志会出现 `入站 ...` 行，说明消息真的进来了。
 6. **验证**：用另一个号给它发条私聊看有没有回；也可以让 agent 调 `qq_status`，一眼看到容器/登录/桥/模型四段状态。
+7. **自检**（可选，但出问题先跑它）：
+
+   ```bash
+   node scripts/verify.mjs              # 只读体检：桥在不在 / OneBot 在不在线 / 最近一次收发有多旧
+   node scripts/verify.mjs --kill-bridge # 额外验证「桥被杀后宿主会不会自己拉起来」
+   node scripts/verify.mjs --json       # 机器可读，贴 issue 时用
+   ```
+
+   每项 FAIL 都带一行「下一步查什么」；`skip` 是当前没有条件测（比如桥没跑，就没法测连续收发），不算问题。
 
 ## 数据放在哪
 
@@ -152,7 +161,7 @@ JSON-RPC（`protocol=dsh`）。
 
 1. `dsh --profile web --dump-config` 里有没有 `dsh-plugin-llminqq`；
 2. profile 的 `package.json` 里 `dsh.profile.bundles` 有没有它（有依赖不等于会加载）；
-3. 宿主启动日志有没有 `[llminqq] v0.5.1 已加载 ...`；
+3. 宿主启动日志有没有 `[llminqq] v0.5.2 已加载 ...`；
 4. 若只有 `[llminqq] webServer 不可用，设置页不挂载`，说明这个宿主没提供 web 设置能力
    （纯 CLI/桌面场景）—— 插件加载成功了、桥也能用，去 Web 端配置即可，配置和记忆共用同一份数据。
 

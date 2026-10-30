@@ -10,6 +10,54 @@
 
 暂无。
 
+## [0.5.2] - 2026-10-30
+
+0.5.1 之后把「已知但没做」的那批尾巴清掉了：传输层可靠性、工具调用权限可见性、
+结构拆分、以及一个能自动回答「消息到底回不回」的自检脚本。没有不兼容变更
+（限流默认值从 800ms 调到 1500ms，属于默认行为变化，0 仍是「关闭」）。
+
+### Added
+
+- **`scripts/verify.mjs`：装完之后的三件事自检**。`node scripts/verify.mjs` 只读体检
+  （桥在不在 / OneBot 在不在线 / 最近一次收发是什么时候、有多旧），
+  `--kill-bridge` 额外杀一次桥验证宿主的自动重启，`--json` 给 CI 用。
+  每一项 FAIL 都带一行「下一步查什么」。
+- **工具调用权限可配**：`config.security.toolPolicy`（`auto` / `allowlist` / `deny`）。
+  `auto` 是旧行为但**第一次自动批准时会打一条 WARN**，让人知道「QQ 里的人可以让模型跑本机工具」；
+  `allowlist` 只放行 `allowed` 里列出的工具名片段，`deny` 一律拒绝。
+- **Token 不再回显**：`/overview` 与 `GET /config` 返回的 `onebot.token` / `server.token`
+  变成掩码；`POST /config` 收到掩码值会当成「不修改」，不会把真凭据覆盖成星号。
+- **发送失败不再静默丢后半段**：桥的本地 API 有 1MB body 上限（超限 413），
+  `/send`、`/recall` 与入站消息走同一套 allowUsers/allowGroups 白名单。
+
+### Fixed
+
+- **OneBot 传输层**：`meta_event` 提前 `return` 让 `lifecycle` 分支成了死代码（现在可达）；
+  重连收敛到单一 `_openSocket()` 入口，旧 socket 的 close/message 会被忽略，不再叠加两条连接；
+  入站按 `message_id` 做 200 条环形去重。
+- **未连接时发送直接 reject**：`call()` 现在入队（上限 200、15s 超时），连上后按序 flush。
+- **`dsh.js` 的 prompt 超时**：30s 超时改 `Promise.race` 并清理全部 waiter，外层不再永挂。
+- **卡片展开的 SSRF**：`carddetail.js` 每跳先过 `checkUrlSafe`、`redirect: 'manual'` 最多跟 2 跳；
+  桥里把带用户配置的守卫注入进去（之前它只能用保守默认实例）。
+- **`bili-python` 硬编码 `D:/dsh-home`**：改为从 `LLMINQQ_DATA_DIR` / `DSH_HOME` / `dataDir()` 推导，
+  旧路径仅在真实存在时兜底。
+- **`scheduler` 卡 running 后再也不跑**：`try/catch/finally` 保证复位，`status()` 暴露
+  `lastError` / `lastDurationMs` / `skippedCount`；忙时跳过会记账而不是静默丢。
+- **`cooldownMsPerPeer` 默认 0 = 无限流**：默认改为 **1500ms**（0 仍表示关闭），
+  非负、上限 60s、非法值回落默认；`lib/store.js`、`lib/index.js`、`client.js` 三处默认值已对齐。
+
+### Changed
+
+- **`handleInbound` 拆分**：出站那一段（约 120 行）抽成 `deliverReply()`，
+  `chatFollowSpeak` / `proactiveSpeak` / `handlePoke` 三份重复的出站流水线合并成 `dispatchOutbound()`
+  —— 原来改一处发送逻辑要同步改三个地方，漏一个就是「某个入口不发消息」。
+- **能力探测彻底离开同步路径**：`probePython` 增加异步版 `probePythonAsync()`（进程内 inflight 合并 +
+  5 分钟缓存），启动预热改为异步填缓存，设置页轮询不再触发 `spawnSync`。
+
+### Tests
+
+- 177 个用例全绿（新增 onebot / dsh / carddetail / bili-python / scheduler / config / napcat 等单测）。
+
 ## [0.5.1] - 2026-10-30
 
 一次以「静默失效 / 崩溃 / 数据丢失 / 越权面」为主的修复发布，顺便把设置页轮询对
