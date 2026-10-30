@@ -79,7 +79,7 @@ NapCat 负责登录 QQ 和收发消息，插件把消息交给配置好的模型
 4. 重启 `dsh --profile web`，刷新浏览器，打开 **设置 → QQ 通道**。启动日志应出现：
 
    ```
-   [llminqq] v0.5.0 已加载 · 代码在 <插件目录> · 数据目录 <数据目录>
+   [llminqq] v0.5.1 已加载 · 代码在 <插件目录> · 数据目录 <数据目录>
    [llminqq] 设置页 API 已挂载
    ```
 
@@ -152,7 +152,7 @@ JSON-RPC（`protocol=dsh`）。
 
 1. `dsh --profile web --dump-config` 里有没有 `dsh-plugin-llminqq`；
 2. profile 的 `package.json` 里 `dsh.profile.bundles` 有没有它（有依赖不等于会加载）；
-3. 宿主启动日志有没有 `[llminqq] v0.5.0 已加载 ...`；
+3. 宿主启动日志有没有 `[llminqq] v0.5.1 已加载 ...`；
 4. 若只有 `[llminqq] webServer 不可用，设置页不挂载`，说明这个宿主没提供 web 设置能力
    （纯 CLI/桌面场景）—— 插件加载成功了、桥也能用，去 Web 端配置即可，配置和记忆共用同一份数据。
 

@@ -8,6 +8,13 @@
 
 ## [Unreleased]
 
+暂无。
+
+## [0.5.1] - 2026-10-30
+
+一次以「静默失效 / 崩溃 / 数据丢失 / 越权面」为主的修复发布，顺便把设置页轮询对
+DSH 宿主的阻塞干掉了。没有不兼容变更（`config.security.toolPolicy` 默认仍是 `auto`）。
+
 ### Fixed
 
 - **接话链路 100% 哑火**：`lib/bridge/index.js` 的 chatFollow 时间窗判断把 `d.age` 写成了

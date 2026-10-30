@@ -82,7 +82,7 @@ dsh --profile web --port 3099
 默认数据目录 `~/.dsh/dsh-plugin-llminqq/`（设置 `DSH_HOME` 时在
 `$DSH_HOME/dsh-plugin-llminqq/`；从 profile 的 `node_modules` 加载时，
 插件优先从安装路径反推 DSH home）。实际路径看设置页「高级」，或宿主启动日志里的
-`[llminqq] v0.5.0 已加载 · 代码在 … · 数据目录 …`。
+`[llminqq] v0.5.1 已加载 · 代码在 … · 数据目录 …`。
 
 ```
 <数据目录>/
