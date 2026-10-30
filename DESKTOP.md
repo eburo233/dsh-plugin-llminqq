@@ -7,7 +7,7 @@
 
 ## 1. 为什么 CLI 装不了 desktop
 
-DSH 的 CLI 里有一条**硬保护**（`lib/bin.js:35`）：
+DSH 的 CLI 里有一条**硬保护**（DSH 源码里的 `lib/bin.js`，具体行号随 DSH 版本可能变化）：
 
 ```js
 function rejectElectronProfile(program, profile) {
@@ -35,10 +35,12 @@ function rejectElectronProfile(program, profile) {
 
 ### 第 1 步：把插件拷进 desktop 的 node_modules
 
-在 PowerShell 里（`$env:USERPROFILE` 就是 `C:\Users\<你>`）：
+在 PowerShell 里（`$env:USERPROFILE` 通常就是 `C:\Users\<你的用户名>`）。
+`$src` 换成你 clone/解压出来的插件目录（含 `package.json` 的那层）的绝对路径；
+也可以先 `cd` 进仓库根目录，用 `$src = (Get-Location).Path`：
 
 ```powershell
-$src  = "D:\DSH-WORKSPACE\LLMinQQ\dsh-plugin-llminqq"
+$src  = "C:\path\to\dsh-plugin-llminqq"
 $dst  = "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-plugin-llminqq"
 
 New-Item -ItemType Directory -Force -Path $dst | Out-Null
@@ -85,10 +87,10 @@ Get-Content $f -Raw
 
 桌面端有自己的控制台 / 日志。找它的 stdout，看有没有这两类行：
 
-**成功**会打（插件自己的日志）：
+**成功**会打（插件自己的日志，实际格式）：
 ```
+[llminqq] v0.5.0 已加载 · 代码在 C:\path\to\desktop\node_modules\dsh-plugin-llminqq · 数据目录 C:\Users\你\.dsh\dsh-plugin-llminqq
 [llminqq] 设置页 API 已挂载
-[llminqq] 已加载，数据目录 C:\Users\你\.dsh\dsh-plugin-llminqq
 ```
 
 **没有 webServer** 会打：
@@ -129,12 +131,12 @@ Get-Content $f -Raw
 插件枚举 provider 用的是**宿主 llm 服务**（`ctx.llm.listProviders()`），
 只返回「当前这个 profile 里真正注册了 adapter 的」那些。
 
-- web profile 装了 `dsh-our-free-model` → 能看到 `trae` / `qodercn` / `our-free-model` 等 17 个
-- desktop profile 没装 → 只能看到 `deepseek-official` 这种官方自带的
+- web profile 装了第三方 provider 插件（例如 `dsh-our-free-model`）→ 能看到它注册的那些
+- desktop profile 没装 → 只能看到 DSH 自带的官方 provider
 
 **这不是插件的问题，是那个 profile 没装对应插件。**
 
-想在桌面端也能用 thosefree providers，就在 desktop profile 里也装一份：
+想在桌面端也能用这些第三方 provider，就在 desktop profile 里也装一份：
 
 ```powershell
 # 手动装（CLI 被禁）—— 同第 2 步的思路，但装的是 dsh-our-free-model

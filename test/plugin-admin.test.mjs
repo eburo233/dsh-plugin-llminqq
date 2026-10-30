@@ -1,26 +1,28 @@
 // 设置页记忆管理（P4）测试：统计 / 清除安全 / 导出导入 roundtrip
 // 运行：node test/plugin-admin.test.mjs
 //
+// 为什么测试库是**现场生成的合成库**，而不是读主仓库那份 844 条真实库：
+//   那份库只存在于作者那台机器（/home/<user>/...），任何别的机器/CI 都没有。
+//   原来硬编码它的路径 → 在别的机器上直接 ENOENT 崩掉（连 skip 都来不及）。
+//   现在用 python sqlite3 按 lib/agent/memory/memctl.py 的 schema 现造一份
+//   结构等价的合成库（条数固定为夹具常量），被测的 SQL / 清除 / 导入逻辑一字不改。
+//
+// 环境缺失时**跳过而不是失败**：没有 python（或 python 里没有 sqlite3）时，
+// A~E 中依赖真库的段整段 skip，F/G 照常跑；导出/临时文件只落 os.tmpdir()。
+//
 // 为什么这个测试的重点是「清除的安全」：
 //   统计和导出是只读的，错了最多显示难看；
 //   而**清除是不可逆操作** —— 误删一份攒了几个月的记忆，用户没有第二份。
 //   所以本文件对「没有确认不能清」的验证是逐条硬断言，不是「前端拦住了」就算。
 //   另外还验「清除前会自动备份」和「导入前会备份」，因为这两条是最后的安全网。
-//
-// 全部用临时 stateDir，绝不碰生产 mem.db / 用户真实 ~/.dsh/llminqq。
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { spawnSync } from 'node:child_process'
 
-// 本文件在 packages/dsh-plugin-llminqq/test/：
-//   PKG  = 上一级（包根）
-//   ROOT = 再上两级（仓库根，用来定位主仓库的 844 条真实库）
+// 本文件在 dsh-plugin-llminqq/test/：PKG = 上一级（包根）
 const PKG = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
-const ROOT = path.resolve(PKG, '..', '..')
-// 844 条真实记忆在主仓库，模板仓库那份是空的
-const MAIN_REPO_DB = '/home/jojo/dsh/LLMinQQ/qq-agent/memory/mem.db'
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-admin-'))
 const REAL_STATE = path.join(os.homedir(), '.dsh', 'llminqq')
 const REAL_STATE_SNAP = fs.existsSync(REAL_STATE)
@@ -29,29 +31,124 @@ const REAL_STATE_SNAP = fs.existsSync(REAL_STATE)
 
 let pass = 0
 let fail = 0
+let skipCount = 0
 const ok = (name, cond, detail = '') => {
   if (cond) { pass++; console.log(`  ✓ ${name}`) }
   else { fail++; console.log(`  ✗ ${name}${detail ? ` — ${detail}` : ''}`) }
 }
+const skip = (name, reason = '') => {
+  skipCount++
+  console.log(`  ○ 跳过 ${name}${reason ? ` — ${reason}` : ''}`)
+}
 
-const { probePython } = await import(path.join(PKG, 'lib/pyprobe.mjs'))
-const admin = await import(path.join(PKG, 'lib/agent/memory-admin.mjs'))
-const { memoryEnv } = await import(path.join(PKG, 'lib/agent/memory-run.mjs'))
+// ESM 动态 import 在 Windows 上必须用 file:// URL：
+//   `await import(path.join(...))` 在 Windows 抛 ERR_UNSUPPORTED_ESM_URL_SCHEME。
+const { probePython } = await import(pathToFileURL(path.join(PKG, 'lib/pyprobe.mjs')).href)
+const admin = await import(pathToFileURL(path.join(PKG, 'lib/agent/memory-admin.mjs')).href)
 const probe = probePython({ log: () => {} })
 console.log(`\npython: ${probe.ok ? `${probe.bin} ${probe.version}` : probe.reason}`)
 
-/** 造一个 stateDir，从主仓库真实库拷 844 条（只读源，绝不写它）。 */
+// ─────────────────────────────────────────────────────────────────────────────
+// 合成夹具：条数/分布都来自这里，断言不写死魔数
+// ─────────────────────────────────────────────────────────────────────────────
+const FIXTURE = Object.freeze({
+  total: 300,
+  alive: 260,          // 其中 40 条 retired=1（归档），用来验「有效 < 总数」
+  owners: ['10001', '10002', '10003'],
+  kinds: ['procedural', 'semantic', 'episodic'],
+})
+
+const FIXTURE_PY = `
+import json, sqlite3, sys
+
+db = sys.argv[1]
+cfg = json.loads(sys.argv[2])
+total = cfg['total']
+alive = cfg['alive']
+owners = cfg['owners']
+kinds = cfg['kinds']
+vis = ['dm_only', 'group', 'public']
+
+c = sqlite3.connect(db)
+c.executescript('''
+CREATE TABLE IF NOT EXISTS entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    peer TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL,
+    fp TEXT NOT NULL,
+    importance REAL NOT NULL DEFAULT 0.5,
+    strength REAL NOT NULL DEFAULT 1.0,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    hits INTEGER NOT NULL DEFAULT 1,
+    created REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    retired INTEGER NOT NULL DEFAULT 0,
+    reflected INTEGER NOT NULL DEFAULT 0,
+    owner TEXT,
+    visibility TEXT,
+    is_self INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_peer ON entries(peer);
+CREATE INDEX IF NOT EXISTS idx_kind ON entries(kind);
+CREATE INDEX IF NOT EXISTS idx_owner ON entries(owner);
+''')
+
+rows = []
+for i in range(total):
+    retired = 0 if i < alive else 1
+    # i % 7 == 0 → owner=NULL，模拟「群级记忆没有归属人」
+    owner = owners[i % len(owners)] if i % 7 != 0 else None
+    kind = kinds[i % len(kinds)]
+    ts = 1600000000 + i
+    rows.append((
+        'peer-%d' % i, kind, '测试记忆条目 %d：设置页管理用的合成数据。' % i,
+        'fp-%d' % i, 0.5, 1.0, 0, 1, ts, ts, retired, 0, owner, vis[i % 3], 0,
+    ))
+
+c.executemany(
+    'INSERT INTO entries (peer,kind,text,fp,importance,strength,pinned,hits,created,'
+    'last_seen,retired,reflected,owner,visibility,is_self) '
+    'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)', rows)
+c.commit()
+n = c.execute('SELECT COUNT(*) FROM entries').fetchone()[0]
+a = c.execute('SELECT COUNT(*) FROM entries WHERE retired=0').fetchone()[0]
+c.close()
+if n != total or a != alive:
+    raise SystemExit('fixture 不一致: total=%d alive=%d' % (n, a))
+print(json.dumps({'total': n, 'alive': a}))
+`
+
+let FIXTURE_SRC = null
+let FIXTURE_ERR = ''
+if (!probe.ok) {
+  FIXTURE_ERR = `本机没有可用的 python（${probe.reason}），无法运行记忆库相关断言`
+} else {
+  try {
+    const dir = path.join(TMP, 'fixture')
+    fs.mkdirSync(dir, { recursive: true })
+    const script = path.join(dir, 'make-fixture.py')
+    fs.writeFileSync(script, FIXTURE_PY, 'utf8')
+    const dbPath = path.join(dir, 'mem.db')
+    const r = spawnSync(probe.bin, [...(probe.preArgs || []), script, dbPath, JSON.stringify(FIXTURE)], {
+      encoding: 'utf8', timeout: 60000,
+    })
+    if (r.error) throw new Error(String(r.error.message || r.error))
+    if (r.status !== 0) throw new Error(`造夹具库失败（退出码 ${r.status}）：${String(r.stderr || r.stdout).slice(-400)}`)
+    FIXTURE_SRC = dbPath
+    console.log(`夹具库: ${FIXTURE.total} 条（有效 ${FIXTURE.alive}）`)
+  } catch (err) {
+    FIXTURE_ERR = `造合成夹具库失败：${err.message}`
+  }
+}
+const DB_READY = !!FIXTURE_SRC
+
+/** 造一个 stateDir：拷一份夹具库 + 记忆目录里常见的伴生文件。 */
 function makeState (name, { withDb = true } = {}) {
   const dir = path.join(TMP, name)
   fs.mkdirSync(dir, { recursive: true })
   if (withDb) {
-    if (!fs.existsSync(MAIN_REPO_DB)) throw new Error(`主仓库库不存在：${MAIN_REPO_DB}`)
-    // sqlite backup（不是 cp）：一致快照，避免撕裂（和迁移工具同一纪律）
-    const py = 'import sqlite3,sys;s=sqlite3.connect("file:%s?mode=ro"%sys.argv[1],uri=True);'
-      + 'd=sqlite3.connect(sys.argv[2]);s.backup(d);d.close();s.close();print("ok")'
-    const r = spawnSync(probe.bin, [...(probe.preArgs || []), '-c', py, MAIN_REPO_DB, path.join(dir, 'mem.db')],
-      { encoding: 'utf8', timeout: 60000 })
-    if (r.status !== 0) throw new Error(`拷库失败：${r.stderr}`)
+    fs.copyFileSync(FIXTURE_SRC, path.join(dir, 'mem.db'))
     fs.writeFileSync(path.join(dir, '.prod-guard'), 'test', { mode: 0o600 })
     fs.mkdirSync(path.join(dir, 'log'), { recursive: true })
     fs.writeFileSync(path.join(dir, 'lexicon.json'), JSON.stringify({ entries: [], updatedAt: 'test' }), 'utf8')
@@ -62,17 +159,21 @@ function makeState (name, { withDb = true } = {}) {
   return dir
 }
 const cfgOf = stateDir => ({ memory: { stateDir, enabled: true } })
+const NO_PY_PROBE = { ok: false, reason: '模拟无 python' }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// A. 统计真跑（844 条 / 按人分布）
+// A. 统计真跑（合成 N 条 / 按人分布）
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('\n=== A. 记忆统计（真实 844 条库）===')
-const stateA = makeState('state-a')
-{
+console.log(`\n=== A. 记忆统计（合成 ${FIXTURE.total} 条库）===`)
+const stateA = DB_READY ? makeState('state-a') : null
+if (!DB_READY) {
+  skip('A. 记忆统计', FIXTURE_ERR)
+} else {
   const st = admin.memoryStats({ cfg: cfgOf(stateA), probe })
   ok('stats 返回 ok', st.ok === true, st.reason)
-  ok('总条数是 844（主仓库真实数据）', st.total === 844, st.total)
-  ok('有效条数 < 总数（有归档的）', typeof st.alive === 'number' && st.alive > 0 && st.alive < st.total, `${st.alive}/${st.total}`)
+  ok(`总条数是 ${FIXTURE.total}（夹具）`, st.total === FIXTURE.total, st.total)
+  ok(`有效条数 == ${FIXTURE.alive} 且 < 总数（有归档的）`,
+    st.alive === FIXTURE.alive && st.alive > 0 && st.alive < st.total, `${st.alive}/${st.total}`)
   ok('有按层统计（procedural/semantic/episodic）',
     Array.isArray(st.byLayer) && st.byLayer.length >= 2, JSON.stringify(st.byLayer))
   ok('三层数字加起来 == 总数', st.byLayer.reduce((a, x) => a + x.total, 0) === st.total,
@@ -82,18 +183,22 @@ const stateA = makeState('state-a')
   ok('byOwner 每项形状是 {owner,count}', st.byOwner.every(o => typeof o.owner === 'string' && typeof o.count === 'number'),
     JSON.stringify(st.byOwner?.[0]))
   ok('owner 都是纯数字 QQ 号', st.byOwner.every(o => /^\d+$/.test(o.owner)), JSON.stringify(st.byOwner?.map(o => o.owner).slice(0, 5)))
-  ok('有 unowned 计数（群级记忆 owner=NULL）', typeof st.unowned === 'number', st.unowned)
+  ok('按人分布覆盖夹具里的 3 个 owner', st.byOwner.length === FIXTURE.owners.length,
+    JSON.stringify(st.byOwner.map(o => o.owner)))
+  ok('有 unowned 计数（群级记忆 owner=NULL）', typeof st.unowned === 'number' && st.unowned > 0, st.unowned)
   ok('有可见性分布', Array.isArray(st.byVisibility) && st.byVisibility.length > 0, JSON.stringify(st.byVisibility))
-  ok('库大小 > 200KB（真实库不是空的）', st.dbSizeBytes > 200 * 1024, `${st.dbSizeBytes} bytes`)
+  ok('库大小 > 4KB（不是空库）', st.dbSizeBytes > 4096, `${st.dbSizeBytes} bytes`)
+  ok('库大小与实际文件一致', st.dbSizeBytes === fs.statSync(path.join(stateA, 'mem.db')).size,
+    `${st.dbSizeBytes} vs ${fs.statSync(path.join(stateA, 'mem.db')).size}`)
   ok('stateDir 指到临时目录（不是真实用户目录）', st.stateDir === stateA, st.stateDir)
   ok('没写真实 ~/.dsh/llminqq',
     !fs.existsSync(REAL_STATE) || (REAL_STATE_SNAP && fs.statSync(REAL_STATE).mtimeMs === REAL_STATE_SNAP.mtimeMs))
 
-  // 真实分布打印出来（这是任务要求的「贴真实输出」）
-  console.log('    真实统计:')
+  // 合成分布打印出来（便于排查断言失败）
+  console.log('    合成统计:')
   console.log(`      总数 ${st.total} / 有效 ${st.alive} / 大小 ${(st.dbSizeBytes / 1024).toFixed(0)} KB`)
   for (const l of st.byLayer) console.log(`      ${l.kind.padEnd(10)} ${String(l.total).padStart(4)} 条（有效 ${l.alive}）`)
-  console.log(`      按人: ${st.byOwner.slice(0, 6).map(o => `${o.owner}:${o.count}`).join(' / ')}${st.byOwner.length > 6 ? ` …共 ${st.byOwner.length} 人` : ''}`)
+  console.log(`      按人: ${st.byOwner.map(o => `${o.owner}:${o.count}`).join(' / ')}`)
   console.log(`      未归属(群级): ${st.unowned}`)
 }
 
@@ -101,16 +206,17 @@ const stateA = makeState('state-a')
 // B. 最近 N 条
 // ─────────────────────────────────────────────────────────────────────────────
 console.log('\n=== B. 最近 N 条 ===')
-{
+if (!DB_READY) {
+  skip('B. 最近 N 条', FIXTURE_ERR)
+} else {
   const r = admin.memoryRecent({ cfg: cfgOf(stateA), probe, limit: 10 })
   ok('recent 返回 ok', r.ok === true, r.reason)
   ok('返回 10 条', r.rows.length === 10, r.rows.length)
   ok('每条有 text/peer/kind/lastSeen', r.rows.every(x => x.text && x.peer && x.kind && x.lastSeen))
   ok('按 last_seen 降序（最近的在前）',
     r.rows.every((x, i) => i === 0 || r.rows[i - 1].lastSeen >= x.lastSeen))
-  ok('limit 有上限保护（要 500 条只给 200）',
-    admin.memoryRecent({ cfg: cfgOf(stateA), probe, limit: 500 }).rows.length <= 200,
-    admin.memoryRecent({ cfg: cfgOf(stateA), probe, limit: 500 }).rows.length)
+  const capped = admin.memoryRecent({ cfg: cfgOf(stateA), probe, limit: 500 })
+  ok('limit 有上限保护（要 500 条只给 200）', capped.rows.length === 200, capped.rows.length)
   console.log(`      样例: [${r.rows[0].kind}] ${r.rows[0].text.slice(0, 50)}`)
 }
 
@@ -118,13 +224,17 @@ console.log('\n=== B. 最近 N 条 ===')
 // C. 清除的安全（这是重点）
 // ─────────────────────────────────────────────────────────────────────────────
 console.log('\n=== C. 清除安全：没有确认不能清 ===')
-{
+if (!DB_READY) {
+  skip('C. 清除安全', FIXTURE_ERR)
+} else {
   const stateC = makeState('state-c')
   const cfg = cfgOf(stateC)
   const before = admin.memoryStats({ cfg, probe })
+  ok('夹具清点：按人分布 3 人', before.byOwner.length === FIXTURE.owners.length,
+    JSON.stringify(before.byOwner))
 
   // ① 不带 confirm → 必须拒绝
-  const noConfirm = admin.memoryClear({ cfg, probe, owner: '1000000001', confirm: false })
+  const noConfirm = admin.memoryClear({ cfg, probe, owner: FIXTURE.owners[0], confirm: false })
   ok('不带 confirm 拒绝清除', noConfirm.ok === false && /二次确认/.test(noConfirm.error || ''), noConfirm.error)
   const stillThere = admin.memoryStats({ cfg, probe })
   ok('被拒绝后数据**一条都没动**', stillThere.total === before.total, `${before.total} → ${stillThere.total}`)
@@ -139,8 +249,10 @@ console.log('\n=== C. 清除安全：没有确认不能清 ===')
   ok('owner 非数字 → 拒绝（防误清全部）', badOwner.ok === false && /QQ 号/.test(badOwner.error || ''), badOwner.error)
 
   // ④ dry-run：算影响面但不删
-  const dry = admin.memoryClear({ cfg, probe, owner: '1000000001', confirm: true, dryRun: true })
-  ok('dry-run 返回 wouldDelete 条数', dry.ok === true && typeof dry.wouldDelete === 'number', JSON.stringify(dry))
+  const target0 = before.byOwner[0]
+  const dry = admin.memoryClear({ cfg, probe, owner: target0.owner, confirm: true, dryRun: true })
+  ok('dry-run 返回 wouldDelete 条数', dry.ok === true && dry.wouldDelete === target0.count,
+    `${JSON.stringify(dry).slice(0, 120)}（应 ${target0.count}）`)
   ok('dry-run 真的没删', admin.memoryStats({ cfg, probe }).total === before.total)
 
   // ⑤ 确认后真清（清某个人）
@@ -172,11 +284,14 @@ console.log('\n=== C. 清除安全：没有确认不能清 ===')
 // D. 导出 / 导入 roundtrip
 // ─────────────────────────────────────────────────────────────────────────────
 console.log('\n=== D. 导出 / 导入 roundtrip ===')
-{
+if (!DB_READY) {
+  skip('D. 导出 / 导入 roundtrip', FIXTURE_ERR)
+} else {
   const stateD = makeState('state-d')
   const cfg = cfgOf(stateD)
+  const expOut = path.join(TMP, 'exports')
   const before = admin.memoryStats({ cfg, probe })
-  ok('导出前有 844 条', before.total === 844, before.total)
+  ok(`导出前有 ${FIXTURE.total} 条`, before.total === FIXTURE.total, before.total)
 
   // ① 导出清单
   const list = admin.exportList({ cfg })
@@ -188,15 +303,13 @@ console.log('\n=== D. 导出 / 导入 roundtrip ===')
       || f.name.startsWith('corpus/') || f.name.startsWith('log/')),
     JSON.stringify(list.map(f => f.name)))
 
-  // ② 导出
-  const exp = admin.memoryExport({ cfg, probe })
+  // ② 导出（显式 outDir → 产物只在 os.tmpdir() 的测试目录里）
+  const exp = admin.memoryExport({ cfg, probe, outDir: expOut })
   ok('导出成功', exp.ok === true, exp.error)
   ok('导出产出 zip 文件', !!exp.zipPath && fs.existsSync(exp.zipPath), exp.zipPath)
-  // 注意：这里不能写「>100KB」这类凭直觉的数字。真实数据（844 条记忆 ≈ 240KB 的
-  // 库 + 1 个语料文件）压缩后约 90KB —— 文本库的压缩比很高。断言只看「不为空且
-  // 至少包含库文件」，不猜具体大小（猜出来的阈值以后会变成假失败）。
-  ok('zip 有体积（不是空包）', exp.bytes > 20 * 1024, `${exp.bytes} bytes`)
-  ok('zip 至少打包了库 + 清单里的文件', exp.entries >= 4, `${exp.entries} 个: ${exp.restored ?? ''}`)
+  ok('zip 有体积（不是空包）', exp.bytes > 1024 && exp.bytes === fs.statSync(exp.zipPath).size,
+    `${exp.bytes} bytes`)
+  ok('zip 打全了清单里的文件', exp.entries === list.length, `${exp.entries} vs ${list.length}`)
   ok('文件名带日期', /llminqq-memory-\d{8}-\d{4}\.zip/.test(exp.filename), exp.filename)
 
   // ③ 清空（用 DELETE-ALL 的归档语义，然后把库删掉模拟「换了台机器」）
@@ -217,31 +330,56 @@ console.log('\n=== D. 导出 / 导入 roundtrip ===')
 
   // ⑤ 关键判据：条数一致
   const after = admin.memoryStats({ cfg, probe })
-  ok('**roundtrip 后条数一致（844 → 0 → 844）**', after.total === before.total, `${before.total} → 0 → ${after.total}`)
+  ok(`**roundtrip 后条数一致（${FIXTURE.total} → 0 → ${FIXTURE.total}）**`,
+    after.total === before.total, `${before.total} → 0 → ${after.total}`)
   ok('有效条数也一致', after.alive === before.alive, `${before.alive} → ${after.alive}`)
   ok('按人分布一致', after.byOwner.length === before.byOwner.length,
     `${before.byOwner.length} 人 → ${after.byOwner.length} 人`)
   ok('导入后库能正常查询（recent 可读）', admin.memoryRecent({ cfg, probe, limit: 3 }).rows.length > 0)
 
-  // ⑥ 恶意 zip：夹带非白名单文件 → 必须被拒在名单外（不能覆盖任意文件）
+  // ⑥ 恶意 zip：内容不是真库 + 夹带 ../ 路径 → 拒绝且不覆盖
   const zipBad = path.join(TMP, 'bad.zip')
-  const py = [
-    'import json,sys,zipfile',
+  const pyBad = [
+    'import sys,zipfile',
     'z=zipfile.ZipFile(sys.argv[1],"w")',
     'z.writestr("mem.db","not a real db")',
     'z.writestr("../../evil.txt","pwned")',
     'z.close()',
   ].join('\n')
-  spawnSync(probe.bin, [...(probe.preArgs || []), '-c', py, zipBad], { encoding: 'utf8' })
+  spawnSync(probe.bin, [...(probe.preArgs || []), '-c', pyBad, zipBad], { encoding: 'utf8', timeout: 60000 })
   const bad = admin.memoryImport({ cfg, probe, zipPath: zipBad })
-  ok('夹带非法路径的 zip 不覆盖到上级目录',
-    !fs.existsSync(path.join(TMP, '..', 'evil.txt')) && !fs.existsSync(path.join(stateD, '..', 'evil.txt')))
+  ok('夹带非法路径的 zip 不往上级目录写文件',
+    !fs.existsSync(path.resolve(os.tmpdir(), '..', 'evil.txt'))
+    && !fs.existsSync(path.resolve(stateD, '..', 'evil.txt'))
+    && !fs.existsSync(path.join(stateD, 'evil.txt')))
   // 内容不是真库 → 校验阶段就该拒绝（而不是覆盖掉真库）
   const badRejected = bad.ok === false
   ok('内容不是有效记忆库 → 拒绝导入（不毁现有库）', badRejected, JSON.stringify(bad).slice(0, 180))
+  ok('拒绝原因指出是库校验失败', /校验失败|不是有效记忆库/.test(bad.error || ''), bad.error)
   const afterBad = admin.memoryStats({ cfg, probe })
   ok('被拒绝的导入没有破坏现有数据', afterBad.total === before.total, `${afterBad.total} vs ${before.total}`)
   ok('被拒绝后库仍可正常读（recent 有内容）', admin.memoryRecent({ cfg, probe, limit: 1 }).rows.length === 1)
+
+  // ⑦ 恶意 zip 变体：库是好的，但夹带 ../../evil.txt → 只恢复白名单内的，
+  //    越界文件必须被跳过（skipped 里有它）且不落盘到上级目录。
+  const zipEvil = path.join(TMP, 'evil-but-valid.zip')
+  const pyEvil = [
+    'import sys,zipfile',
+    'z=zipfile.ZipFile(sys.argv[1],"w")',
+    'z.write(sys.argv[2],arcname="mem.db")',
+    'z.writestr("../../evil.txt","pwned")',
+    'z.close()',
+  ].join('\n')
+  spawnSync(probe.bin, [...(probe.preArgs || []), '-c', pyEvil, zipEvil, FIXTURE_SRC], { encoding: 'utf8', timeout: 60000 })
+  const evilImp = admin.memoryImport({ cfg, probe, zipPath: zipEvil })
+  ok('带越界路径但库有效的 zip 能导入（只恢复白名单）', evilImp.ok === true, evilImp.error)
+  ok('越界文件被 skipped（没被当数据恢复）', (evilImp.skipped || []).includes('../../evil.txt'),
+    JSON.stringify(evilImp.skipped))
+  ok('越界文件没有落盘到上级目录',
+    !fs.existsSync(path.resolve(os.tmpdir(), '..', 'evil.txt'))
+    && !fs.existsSync(path.resolve(stateD, '..', 'evil.txt'))
+    && !fs.existsSync(path.join(stateD, 'evil.txt')))
+  ok('恢复后条数仍一致', admin.memoryStats({ cfg, probe }).total === before.total)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -249,26 +387,34 @@ console.log('\n=== D. 导出 / 导入 roundtrip ===')
 // ─────────────────────────────────────────────────────────────────────────────
 console.log('\n=== E. 边界 + 前端数据形状 ===')
 {
-  // 完全没有库（全新安装）
-  const fresh = path.join(TMP, 'state-fresh')
-  fs.mkdirSync(fresh, { recursive: true })
-  const st = admin.memoryStats({ cfg: cfgOf(fresh), probe })
-  ok('库不存在时 stats 仍 ok（不是错误）', st.ok === true && st.total === 0, JSON.stringify(st).slice(0, 140))
-  ok('库不存在时标了 empty（前端显示「还没有记忆」）', st.empty === true)
-  ok('库不存在时导出给明确错误（不是崩）',
-    admin.memoryExport({ cfg: cfgOf(fresh), probe }).ok === false)
+  // 完全没有库（全新安装）—— 不需要库文件，只需要 python 可用（stats 先判 probe）
+  if (!DB_READY) {
+    skip('E. 库不存在时的 stats 边界', FIXTURE_ERR)
+  } else {
+    const fresh = path.join(TMP, 'state-fresh')
+    fs.mkdirSync(fresh, { recursive: true })
+    const st = admin.memoryStats({ cfg: cfgOf(fresh), probe })
+    ok('库不存在时 stats 仍 ok（不是错误）', st.ok === true && st.total === 0, JSON.stringify(st).slice(0, 140))
+    ok('库不存在时标了 empty（前端显示「还没有记忆」）', st.empty === true)
+    ok('库不存在时导出给明确错误（不是崩）',
+      admin.memoryExport({ cfg: cfgOf(fresh), probe }).ok === false)
+  }
 
-  // 没有 python
-  const noPy = admin.memoryStats({ cfg: cfgOf(stateA), probe: { ok: false, reason: '模拟无 python' } })
+  // 没有 python（模拟探针结果，不需要真库）
+  const noPy = admin.memoryStats({ cfg: cfgOf(path.join(TMP, 'state-nopy')), probe: NO_PY_PROBE })
   ok('无 python 时 stats.ok=false 且带 reason', noPy.ok === false && /python/.test(noPy.reason || ''), noPy.reason)
   ok('无 python 时 clear 拒绝并说明', admin.memoryClear({
-    cfg: cfgOf(stateA), probe: { ok: false, reason: '模拟无 python' }, owner: '1', confirm: true,
+    cfg: cfgOf(path.join(TMP, 'state-nopy')), probe: NO_PY_PROBE, owner: '1', confirm: true,
   }).ok === false)
 
   // 前端渲染所需字段一个不少（照 client.js 的用法核）
-  const shape = admin.memoryStats({ cfg: cfgOf(stateA), probe })
-  for (const k of ['ok', 'total', 'alive', 'byLayer', 'byOwner', 'unowned', 'dbSizeBytes', 'stateDir', 'pythonOk', 'pythonVersion', 'byVisibility']) {
-    ok(`stats 字段 ${k} 存在`, k in shape, Object.keys(shape).join(','))
+  if (!DB_READY) {
+    skip('E. stats 字段形状', FIXTURE_ERR)
+  } else {
+    const shape = admin.memoryStats({ cfg: cfgOf(stateA), probe })
+    for (const k of ['ok', 'total', 'alive', 'byLayer', 'byOwner', 'unowned', 'dbSizeBytes', 'stateDir', 'pythonOk', 'pythonVersion', 'byVisibility']) {
+      ok(`stats 字段 ${k} 存在`, k in shape, Object.keys(shape).join(','))
+    }
   }
 }
 
@@ -324,10 +470,10 @@ console.log('\n=== F. 隔离 + 前端语法 ===')
 {
   ok('没写真实 ~/.dsh/llminqq',
     !fs.existsSync(REAL_STATE) || (REAL_STATE_SNAP && fs.statSync(REAL_STATE).mtimeMs === REAL_STATE_SNAP.mtimeMs))
-  ok('生产主仓库 mem.db 没被改（只读过）', (() => {
-    if (!fs.existsSync(MAIN_REPO_DB)) return true
-    const st = fs.statSync(MAIN_REPO_DB)
-    return st.size > 4096 // 还能打开就是没被删；内容由只读连接保证
+  ok('测试全程没碰生产主仓库库（本机不存在或未被改写）', (() => {
+    const mainDb = path.join(path.resolve(PKG, '..', '..'), 'qq-agent', 'memory', 'mem.db')
+    if (!fs.existsSync(mainDb)) return true
+    return fs.statSync(mainDb).size > 4096 // 还能打开就是没被删
   })())
   // client.js 语法：它走 window.__ModuleLoader__，不是标准 ESM，只能做文本级检查
   const clientSrc = fs.readFileSync(path.join(PKG, 'client.js'), 'utf8')
@@ -345,5 +491,9 @@ console.log('\n=== F. 隔离 + 前端语法 ===')
   ok('client.js 圆括号配平', balanced(clientSrc.replace(/`(?:[^`\\]|\\.)*`/g, '``'), '(', ')'))
 }
 
-console.log(`\n结果: ${pass} 通过 / ${fail} 失败`)
+console.log(`\n结果: ${pass} 通过 / ${fail} 失败 / ${skipCount} 跳过`)
+// 成功时清掉临时目录（失败时保留现场供排查）
+if (fail === 0) {
+  try { fs.rmSync(TMP, { recursive: true, force: true }) } catch { /* ignore */ }
+}
 process.exit(fail === 0 ? 0 : 1)

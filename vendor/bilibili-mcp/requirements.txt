@@ -1,10 +1,15 @@
-# dsh-bili-scroll 用的 Python MCP 依赖
-# （基座是 AGI_Ananas 的 bilibili-mcp，MIT；这里只按我们的实测改了版本约束）
+# Python MCP server for the bilibili tools (bili_search / bili_subtitle / bili_comments / ...).
+# Base is AGI_Ananas/bilibili-mcp, MIT. Only these deps are needed.
+#
+# Keep this file ASCII-only: pip reads a requirements file with the platform
+# locale encoding on Windows (GBK / CP936), so non-ASCII comments make
+# `pip install -r` die with UnicodeDecodeError. That is why the notes below are
+# in English even though the rest of the repo is Chinese.
 bilibili-api-python>=17.4.1,<18
 aiohttp>=3.9.0
-# 🔴 必须锁 <2：mcp 2.x 的 server 没有 list_tools，起不来（2026-10-09 踩过）
+# Must stay <2: the mcp 2.x server has no list_tools and fails to start.
 mcp>=1.0.0,<2
-# 插件用 Python 画登录二维码；不装就只能退回"只给 URL"
+# bili_login / bili_login_check draw the QR code locally.
 qrcode[pil]>=8.0
-# bili_frames 裁画面帧要 Pillow。qrcode[pil] 会带进来，但那是传递依赖 —— 显式钉住
+# bili_frames cuts frames; Pillow is enough (also pulled in by qrcode[pil]).
 Pillow>=9.0

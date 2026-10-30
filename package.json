@@ -10,6 +10,27 @@
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "qq",
+    "napcat",
+    "onebot",
+    "qqbot",
+    "chatbot"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eburo233/dsh-plugin-llminqq.git"
+  },
+  "bugs": {
+    "url": "https://github.com/eburo233/dsh-plugin-llminqq/issues"
+  },
+  "homepage": "https://github.com/eburo233/dsh-plugin-llminqq#readme",
   "files": [
     "lib",
     "client.js",
@@ -19,10 +40,7 @@
     "README.md",
     "THIRD-PARTY-NOTICES.md",
     "INSTALL-PLUGIN.md",
-    "DESKTOP.md",
-    "update-windows.ps1",
-    "where-is-loaded.ps1",
-    "find-all-copies.ps1"
+    "DESKTOP.md"
   ],
   "engines": {
     "node": ">=22.19.0"

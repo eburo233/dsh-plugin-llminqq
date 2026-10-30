@@ -68,8 +68,8 @@
 
 | # | 改动 | 为什么 |
 |---|---|---|
-| 1 | **脱敏**：真实 QQ 号 → `1000000001`；「2026-10-26 实测事故」→「历史事故（本机个人实例）」；「吉祥物」→「机器人」 | 分享出去不泄露本机账号与使用史 |
-| 2 | **去硬编码路径**：`BRIDGE_LOG` 从 `/home/jojo/dsh/LLMinQQ/logs/bridge.out` 改成 `<仓库根>/logs/bridge.out` + `LLMINQQ_BRIDGE_LOG` 环境变量覆盖 | 别人装到别的目录也能跑 |
+| 1 | **脱敏**：真实 QQ 号 `1000000001` → `1000000001`；「2026-10-26 实测事故」→「历史事故（本机个人实例）」；「吉祥物」→「机器人」 | 分享出去不泄露本机账号与使用史 |
+| 2 | **去硬编码路径**：`BRIDGE_LOG` 从 `/home/<user>/dsh/LLMinQQ/logs/bridge.out` 改成 `<仓库根>/logs/bridge.out` + `LLMINQQ_BRIDGE_LOG` 环境变量覆盖 | 别人装到别的目录也能跑 |
 | 3 | **生产库识别重构**：写死的 `_PROD_DIR_REAL` 改成 `.prod-guard` 哨兵文件 + `MEMCTL_PROD_DIR` 环境变量 | 同上：写死路径的另一种形式 |
 | 4 | **新增 `run.py` launcher**（唯一新增文件）：import 包内代码，把 `BASE` 推导出的落盘路径常量改指 stateDir | **代码在包里（只读）、数据在 stateDir（可写）** 这两件事必须同时成立 |
 

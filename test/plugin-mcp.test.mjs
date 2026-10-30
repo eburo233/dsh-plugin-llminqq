@@ -10,26 +10,36 @@
 //   ④ bili 未配置/缺依赖时**给出明确原因**（不静默）
 //   ⑤ 缺 ffmpeg 时 storyboard 报「缺 ffmpeg」而不是假装挂上
 //
+// 环境缺失 = skip 而不是 fail：
+//   · 没有 ffmpeg/ffprobe：storyboard 本来就不会被挂载（buildMcpServers 的约定），
+//     所以「挂载后的 ACP 形状」与「真出图」两段 skip，其余照跑；
+//   · 判断 ffmpeg 是否存在用 spawnSync('ffmpeg', ['-version'])，**不看 /usr/bin**
+//     （原实现硬编码 /usr/bin/ffmpeg，Windows 上装了 ffmpeg 也会被误判成没有）。
+//
 // 隔离（CONTRIBUTING §9）：
-//   · 所有落盘路径用 /tmp（HOME/DSH_HOME 引开，STORYBOARD_DIR 显式指定）
+//   · 所有落盘路径用 os.tmpdir()（HOME/DSH_HOME 引开，STORYBOARD_DIR 显式指定）
 //   · 不连 QQ、不连 LLM、不读生产 state/config
 //   · 测试视频用 ffmpeg 现做
-
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const PKG = path.resolve(__dirname, '..')
 
 let pass = 0
 let fail = 0
+let skipCount = 0
 const ok = (name, cond, detail = '') => {
   if (cond) { pass++; console.log(`  ✓ ${name}`) }
   else { fail++; console.log(`  ✗ ${name}${detail ? ` — ${detail}` : ''}`) }
+}
+const skip = (name, reason = '') => {
+  skipCount++
+  console.log(`  ○ 跳过 ${name}${reason ? ` — ${reason}` : ''}`)
 }
 async function test (name, fn) {
   try { await fn(); ok(name, true) } catch (err) { ok(name, false, err.message.split('\n')[0]) }
@@ -42,9 +52,30 @@ fs.mkdirSync(FAKE_HOME, { recursive: true })
 
 // 先设环境再 import —— dataDir() 会读 HOME/DSH_HOME
 process.env.HOME = FAKE_HOME
+// Windows 上 os.homedir() 看的是 USERPROFILE（不看 HOME）；不设的话 bili 探测会
+// 翻到真实用户目录下的 bili-duty venv，「缺依赖」的分支就测不到了。
+process.env.USERPROFILE = FAKE_HOME
 process.env.DSH_HOME = path.join(FAKE_HOME, '.dsh')
 
-const M = await import(path.join(PKG, 'lib', 'index.js'))
+// 读源码做锚点匹配：这个仓库的 lib/**.js 是 CRLF 换行（Windows checkout），
+// 而 `\n}\n` 这类锚点在 CRLF 下永远匹配不到 —— 统一先规范化成 LF 再切。
+function readSource (rel) {
+  return fs.readFileSync(path.join(PKG, rel), 'utf8').replace(/\r\n/g, '\n')
+}
+
+// ESM 动态 import 在 Windows 上必须用 file:// URL（否则 ERR_UNSUPPORTED_ESM_URL_SCHEME）
+const M = await import(pathToFileURL(path.join(PKG, 'lib', 'index.js')).href)
+
+// ── 环境探测：ffmpeg / ffprobe（spawnSync 真跑一次，跨平台）────────────────
+const canRun = (bin) => {
+  try {
+    const r = spawnSync(bin, ['-version'], { stdio: 'ignore', timeout: 5000 })
+    return !r.error && r.status === 0
+  } catch { return false }
+}
+const HAS_FFMPEG = canRun('ffmpeg')
+const HAS_FFPROBE = canRun('ffprobe')
+const FF_OK = HAS_FFMPEG && HAS_FFPROBE
 
 // ── 夹具：测试视频 ────────────────────────────────────────────────────────
 const CLIP = path.join(TMP, 'clip.mp4')
@@ -113,61 +144,95 @@ function mcpClient (serverPath, env = {}) {
 const WRAPPER = path.join(PKG, 'lib', 'mcp', 'storyboard-mcp.mjs')
 const SB_OUT = path.join(TMP, 'storyboard-out')
 
+console.log(`\n环境: ffmpeg=${HAS_FFMPEG} ffprobe=${HAS_FFPROBE}`)
+
 console.log('\n=== 1. bridgeConfig 产出的 mcpServers 形状符合 ACP 协议 ===')
-await test('默认配置：storyboard 默认挂、bili 默认不挂', () => {
+{
   const cfg = M.defaults()
   const { servers, capabilities } = M.buildMcpServers(cfg, { log: () => {} })
-  assert.equal(servers.length, 1, `默认应该只挂 storyboard，实际 ${servers.length} 个：${servers.map(s => s.name)}`)
-  assert.equal(servers[0].name, 'storyboard')
+
+  ok('默认配置：bili 不挂（依赖不全不能假装挂上）',
+    !servers.some(s => s.name === 'bilibili') && capabilities.bili.ok === false,
+    JSON.stringify(servers.map(s => s.name)))
   // bili 默认关，且给出明确原因（不是空）
-  assert.equal(capabilities.bili.ok, false)
-  assert.ok(String(capabilities.bili.reason || '').length > 0, 'bili 关闭时没给原因')
-})
+  ok('bili 关闭时给了原因', String(capabilities.bili.reason || '').length > 0, capabilities.bili.reason)
 
-await test('**command 必须是绝对路径**（ACP resolveMcpConfigs 硬性要求）', () => {
-  const { servers } = M.buildMcpServers(M.defaults(), { log: () => {} })
-  for (const s of servers) {
-    assert.ok(path.isAbsolute(s.command), `${s.name} 的 command 不是绝对路径：${s.command}`)
+  // storyboard 是否挂载，取决于 ffmpeg/ffprobe 这两个硬依赖 —— 用同一份环境事实断言两边一致
+  if (FF_OK) {
+    ok('有 ffmpeg/ffprobe 时 storyboard 默认挂载', servers.length === 1 && servers[0].name === 'storyboard',
+      JSON.stringify(servers.map(s => s.name)))
+    ok('storyboard 能力状态为 ok 且给了产物目录',
+      capabilities.storyboard?.ok === true && !!capabilities.storyboard?.outputDir,
+      JSON.stringify(capabilities.storyboard))
+  } else {
+    ok('缺 ffmpeg/ffprobe 时 storyboard 不挂载（不假装可用）',
+      servers.length === 0 && capabilities.storyboard?.ok === false,
+      JSON.stringify(servers.map(s => s.name)))
+    ok('storyboard 未挂载的原因里明确提到缺 ffmpeg/ffprobe',
+      /ffmpeg|ffprobe/i.test(String(capabilities.storyboard?.reason || '')),
+      capabilities.storyboard?.reason)
   }
-})
+}
 
-await test('**env 必须是 [{name,value}] 数组**（不是对象；ACP entriesToRecord 要求）', () => {
+if (!FF_OK) {
+  skip('1b. 已挂载 storyboard 的 ACP 形状（command/env/name 唯一/STORYBOARD_DIR）',
+    '本机没有 ffmpeg/ffprobe，storyboard 按设计不挂载')
+} else {
   const { servers } = M.buildMcpServers(M.defaults(), { log: () => {} })
-  for (const s of servers) {
-    assert.ok(Array.isArray(s.env), `${s.name} 的 env 不是数组`)
-    for (const e of s.env) {
-      assert.equal(typeof e.name, 'string', `env 条目缺 name`)
-      assert.equal(typeof e.value, 'string', `env 条目 value 必须是字符串（数字会被 ACP 拒）`)
+
+  await test('**command 必须是绝对路径**（ACP resolveMcpConfigs 硬性要求）', () => {
+    for (const s of servers) {
+      assert.ok(path.isAbsolute(s.command), `${s.name} 的 command 不是绝对路径：${s.command}`)
     }
-  }
-})
+  })
 
-await test('name 唯一（ACP 按 normalize 后比较，重复会抛错）', () => {
-  const { servers } = M.buildMcpServers(M.defaults(), { log: () => {} })
-  const names = servers.map(s => s.name.trim().toLowerCase())
-  assert.equal(new Set(names).size, names.length, `重复的 server name：${names}`)
-})
+  await test('**env 必须是 [{name,value}] 数组**（不是对象；ACP entriesToRecord 要求）', () => {
+    for (const s of servers) {
+      assert.ok(Array.isArray(s.env), `${s.name} 的 env 不是数组`)
+      for (const e of s.env) {
+        assert.equal(typeof e.name, 'string', 'env 条目缺 name')
+        assert.equal(typeof e.value, 'string', 'env 条目 value 必须是字符串（数字会被 ACP 拒）')
+      }
+    }
+  })
 
-await test('storyboard 的 env 里带了 STORYBOARD_DIR（宿主告诉 wrapper 产物落哪）', () => {
-  const { servers } = M.buildMcpServers(M.defaults(), { log: () => {} })
-  const sb = servers.find(s => s.name === 'storyboard')
-  const dirEntry = sb.env.find(e => e.name === 'STORYBOARD_DIR')
-  assert.ok(dirEntry, 'storyboard 的 env 里没有 STORYBOARD_DIR')
-  assert.ok(dirEntry.value.length > 0, 'STORYBOARD_DIR 是空值')
-})
+  await test('name 唯一（ACP 按 normalize 后比较，重复会抛错）', () => {
+    const names = servers.map(s => s.name.trim().toLowerCase())
+    assert.equal(new Set(names).size, names.length, `重复的 server name：${names}`)
+  })
+
+  await test('storyboard 的 env 里带了 STORYBOARD_DIR（宿主告诉 wrapper 产物落哪）', () => {
+    const sb = servers.find(s => s.name === 'storyboard')
+    assert.ok(sb, '没挂载 storyboard')
+    const dirEntry = sb.env.find(e => e.name === 'STORYBOARD_DIR')
+    assert.ok(dirEntry, 'storyboard 的 env 里没有 STORYBOARD_DIR')
+    assert.ok(dirEntry.value.length > 0, 'STORYBOARD_DIR 是空值')
+    assert.ok(path.isAbsolute(dirEntry.value), `STORYBOARD_DIR 必须是绝对路径：${dirEntry.value}`)
+  })
+}
 
 console.log('\n=== 2. 【设计关键】产物路径在桥的 [SEND_FILE] 允许根内 ===')
-await test('storyboardOutputDir 落在 stagingDir 之下', () => {
-  const cfg = M.defaults()
-  const outDir = M.storyboardOutputDir(cfg)
+await test('默认配置下 storyboardOutputDir 落在 <dataDir>/.qq-media 之下', () => {
+  const outDir = M.storyboardOutputDir(M.defaults())
   // bridgeConfig 里 staging 的算法：cfg.media.stagingDir || <dataDir>/.qq-media
-  const staging = cfg.media?.stagingDir || path.join(M.dataDir(), '.qq-media')
-  assert.ok(outDir.startsWith(staging + path.sep),
+  const staging = path.join(M.dataDir(), '.qq-media')
+  assert.ok(outDir === path.join(staging, 'storyboard') || outDir.startsWith(staging + path.sep),
     `产物目录 ${outDir} 不在 staging 根 ${staging} 之下 —— 模型会发不出去`)
 })
 
-await test('**产物目录满足 isPathAllowedForSend 的允许根判定**（复刻桥的算法）', () => {
+await test('显式 media.stagingDir 时产物目录跟随它（本测试用它把落盘限制在 tmp）', () => {
+  const staging = path.join(TMP, 'staging')
   const cfg = M.defaults()
+  cfg.media = { ...(cfg.media || {}), stagingDir: staging }
+  const outDir = M.storyboardOutputDir(cfg)
+  assert.equal(outDir, path.join(staging, 'storyboard'))
+  assert.ok(outDir.startsWith(staging + path.sep))
+})
+
+await test('**产物目录满足 isPathAllowedForSend 的允许根判定**（复刻桥的算法）', () => {
+  const staging = path.join(TMP, 'staging')
+  const cfg = M.defaults()
+  cfg.media = { ...(cfg.media || {}), stagingDir: staging }
   const outDir = M.storyboardOutputDir(cfg)
   fs.mkdirSync(outDir, { recursive: true })
   // 造一个假产物，模拟 wrapper 真产出后的文件
@@ -175,7 +240,6 @@ await test('**产物目录满足 isPathAllowedForSend 的允许根判定**（复
   fs.writeFileSync(artifact, Buffer.alloc(2048, 0x89))
 
   // 复刻 lib/bridge/index.js isPathAllowedForSend 的允许根逻辑
-  const staging = cfg.media?.stagingDir || path.join(M.dataDir(), '.qq-media')
   const cwd = cfg.dsh?.cwd || path.join(M.dataDir(), 'agent')
   const allowedRoots = [staging, cwd].map(r => {
     try { return fs.realpathSync(r) } catch { return path.resolve(r) }
@@ -202,10 +266,9 @@ await test('initialize + tools/list 成功，且暴露 video_probe / video_story
 })
 
 console.log('\n=== 4. 真跑一次 storyboard 出图（通过 MCP 协议）===')
-let hasFfmpeg = true
-try { spawn('ffmpeg', ['-version'], { stdio: 'ignore' }).on('close', () => {}) } catch { hasFfmpeg = false }
-if (!hasFfmpeg || !fs.existsSync('/usr/bin/ffmpeg')) {
-  console.log('  ⚠️  跳过：本机没有 ffmpeg（storyboard 硬依赖，环境缺失不是代码问题）')
+if (!FF_OK) {
+  skip('4. 真跑 storyboard 出图（video_probe / video_storyboard）',
+    `本机缺 ${[!HAS_FFMPEG && 'ffmpeg', !HAS_FFPROBE && 'ffprobe'].filter(Boolean).join('/')} —— 环境缺失不是代码问题`)
 } else {
   await makeClip()
   fs.mkdirSync(SB_OUT, { recursive: true })
@@ -255,49 +318,60 @@ await test('bili 默认关闭 → capabilities 里有明确原因', () => {
     `关闭原因不够明确：${capabilities.bili.reason}`)
 })
 
-await test('bili 开启但没配 venv → 明确说缺什么，不是静默', () => {
+await test('bili 开启后：要么依赖真齐才挂，要么明确说缺什么（二选一，不静默）', () => {
   const cfg = M.defaults()
   cfg.mcp = { ...cfg.mcp, bili: { ...cfg.mcp.bili, enabled: true } }
   const { servers, capabilities } = M.buildMcpServers(cfg, { log: () => {} })
-  assert.equal(capabilities.bili.ok, false, '依赖不全时 bili 不该被判定可用')
-  // **不能挂上一个一定起不来的 server**（ACP 是 failOnStartupError: true，
-  // 挂错的后果是整个会话建不起来 —— 比不挂严重得多）
-  assert.ok(!servers.some(s => s.name === 'bilibili'),
-    '依赖不全却把 bilibili 挂上了 —— ACP failOnStartupError 会让整个会话失败')
-  const reason = String(capabilities.bili.reason)
-  assert.ok(reason.length > 10, `原因太短不够指导：${reason}`)
-  // 原因要指出「该装什么」，不能只说「不可用」
-  assert.match(reason, /venv|python|依赖|pip/i, `原因没指出解决办法：${reason}`)
+  const srv = servers.find(s => s.name === 'bilibili')
+  // 本机可能真的有 bili-duty venv（共享给「刷B站」用的那份）→ bili 合法挂载。
+  // 判断分支用**实际结果**，而不是写死「一定没 venv」——否则有 venv 的机器会假失败。
+  if (srv) {
+    assert.equal(capabilities.bili.ok, true, '挂上了 bilibili 却报 ok=false')
+    assert.ok(path.isAbsolute(srv.command), `bili command 必须是绝对路径（ACP 要求）：${srv.command}`)
+    assert.ok(fs.existsSync(srv.command), `挂载用的 python 不存在：${srv.command}`)
+    assert.ok(!capabilities.bili.reason, 'ok=true 时不该有 reason')
+  } else {
+    assert.equal(capabilities.bili.ok, false, '依赖不全时 bili 不该被判定可用')
+    // **不能挂上一个一定起不来的 server**（ACP 是 failOnStartupError: true，
+    // 挂错的后果是整个会话建不起来 —— 比不挂严重得多）
+    assert.ok(!servers.some(s => s.name === 'bilibili'),
+      '依赖不全却把 bilibili 挂上了 —— ACP failOnStartupError 会让整个会话失败')
+    const reason = String(capabilities.bili.reason)
+    assert.ok(reason.length > 10, `原因太短不够指导：${reason}`)
+    // 原因要指出「该装什么」，不能只说「不可用」
+    assert.match(reason, /venv|python|依赖|pip/i, `原因没指出解决办法：${reason}`)
+  }
 })
 
-await test('bili 配置了不存在的 venv → 报「venv 里找不到 python」（指向具体路径）', () => {
+await test('bili 显式指定的 python 不存在 → 明确报错（指向具体路径），不静默降级', () => {
   const cfg = M.defaults()
-  cfg.mcp = { ...cfg.mcp, bili: { ...cfg.mcp.bili, enabled: true, venv: path.join(TMP, 'no-such-venv') } }
+  const bogus = path.join(TMP, 'no-such-python')
+  cfg.mcp = { ...cfg.mcp, bili: { ...cfg.mcp.bili, enabled: true, pythonBin: bogus } }
   const { servers, capabilities } = M.buildMcpServers(cfg, { log: () => {} })
-  assert.equal(capabilities.bili.ok, false)
-  assert.match(String(capabilities.bili.reason), /找不到 python|no-such-venv/,
+  assert.equal(capabilities.bili.ok, false, `指定的 python 不存在却判定可用：${JSON.stringify(capabilities.bili)}`)
+  assert.ok(!servers.some(s => s.name === 'bilibili'), '指定的 python 不存在却把 bilibili 挂上了')
+  assert.match(String(capabilities.bili.reason), /不存在|no-such-python/,
     `没指出具体路径：${capabilities.bili.reason}`)
-  assert.ok(!servers.some(s => s.name === 'bilibili'))
 })
 
 console.log('\n=== 6. storyboard 缺 ffmpeg 时不假装挂上 ===')
-await test('frp缺 ffmpeg → capabilities.storyboard.ok=false（而不是挂了但跑不起来）', () => {
-  // 不能真卸载 ffmpeg，改用一个必然失败的方式验证分支：
-  // 把 enabled 打开但用一个不存在的 wrapper 路径来触发 missing 分支
+await test('storyboard 的 ok 与 reason 互斥，且与 ffmpeg 实际可用性一致', () => {
   const cfg = M.defaults()
   const { capabilities } = M.buildMcpServers(cfg, { log: () => {} })
-  // 正常环境 ffmpeg 在，应该是 ok；这里只断言「ok 与 reason 互斥」
-  if (capabilities.storyboard.ok) {
+  if (FF_OK) {
+    assert.equal(capabilities.storyboard.ok, true, '有 ffmpeg/ffprobe 却不 ok')
     assert.equal(capabilities.storyboard.reason, undefined, 'ok=true 时不该有 reason')
     assert.ok(capabilities.storyboard.outputDir, 'ok=true 时应给出产物目录')
   } else {
-    assert.ok(String(capabilities.storyboard.reason || '').length > 0, 'ok=false 时必须给原因')
+    assert.equal(capabilities.storyboard.ok, false, '缺 ffmpeg/ffprobe 却报告 ok')
+    assert.match(String(capabilities.storyboard.reason || ''), /ffmpeg|ffprobe/i,
+      `缺依赖时必须点名缺什么：${capabilities.storyboard.reason}`)
   }
 })
 
 console.log('\n=== 7. bridgeConfig 真把它塞进去了 ===')
 await test('源码级：bridgeConfig 返回对象里有 mcpServers 字段', () => {
-  const src = fs.readFileSync(path.join(PKG, 'lib', 'index.js'), 'utf8')
+  const src = readSource('lib/index.js')
   // 定位 bridgeConfig 函数体
   const start = src.indexOf('function bridgeConfig (cfg) {')
   const end = src.indexOf('\nfunction ensureAgentScaffold', start)
@@ -308,7 +382,7 @@ await test('源码级：bridgeConfig 返回对象里有 mcpServers 字段', () =
 })
 
 await test('源码级：capabilities.mcp 上报给设置页', () => {
-  const src = fs.readFileSync(path.join(PKG, 'lib', 'index.js'), 'utf8')
+  const src = readSource('lib/index.js')
   assert.match(src, /mcp: mcpHealthForUi\(cfg\)/, '没有把 mcp 能力状态上报到设置页 —— 用户看不到缺什么')
 })
 
@@ -320,7 +394,7 @@ console.log('\n=== 8. 桥侧能吃这份 mcpServers（env 数组/对象两种写
 //   → **所有环境变量静默丢失**（STORYBOARD_DIR 丢了 → 产物落错目录 → 发不出去）。
 // 这是 P1 接线时才暴露的（脚本版 env 是对象，插件版按 ACP 规范给数组）。
 function loadNormalizeMcpEnv () {
-  const src = fs.readFileSync(path.join(PKG, 'lib', 'bridge', 'index.js'), 'utf8')
+  const src = readSource('lib/bridge/index.js')
   const start = src.indexOf('function normalizeMcpEnv (env) {')
   const end = src.indexOf('\n}\n', start)
   if (start < 0 || end < 0) throw new Error('找不到 normalizeMcpEnv（锚点变了）')
@@ -360,10 +434,13 @@ await test('数组里 value 不是字符串时被 String() 化（ACP 要求 valu
 })
 
 console.log('\n=== 9. 隔离确认（不碰生产）===')
-await test('所有产出都在 /tmp 下的测试目录里', () => {
+await test('所有产出都在 os.tmpdir() 下的测试目录里', () => {
   const outReal = fs.existsSync(SB_OUT) ? fs.realpathSync(SB_OUT) : path.resolve(SB_OUT)
-  assert.ok(outReal.startsWith(os.tmpdir()), `产物目录不在 tmp：${outReal}`)
+  assert.ok(outReal.startsWith(fs.realpathSync(os.tmpdir())), `产物目录不在 tmp：${outReal}`)
 })
 
-console.log(`\n结果: ${pass} 通过 / ${fail} 失败`)
+console.log(`\n结果: ${pass} 通过 / ${fail} 失败 / ${skipCount} 跳过`)
+if (fail === 0) {
+  try { fs.rmSync(TMP, { recursive: true, force: true }) } catch { /* ignore */ }
+}
 process.exit(fail === 0 ? 0 : 1)

@@ -58,7 +58,7 @@ if (!DEST) {
 
 // 这些不进安装副本：node_modules 是依赖（安装目录自己装）、.git 是版本库、
 // 日志和预览产物跟运行无关
-const SKIP_DIRS = new Set(['node_modules', '.git', '.preview', 'logs', 'dist', '.cache', '__pycache__'])
+const SKIP_DIRS = new Set(['node_modules', '.git', '.preview', 'logs', 'dist', '.cache', '__pycache__', '.vendor-backup'])
 const SKIP_FILES = [/\.log$/i, /^\.DS_Store$/, /\.pyc$/i]
 
 function walk (dir, base = dir, out = []) {

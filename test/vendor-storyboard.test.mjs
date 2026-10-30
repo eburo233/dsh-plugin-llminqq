@@ -16,7 +16,7 @@
 //   （版本号、files 清单、被删的 src/index.js 确实不在、没有 __pycache__）。
 
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -29,6 +29,7 @@ const CLI = path.join(VENDOR, 'bin', 'storyboard.mjs')
 
 let pass = 0
 let fail = 0
+let skip = 0
 async function test (name, fn) {
   try { await fn(); pass++; console.log(`  ✓ ${name}`) } catch (err) {
     fail++; console.log(`  ✗ ${name}\n    ${err.message}`)
@@ -40,22 +41,11 @@ const CLIP = path.join(TMP, 'clip.mp4')
 const CLIP_SECONDS = 6
 
 function hasFfmpeg () {
-  try {
-    return spawnSync('ffmpeg', ['-version']).status === 0
-  } catch { return false }
+  // 跨平台探测：不假设 /usr/bin/ffmpeg（Windows 上没有这个路径）。
+  // spawnSync 找不到命令时 error=ENOENT、没有异常，比 spawn+error 监听靠谱。
+  const r = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore', timeout: 10000 })
+  return !r.error && r.status === 0
 }
-function spawnSync (cmd, args) {
-  try {
-    // 用同步方式只为探测存在性，不阻塞太久
-    const { execFileSync } = require2('node:child_process')
-    execFileSync(cmd, args, { stdio: 'ignore', timeout: 10000 })
-    return { status: 0 }
-  } catch { return { status: 1 } }
-}
-// ESM 里没有 require；用一个薄封装支持上面的写法
-function require2 (mod) { return nodeRequire(mod) }
-import { createRequire } from 'node:module'
-const nodeRequire = createRequire(import.meta.url)
 
 async function makeClip () {
   return new Promise((resolve, reject) => {
@@ -160,6 +150,7 @@ await test('files 里声明的条目全部存在', () => {
 
 console.log('\n=== 4. CLI 真能跑（这是更新后自动测试的核心价值）===')
 if (!hasFfmpeg()) {
+  skip += 4   // --help / 真跑出图 / probe / 非视频优雅报错
   console.log('  ⚠️  跳过 CLI 测试：本机没有 ffmpeg（storyboard 依赖它，属环境缺失不是代码问题）')
 } else {
   await makeClip()
@@ -243,5 +234,7 @@ await test('vendor 目录里的代码和「原样复制」声明一致（除声�
   assert.deepEqual(extra, [], `vendor 里有 manifest 没声明的多余条目：${extra.join(', ')}（应为「原样复制+声明文件」）`)
 })
 
-console.log(`\n结果: ${pass} 通过 / ${fail} 失败`)
+// 测试产物必须清掉：TMP 里可能留着几十 MB 的测试视频/宫格图
+try { fs.rmSync(TMP, { recursive: true, force: true }) } catch { /* ignore */ }
+console.log(`\n结果: ${pass} 通过 / ${fail} 失败 / ${skip} 跳过`)
 process.exit(fail === 0 ? 0 : 1)

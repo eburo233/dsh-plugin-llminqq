@@ -17,7 +17,7 @@
 //     —— 那是环境问题不是 vendored 代码问题
 
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -30,6 +30,7 @@ const SERVER = path.join(VENDOR, 'mcp_server.py')
 
 let pass = 0
 let fail = 0
+let skip = 0
 async function test (name, fn) {
   try { await fn(); pass++; console.log(`  ✓ ${name}`) } catch (err) {
     fail++; console.log(`  ✗ ${name}\n    ${err.message}`)
@@ -40,7 +41,7 @@ function runPython (args, timeoutMs = 60000) {
   return new Promise(resolve => {
     // -B：不写 __pycache__ —— 测试跑完不该在 vendor 里留字节码（否则
     // 下一次跑「无字节码」断言就会红，而且这些缓存本来就不该进包）
-    const p = spawn('python3', ['-B', ...args], { stdio: ['ignore', 'pipe', 'pipe'] })
+    const p = spawn(PY.bin, [...PY.preArgs, '-B', ...args], { stdio: ['ignore', 'pipe', 'pipe'] })
     let out = '', err = ''
     p.stdout.on('data', c => { out += c })
     p.stderr.on('data', c => { err += c })
@@ -50,9 +51,28 @@ function runPython (args, timeoutMs = 60000) {
   })
 }
 
-const hasPython = fs.existsSync('/usr/bin/python3') || (() => {
-  try { return spawn('python3', ['--version']).pid !== undefined } catch { return false }
-})()
+// 跨平台找 Python 3.8+：Windows 上通常没有 `python3`，只有 `python` 或 `py -3`；
+// Linux/macOS 反过来。挨个探测，找到第一个能用的，而不是写死 /usr/bin/python3。
+const PY_CANDIDATES = [
+  { bin: 'python3', preArgs: [], label: 'python3' },
+  { bin: 'python', preArgs: [], label: 'python' },
+  { bin: 'py', preArgs: ['-3'], label: 'py -3' },   // Windows Python Launcher
+]
+function findPython () {
+  for (const c of PY_CANDIDATES) {
+    const r = spawnSync(c.bin, [...c.preArgs, '--version'], { encoding: 'utf8', timeout: 10000 })
+    if (r.error) continue
+    const txt = `${r.stdout || ''}${r.stderr || ''}`
+    const m = txt.match(/Python (\d+)\.(\d+)/)
+    if (r.status === 0 && m) {
+      const major = Number(m[1]), minor = Number(m[2])
+      if (major > 3 || (major === 3 && minor >= 8)) return { ...c, version: `${major}.${minor}` }
+    }
+  }
+  return null
+}
+const PY = findPython()
+const hasPython = Boolean(PY)
 
 console.log('\n=== 1. 来源声明完整性（MIT 署名义务）===')
 await test('VENDORED.md 存在（说明它是谁的、从哪来）', () => {
@@ -107,8 +127,11 @@ await test('没有 .venv / venv（虚拟环境不该进包）', () => {
 
 console.log('\n=== 3. Python 源码能不能真的编译（语法错必须在这里抓住）===')
 if (!hasPython) {
-  console.log('  ⚠️  跳过：本机没有 python3（环境缺失，不是 vendored 代码问题）')
+  skip += 3   // 语法检查 / requirements 校验 / import 检查都依赖 Python
+  console.log('  ⚠️  跳过：本机没有可用的 Python 3.8+（试过 ' +
+    PY_CANDIDATES.map(c => c.label).join(' / ') + '，都不可用；环境缺失，不是 vendored 代码问题）')
 } else {
+  console.log(`  ℹ️  用 ${PY.bin}${PY.preArgs.length ? ' ' + PY.preArgs.join(' ') : ''}（Python ${PY.version}）做语法检查`)
   await test('mcp_server.py 语法正确（py_compile 级检查）', async () => {
     // 用 compile() 而不是 import：不需要第三方依赖就能验语法
     const r = await runPython(['-c',
@@ -161,5 +184,5 @@ await test('vendor 目录里只有 manifest 声明的东西 + 两个声明文件
   assert.deepEqual(extra, [], `有 manifest 没声明的多余条目：${extra.join(', ')}`)
 })
 
-console.log(`\n结果: ${pass} 通过 / ${fail} 失败`)
+console.log(`\n结果: ${pass} 通过 / ${fail} 失败 / ${skip} 跳过`)
 process.exit(fail === 0 ? 0 : 1)

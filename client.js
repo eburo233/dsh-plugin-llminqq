@@ -234,11 +234,27 @@ window.__ModuleLoader__.load({
     document.head.appendChild(styleEl)
 
     // ── HTTP 小工具 ─────────────────────────────────────────────────────────
+    // 一律带超时：没有超时的 fetch 遇到「后端卡住/半死」会一直挂着，
+    // 界面就停在 loading（用户看到的是「设置页一直转圈」）。
+    const API_TIMEOUT_MS = 30000
     async function api (path, init) {
-      const r = await fetch(API + path, {
-        headers: { 'content-type': 'application/json' },
-        ...init,
-      })
+      // 调用方自己传了 signal 就不覆盖（少数长任务用得更久）
+      const signal = init?.signal ?? (typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+        ? AbortSignal.timeout(API_TIMEOUT_MS)
+        : undefined)
+      let r
+      try {
+        r = await fetch(API + path, {
+          headers: { 'content-type': 'application/json' },
+          ...init,
+          signal,
+        })
+      } catch (err) {
+        if (err?.name === 'TimeoutError' || err?.name === 'AbortError') {
+          return { ok: false, error: `请求超时（${Math.round(API_TIMEOUT_MS / 1000)}s）：后端可能卡住了，看「运行」页的日志` }
+        }
+        throw err
+      }
       const text = await r.text()
       let body
       try { body = JSON.parse(text) } catch { body = { ok: false, error: text.slice(0, 300) } }
@@ -418,14 +434,22 @@ window.__ModuleLoader__.load({
       const [msg, setMsg] = useState(null)     // {kind, text}
       const [loading, setLoading] = useState(true)
 
+      const inflightRef = useRef(false)
       const refresh = useCallback(async () => {
+        // 轮询是 4 秒一次，而 /overview 里的 docker/登录探测在慢机器上要十几秒：
+        // 不挡的话新一轮在上一轮没回来时就发出去，请求层层叠加，越叠越慢、越慢越叠。
+        if (inflightRef.current) return
+        inflightRef.current = true
         try {
           const r = await api('/overview')
           if (r.ok) setData(r)
           else setMsg({ kind: 'err', text: r.error || r.reason || '读取状态失败' })
         } catch (err) {
           setMsg({ kind: 'err', text: '连不上插件后端：' + err.message })
-        } finally { setLoading(false) }
+        } finally {
+          inflightRef.current = false
+          setLoading(false)
+        }
       }, [])
 
       useEffect(() => { refresh() }, [refresh])
@@ -509,7 +533,7 @@ window.__ModuleLoader__.load({
 
         tab === 'login' && h(LoginTab, { data, cfg, env, busy, run, refresh, saveConfig }),
         tab === 'model' && h(ModelTab, { data, cfg, env, busy, run, saveConfig, setMsg }),
-        tab === 'behavior' && h(BehaviorTab, { cfg, saveConfig }),
+        tab === 'behavior' && h(BehaviorTab, { cfg, saveConfig, env }),
         tab === 'memory' && h(MemoryTab, { run, setMsg }),
         tab === 'persona' && h(PersonaTab, { run, setMsg }),
         tab === 'run' && h(RunTab, { data, busy, run, refresh }),
@@ -593,6 +617,54 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // B站 MCP 的一键装依赖。两处用到（登录页的安装指引、行为页的工具卡），
+    // 所以单独拆出来：里面要跑 pip（慢），得有自己的进度与日志，不能每次渲染都重跑。
+    function BiliSetup ({ bili, venv }) {
+      const [busy, setBusy] = useState(false)
+      const [lines, setLines] = useState([])
+      const [done, setDone] = useState(null)
+
+      const go = async () => {
+        setBusy(true); setLines([]); setDone(null)
+        try {
+          const r = await post('/mcp/bili/setup', {})
+          setLines(Array.isArray(r.log) ? r.log : [])
+          setDone(r.ok
+            ? { kind: 'ok', text: '装好了。把「B站工具」和「B站工具（MCP）」都打开，再重启桥一次。' }
+            : { kind: 'err', text: r.detail || r.error || '装失败（看下面的日志）' })
+        } catch (e) {
+          setDone({ kind: 'err', text: '装失败：' + e.message })
+        } finally { setBusy(false) }
+      }
+
+      const venvPath = bili?.venv || venv || ''
+      const state = bili?.ok
+        ? { kind: 'ok', text: '当前可用：' + (bili?.pythonBin || venvPath) }
+        : null
+      return h('div', { style: { marginTop: 6 } },
+        state ? h(Notice, { kind: state.kind }, state.text) : null,
+        h('div', { className: 'muted', style: { fontSize: 12, lineHeight: 1.7 } },
+          'MCP 服务器是插件自带的，不用另外装 bili-duty；需要的只是一个装了 Python 依赖的 venv。',
+          venvPath ? h('div', { className: 'mono' }, 'venv 位置：' + venvPath) : null,
+        ),
+        h('div', { className: 'row', style: { marginTop: 8 } },
+          h('button', { className: 'primary', disabled: busy, onClick: go },
+            busy ? '正在装依赖…（首次要下载，可能一两分钟）' : (bili?.ok ? '重装依赖（换 venv 也行）' : '一键装依赖')),
+          h(Collapse, { title: '想自己手动装' },
+            h('div', { className: 'muted', style: { fontSize: 12, lineHeight: 1.8 } },
+              h('div', null, '1. 建 venv：python -m venv "' + (venvPath || '<venv 目录>') + '"'),
+              h('div', { className: 'mono' }, '2. 装依赖："' + (venvPath || '<venv>') + '\\Scripts\\python.exe" -m pip install -r "' + (bili?.requirements || 'vendor/bilibili-mcp/requirements.txt') + '"'),
+              h('div', null, '3. 回「行为」页打开两个 B站 开关，重启桥'),
+            )),
+        ),
+        done ? h(Notice, { kind: done.kind }, done.text) : null,
+        lines.length
+          ? h(Collapse, { title: `安装日志（${lines.length} 行）` },
+              h('div', { className: 'logbox', style: { maxHeight: 220 } }, lines.join('\n')))
+          : null,
+      )
+    }
+
     function SetupWizard ({ env, cfg, saveConfig, onDone }) {
       const [probe, setProbe] = useState(null)
       const [loading, setLoading] = useState(true)
@@ -622,52 +694,66 @@ window.__ModuleLoader__.load({
       }
 
       // 一键：拉镜像 → 起容器 → 等 OneBot 就绪
+      //
+      // ⚠️ 整个流程必须 try/finally：按钮是 `disabled: !!step`，
+      // 而 step 只在成功路径上被 setStep('') 复位。任何一次 await 抛异常
+      // （网络断、宿主 500、请求超时）都会让 step 永远停在文案上 →
+      // 按钮永久禁用+一直转圈，用户以为「正在装」其实什么都没在发生。
       const oneClickDocker = async () => {
         setResult(null)
-        setStep('正在拉取镜像（首次约 2GB，慢的话几分钟）…')
-        const pull = await post('/env/pull-image')
-        if (!pull.ok) {
+        try {
+          setStep('正在拉取镜像（首次约 2GB，慢的话几分钟）…')
+          const pull = await post('/env/pull-image')
+          if (!pull.ok) {
+            setResult({ kind: 'err', text: '拉镜像失败：' + (pull.detail || pull.error || '').slice(-400) })
+            return
+          }
+          setStep('镜像就绪，正在启动容器…')
+          const started = await post('/napcat/start')
+          if (!started.ok) {
+            setResult({
+              kind: 'err',
+              text: '容器启动失败：' + (started.reason || started.error || '') +
+                (started.detail ? '\n\n' + started.detail : ''),
+            })
+            return
+          }
+          setStep('容器已起，正在等 NapCat 就绪（它内部要启动完整的 QQ 客户端，约 10~60 秒）…')
+          const waited = await post('/env/wait-onebot', { timeoutMs: 120000 })
+          if (waited.ok) {
+            setResult({ kind: 'ok', text: '✓ 就绪！下面应该出现二维码了，用手机 QQ 扫。' })
+          } else {
+            setResult({
+              kind: 'warn',
+              text: `容器起了，但 ${waited.port || 3001} 端口 ${Math.round((waited.timeoutMs || 90000) / 1000)} 秒内没就绪。\n` +
+                '可能还在启动（再等一会儿点刷新），或者去「运行」页看容器日志。',
+            })
+          }
+          await refreshProbe()
+          onDone?.()
+        } catch (e) {
+          setResult({ kind: 'err', text: '一键安装中断：' + (e?.message || e) + '\n可以直接重试；也可以切到「手动」按步骤来。' })
+        } finally {
+          // 无论成功、失败还是抛异常，都把 step 复位，别让按钮卡死
           setStep('')
-          setResult({ kind: 'err', text: '拉镜像失败：' + (pull.detail || '').slice(-400) })
-          return
         }
-        setStep('镜像就绪，正在启动容器…')
-        const started = await post('/napcat/start')
-        if (!started.ok) {
-          setStep('')
-          setResult({
-            kind: 'err',
-            text: '容器启动失败：' + (started.reason || '') +
-              (started.detail ? '\n\n' + started.detail : ''),
-          })
-          return
-        }
-        setStep('容器已起，正在等 NapCat 就绪（它内部要启动完整的 QQ 客户端，约 10~60 秒）…')
-        const waited = await post('/env/wait-onebot', { timeoutMs: 120000 })
-        setStep('')
-        if (waited.ok) {
-          setResult({ kind: 'ok', text: '✓ 就绪！下面应该出现二维码了，用手机 QQ 扫。' })
-        } else {
-          setResult({
-            kind: 'warn',
-            text: `容器起了，但 ${waited.port || 3001} 端口 ${Math.round((waited.timeoutMs || 90000) / 1000)} 秒内没就绪。\n` +
-              '可能还在启动（再等一会儿点刷新），或者去「运行」页看容器日志。',
-          })
-        }
-        await refreshProbe()
-        onDone?.()
       }
 
       // 一键：连已经在跑的本机 NapCat
       const useExisting = async () => {
         setResult(null)
-        setStep('正在测试连接…')
-        const waited = await post('/env/wait-onebot', { timeoutMs: 8000 })
-        setStep('')
-        if (waited.ok) {
-          setResult({ kind: 'ok', text: `✓ ${waited.port} 端口通，可以点「启动桥」了` })
-        } else {
-          setResult({ kind: 'err', text: '端口不通。确认 NapCat 已经启动，且 OneBot 正向 WS 端口是 ' + (probe?.onebotPort || 3001) })
+        try {
+          setStep('正在测试连接…')
+          const waited = await post('/env/wait-onebot', { timeoutMs: 8000 })
+          if (waited.ok) {
+            setResult({ kind: 'ok', text: `✓ ${waited.port} 端口通，可以点「启动桥」了` })
+          } else {
+            setResult({ kind: 'err', text: '端口不通。确认 NapCat 已经启动，且 OneBot 正向 WS 端口是 ' + (probe?.onebotPort || 3001) })
+          }
+        } catch (e) {
+          setResult({ kind: 'err', text: '测试连接失败：' + (e?.message || e) })
+        } finally {
+          setStep('')
         }
       }
 
@@ -685,12 +771,12 @@ window.__ModuleLoader__.load({
       // 能力行
       const rows = [
         ['操作系统', `${probe.platformLabel} ${probe.arch}`, true],
-        ['Docker', probe.docker.present
-          ? (probe.docker.usable ? probe.docker.version : '装了但没跑起来')
+        ['Docker', probe.docker?.present
+          ? (probe.docker?.usable ? probe.docker?.version : '装了但没跑起来')
           : '没装',
-          probe.docker.usable],
-        ['镜像', probe.localImages.hasTarget ? '已在本地' : '还没拉',
-          probe.localImages.hasTarget],
+          probe.docker?.usable],
+        ['镜像', probe.localImages?.hasTarget ? '已在本地' : '还没拉',
+          probe.localImages?.hasTarget],
         ['OneBot 服务',
           probe.onebot?.found
             ? `已识别（:${probe.onebot.best.port}${probe.onebot.best.selfId ? ' · ' + probe.onebot.best.selfId : ''}）`
@@ -702,12 +788,12 @@ window.__ModuleLoader__.load({
         // 于是「NapCat 跑在别处、3001 握手都成功了」却显示「没找到」——
         // 这不是显示的小毛病，它会让人以为整条链路没连上。
         ['本机 NapCat',
-          probe.artifacts.length
+          probe.artifacts?.length
             ? probe.artifacts.join(', ')
             : probe.onebot?.found
               ? `在跑（:${probe.onebot.best?.port ?? probe.onebotPort} 握手成功）`
               : '没找到',
-          probe.artifacts.length > 0 || probe.onebot?.found === true],
+          probe.artifacts?.length > 0 || probe.onebot?.found === true],
       ]
 
       return h('div', { className: 'card' },
@@ -717,18 +803,15 @@ window.__ModuleLoader__.load({
 
         // B站工具依赖自检：缺 python / 没装依赖 / 开关没开是三种不同的事，
         // 分开说清楚，否则用户会按错的那条去修（这正是「装了还是读不到」的来源）。
+        // 注意：MCP 服务器是插件自带的（vendor/bilibili-mcp/），不需要另外 clone bili-duty；
+        // 缺的只是一个装了依赖的 venv —— 所以这里给「一键装依赖」，别再让人去 bili-duty 里 pip。
         (() => {
           const bili = env?.capabilities?.mcp?.bili
           if (bili?.ok) return null
+          const venv = bili?.venv || ''
           return h(Notice, { kind: 'warn', title: 'B站工具没挂上（读不到视频内容）' },
             h('div', null, bili?.reason || '未知原因'),
-            h(Collapse, { title: '怎么装（装一次就行）' },
-              h('ol', { style: { margin: '6px 0 0 18px', padding: 0, fontSize: 12, lineHeight: 1.8 } },
-                h('li', null, '确认 bili-duty 在哪：D:\\dsh-home\\bili-duty 或 ~/.dsh/bili-duty'),
-                h('li', null, '装依赖：.venv\\Scripts\\python.exe -m pip install -r requirements.txt'),
-                h('li', null, '回「行为」页把「B站工具」和「B站工具（MCP）」都打开'),
-                h('li', null, '重启桥一次（MCP 只在启动时挂）'),
-              )),
+            h(BiliSetup, { bili, venv: cfg.mcp?.bili?.venv || '' }),
           )
         })(),
 
@@ -1260,7 +1343,7 @@ window.__ModuleLoader__.load({
     }
 
     // ── 行为页 ──────────────────────────────────────────────────────────────
-    function BehaviorTab ({ cfg, saveConfig }) {
+    function BehaviorTab ({ cfg, saveConfig, env }) {
       const p = cfg.policy || {}
       const f = cfg.features || {}
 
@@ -1383,10 +1466,23 @@ window.__ModuleLoader__.load({
           // 只有 features.bili 打开、MCP 也挂上，模型才真的拿得到 bili_* 工具。
           h(SwitchRow, {
             label: 'B站工具（MCP）',
-            desc: '挂 bilibili MCP 服务器；需要 bili-duty 的 python 依赖，改了要重启桥',
+            desc: '挂插件自带的 bilibili MCP；缺依赖可在下面一键装，改完要重启桥',
             on: cfg.mcp?.bili?.enabled === true,
             onChange: v => saveConfig({ mcp: { bili: { enabled: v } } }),
           }),
+          // 只有 features.bili 打开、MCP 也真挂上，模型才拿得到 bili_* 工具 ——
+          // 所以状态与「装依赖」必须常驻可见（挂上了也留一个入口，方便换 venv/重装），
+          // 否则用户会以为「开了开关就等于能用」或者干脆找不到这个按钮。
+          (() => {
+            const bili = env?.capabilities?.mcp?.bili
+            if (!bili) return null
+            const title = bili.ok
+              ? 'B站工具已就绪 · 换 venv / 重装依赖'
+              : 'B站工具没挂上 · 点这里装依赖'
+            return h(Collapse, { title },
+              h(BiliSetup, { bili }),
+            )
+          })(),
           h(SwitchRow, {
             label: '自我风格样本库',
             desc: '记住「我类似场合怎么说的」，保持人格一致',
@@ -1454,11 +1550,19 @@ window.__ModuleLoader__.load({
       const [path, setPath] = useState('')
       const [loading, setLoading] = useState(true)
       const [dirty, setDirty] = useState(false)
+      // 读失败时锁住编辑/保存：否则文本框是空的，用户一保存就把原人设覆盖成空
+      const [loadError, setLoadError] = useState('')
 
       useEffect(() => {
         api('/persona').then(r => {
           if (r.ok) { setText(r.text || ''); setPath(r.path || '') }
-          else setMsg({ kind: 'err', text: r.error || '读不到人设' })
+          else {
+            setLoadError(r.error || '读不到人设')
+            setMsg({ kind: 'err', text: `读不到人设：${r.error || '未知错误'}（已禁止保存，避免覆盖原文件）` })
+          }
+        }).catch(err => {
+          setLoadError(err?.message || String(err))
+          setMsg({ kind: 'err', text: `读不到人设：${err?.message || err}（已禁止保存，避免覆盖原文件）` })
         }).finally(() => setLoading(false))
       }, [setMsg])
 
@@ -1474,17 +1578,20 @@ window.__ModuleLoader__.load({
         h('div', { className: 'card-title' }, '人格文件',
           h('span', { className: 'muted', style: { marginLeft: 'auto', fontWeight: 400 } },
             `${byteLenOf(text)} 字节`)),
-        h('div', { className: 'hint' },
-          '模型自己也会改这份文件，看到的内容可能和上次不同。'),
+        loadError
+          ? h('div', { className: 'hint', style: { color: 'var(--danger, #d33)' } },
+              `读取失败：${loadError}。为避免把原文件覆盖成空内容，编辑和保存已禁用；修好文件权限后重新打开本页。`)
+          : h('div', { className: 'hint' }, '模型自己也会改这份文件，看到的内容可能和上次不同。每次保存会留一份 .bak。'),
         h('div', { className: 'mono', style: { color: 'var(--qq-2)', wordBreak: 'break-all' } }, path),
         h('textarea', {
           value: text,
+          disabled: !!loadError,
           onChange: e => { setText(e.target.value); setDirty(true) },
           style: { minHeight: 320, fontFamily: 'ui-monospace,SFMono-Regular,Menlo,monospace', fontSize: 12, lineHeight: 1.6 },
         }),
         h('div', { className: 'row' },
-          h('button', { className: 'primary', disabled: !dirty, onClick: save }, '保存'),
-          h('button', { className: 'tiny', onClick: () => { setText(text); setDirty(false) } }, '放弃修改'),
+          h('button', { className: 'primary', disabled: !dirty || !!loadError, onClick: save }, '保存'),
+          h('button', { className: 'tiny', disabled: !!loadError, onClick: () => { setText(text); setDirty(false) } }, '放弃修改'),
           dirty ? h('span', { className: 'muted', style: { marginLeft: 'auto' } }, '有未保存的修改') : null,
         ),
       )
@@ -1623,7 +1730,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'card-title' }, '分布'),
           h('div', { className: 'sec-head' }, '按层'),
           h('div', { className: 'hint' },
-            stats.byLayer.map(l => `${l.kind} ${l.total}`).join(' · ')),
+            (stats.byLayer || []).map(l => `${l.kind} ${l.total}`).join(' · ')),
           (stats.byVisibility || []).length
             ? h('div', { className: 'hint' }, '可见性：' + stats.byVisibility.map(v => `${v.visibility} ${v.count}`).join(' · '))
             : null,
