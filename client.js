@@ -169,17 +169,28 @@ window.__ModuleLoader__.load({
   white-space:pre-wrap;word-break:break-all;max-height:240px;overflow:auto}
 
 /* ── 折叠块（native details：不占 React state，键盘也能用）────────────── */
-.qq-panel .collapse{border:var(--qq-hair);border-radius:var(--qq-r-sm);background:var(--qq-surface)}
-.qq-panel .collapse+.collapse{margin-top:8px}
-.qq-panel .collapse>summary{list-style:none;cursor:pointer;user-select:none;padding:9px 12px;
+/* ⚠️ 必须显式覆盖宿主那条 .collapse{visibility:collapse} ——
+   它是一条**全局内联规则**（不属于我们插件），把任何 class 含 collapse 的元素
+   变成「占位但不可见」：DOM 在、高度 41px 在、颜色也正常，就是看不见。
+   表现就是「这一块明明是空的但还占地方」。
+   只加 .qq-panel .qq-collapse 还不够（同优先级下后者看源码顺序，宿主在内联层之后注入），
+   所以这里用 visibility:visible + !important 钉死。 */
+.qq-panel .qq-collapse,
+.qq-panel .qq-collapse:not([open]),
+.qq-panel details.qq-collapse {
+  visibility:visible!important;
+}
+.qq-panel .qq-collapse{border:var(--qq-hair);border-radius:var(--qq-r-sm);background:var(--qq-surface)}
+.qq-panel .qq-collapse+.qq-collapse{margin-top:8px}
+.qq-panel .qq-collapse>summary{list-style:none;cursor:pointer;user-select:none;padding:9px 12px;
   font-size:12.5px;color:var(--qq-2);display:flex;align-items:center;gap:8px;border-radius:var(--qq-r-sm)}
-.qq-panel .collapse>summary::-webkit-details-marker{display:none}
-.qq-panel .collapse>summary::before{content:"›";font-size:14px;color:var(--qq-3);
+.qq-panel .qq-collapse>summary::-webkit-details-marker{display:none}
+.qq-panel .qq-collapse>summary::before{content:"›";font-size:14px;color:var(--qq-3);
   display:inline-block;transition:transform .15s ease}
-.qq-panel .collapse[open]>summary::before{transform:rotate(90deg)}
-.qq-panel .collapse>summary:hover{color:var(--qq-1);background:var(--qq-sunken)}
-.qq-panel .collapse .body{padding:6px 12px 12px;font-size:12.5px;line-height:1.75;color:var(--qq-2)}
-.qq-panel .collapse .body strong,.qq-panel .collapse .body b{color:var(--qq-1)}
+.qq-panel .qq-collapse[open]>summary::before{transform:rotate(90deg)}
+.qq-panel .qq-collapse>summary:hover{color:var(--qq-1);background:var(--qq-sunken)}
+.qq-panel .qq-collapse .body{padding:6px 12px 12px;font-size:12.5px;line-height:1.75;color:var(--qq-2)}
+.qq-panel .qq-collapse .body strong,.qq-panel .qq-collapse .body b{color:var(--qq-1)}
 
 /* ── 状态摘要 ─────────────────────────────────────────────────────────── */
 .qq-panel .hero{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
@@ -343,7 +354,10 @@ window.__ModuleLoader__.load({
 
     // 折叠块：用 native <details>，不用 React state，键盘/无障碍都是现成的
     function Collapse ({ title, children }) {
-      return h('details', { className: 'collapse' },
+      // ⚠️ 类名必须带 qq- 前缀：宿主的全局内联样式里有 `.collapse{visibility:collapse}`，
+      //   裸用 'collapse' 会被它命中 → DOM 在、高度在、但看不见（表现是「一块空白占位」）。
+      //   改名根治，CSS 里的 !important 是双保险。
+      return h('details', { className: 'qq-collapse' },
         h('summary', null, title),
         h('div', { className: 'body' }, children),
       )
@@ -2189,8 +2203,17 @@ window.__ModuleLoader__.load({
         try {
           const r = await post('/memory/crawl', { only: 2 })
           if (r.ok) {
-            const n = r.result?.total ?? r.result?.comments ?? '若干'
-            setMsg({ kind: 'ok', text: `抓取完成：${n} 条评论（用时 ${Math.round((r.ms || 0) / 1000)}s）。下一轮学习会自动吃进语料池。` })
+            // ⚠️ 别再拿 `?? '若干'` 兜底了 —— 那会让「一条没抓」也显示成
+            //   「学到 若干 个词汇」，用户以为成功。宁可说清楚没抓到及原因。
+            const got = Number(r.result?.fetched ?? 0) + Number(r.result?.files?.length ?? 0)
+            const secs = Math.round((r.ms || 0) / 1000)
+            if (r.note) {
+              setMsg({ kind: 'warn', text: `${r.note}（用时 ${secs}s，未计次）` })
+            } else if (got > 0) {
+              setMsg({ kind: 'ok', text: `抓取完成：${got} 个视频，用时 ${secs}s。下一轮学习会自动吃进语料池。` })
+            } else {
+              setMsg({ kind: 'warn', text: `跑完了但没抓到内容（用时 ${secs}s，未计次）。${r.result ? JSON.stringify(r.result).slice(0, 120) : ''}` })
+            }
           } else setMsg({ kind: 'err', text: r.error || '抓取失败' })
           await load()
         } catch (e) { setMsg({ kind: 'err', text: '抓取出错：' + e.message }) }
