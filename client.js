@@ -2317,9 +2317,61 @@ window.__ModuleLoader__.load({
     }
 
     // ── 运行页 ──────────────────────────────────────────────────────────────
+    /**
+     * 日志「贴底才跟随」。
+     *
+     * 需求：用户在最底部时，新日志来了要保持在最底部；用户往上翻看历史时，
+     * 新日志来了**不许**把他弹回底部（那样根本没法读）。
+     *
+     * 两个容易写错的地方：
+     *   ① **判断时机**。必须在内容更新**之前**记住「当时是不是贴底」。
+     *      如果等 DOM 更新完再判断，新行一追加 scrollHeight 就变大了，
+     *      容器立刻变成「不在底部」——于是永远不跟随，日志看起来是死的。
+     *      所以滚动位置用 ref 记，由 scroll 事件维护；内容更新前它已经是上一轮的真相。
+     *   ② **程序化滚动也会触发 scroll 事件**。但那正是我们要的（滚到底部后
+     *      ref 变回 true），不需要区分「用户滚」和「代码滚」。
+     *
+     * 阈值 24px 而不是 0：高 DPI / 缩放下列表底部可能差零点几像素，
+     * 严判 0 会导致「明明在最底部却不跟随」。24px 小于一行文字高度，不会误判。
+     */
+    function useStickToBottom (content) {
+      const boxRef = useRef(null)
+      const stuckRef = useRef(true)
+      // stuckRef 给逻辑用（内容更新时读到的是上一轮真相），stuck 给 UI 用（显示「回到底部」）
+      const [stuck, setStuck] = useState(true)
+
+      const isAtBottom = (el) => !el || (el.scrollHeight - el.scrollTop - el.clientHeight) <= 24
+
+      const onScroll = useCallback(() => {
+        const b = isAtBottom(boxRef.current)
+        if (b !== stuckRef.current) {
+          stuckRef.current = b
+          setStuck(b)
+        }
+      }, [])
+
+      // useLayoutEffect：在浏览器绘制之前滚，避免「先闪一下旧位置再跳到底部」
+      React.useLayoutEffect(() => {
+        const el = boxRef.current
+        if (!el) return
+        if (stuckRef.current) el.scrollTop = el.scrollHeight
+      }, [content])
+
+      const jumpToBottom = useCallback(() => {
+        const el = boxRef.current
+        if (!el) return
+        el.scrollTop = el.scrollHeight
+        stuckRef.current = true
+        setStuck(true)
+      }, [])
+
+      return { boxRef, onScroll, stuck, jumpToBottom }
+    }
+
     function RunTab ({ data, busy, run, refresh }) {
       const bridge = data.bridge || {}
       const [log, setLog] = useState(data.bridgeLogTail || '')
+      const { boxRef, onScroll, stuck, jumpToBottom } = useStickToBottom(log)
 
       const loadLog = useCallback(async () => {
         const r = await api('/bridge/log')
@@ -2379,7 +2431,18 @@ window.__ModuleLoader__.load({
           h('div', { className: 'card-title' }, '桥日志',
             h('span', { className: 'muted', style: { fontWeight: 400 } }, '最后 100 行'),
             h('button', { className: 'tiny', onClick: loadLog, style: { marginLeft: 'auto' } }, '刷新')),
-          h('div', { className: 'logbox', style: { maxHeight: 420 } }, log || '（暂无日志）'),
+          h('div', {
+            className: 'logbox',
+            ref: boxRef,
+            onScroll,
+            style: { maxHeight: 420 },
+          }, log || '（暂无日志）'),
+          // 只有用户往上翻、脱离了底部才出现；贴底时它没用处，不该占地方
+          !stuck && log
+            ? h('div', { className: 'row' },
+                h('span', { className: 'muted' }, '已暂停跟随（你在看历史）'),
+                h('button', { className: 'tiny', onClick: jumpToBottom }, '回到底部'))
+            : null,
           h('div', { className: 'muted mono' },
             `完整日志 ${data.env?.dataDir}/logs/bridge.out`),
         ),

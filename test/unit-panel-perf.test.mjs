@@ -225,3 +225,46 @@ test('桥日志默认显示 100 行', () => {
 test('前端标明「最后 100 行」，不同 tab 之间不会突然变长', () => {
   assert.match(CLIENT_SRC, /最后 100 行/, '界面上没写清楚这是最后多少行')
 })
+
+// ── ⑧ 日志「贴底才跟随」的判断时机 ──────────────────────────────────────────
+//
+// 需求：用户停在最底部时，新日志要保持在最底部；用户往上翻看历史时，
+// 新日志**不许**把他弹回底部（不然根本没法读）。
+//
+// 这里最容易写错的是**判断时机**：如果等 DOM 更新完再算「是不是在底部」，
+// 新行一追加 scrollHeight 就变大了，容器立刻变成「不在底部」——
+// 于是永远不跟随，日志看起来像死的。正确做法是用 scroll 事件维护一个 ref，
+// 内容更新时读到的是「上一轮的真相」。
+
+test('日志跟随用 ref 记滚动位置（内容更新前读到的是上一轮真相）', () => {
+  const fn = CLIENT_SRC.slice(
+    CLIENT_SRC.indexOf('function useStickToBottom'),
+    CLIENT_SRC.indexOf('function RunTab'),
+  )
+  assert.ok(fn.length > 0, '定位不到 useStickToBottom')
+  assert.match(fn, /stuckRef/, '没有用 ref 记位置 —— 用 state 会在渲染后才有值，判断就晚了一步')
+  assert.match(fn, /useLayoutEffect/, '没有 useLayoutEffect —— 会在绘制后才跳，先闪一下旧位置')
+  // 滚动动作必须在 layout effect 里、且读的是 ref（不是 state）
+  const effect = fn.slice(fn.indexOf('useLayoutEffect'), fn.indexOf('jumpToBottom'))
+  assert.match(effect, /stuckRef\.current/, 'layout effect 里读的不是 ref')
+  assert.match(effect, /scrollTop = el\.scrollHeight/, '没有滚到底部')
+})
+
+test('判断在内容更新前（scroll 事件维护），不是 DOM 更新后', () => {
+  const fn = CLIENT_SRC.slice(
+    CLIENT_SRC.indexOf('function useStickToBottom'),
+    CLIENT_SRC.indexOf('function RunTab'),
+  )
+  assert.match(fn, /onScroll/, '没有 scroll 事件维护位置')
+  // 阈值不能是 0：高 DPI 下底部可能差零点几像素，严判 0 会「明明在底部却不跟随」
+  const th = fn.match(/<=\s*(\d+)/)
+  assert.ok(th && Number(th[1]) > 0 && Number(th[1]) <= 48,
+    `阈值不合理（${th ? th[1] : '缺失'}px）：0 会误判，太大则「没到底也算到底」`)
+})
+
+test('脱离底部时提供「回到底部」，贴底时不占地方', () => {
+  const run = CLIENT_SRC.slice(CLIENT_SRC.indexOf('function RunTab'))
+  assert.match(run, /jumpToBottom/, '没有回到底部的入口 —— 用户翻上去后只能手动拖回来')
+  assert.match(run, /!stuck && log/, '「回到底部」没有按贴底状态隐藏')
+  assert.match(run, /ref: boxRef/, '滚动容器没有挂 ref')
+})
