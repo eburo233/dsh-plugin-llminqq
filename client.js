@@ -533,7 +533,7 @@ window.__ModuleLoader__.load({
 
         tab === 'login' && h(LoginTab, { data, cfg, env, busy, run, refresh, saveConfig }),
         tab === 'model' && h(ModelTab, { data, cfg, env, busy, run, saveConfig, setMsg }),
-        tab === 'behavior' && h(BehaviorTab, { cfg, saveConfig, env }),
+        tab === 'behavior' && h(BehaviorTab, { cfg, saveConfig, env, data }),
         tab === 'memory' && h(MemoryTab, { run, setMsg }),
         tab === 'persona' && h(PersonaTab, { run, setMsg }),
         tab === 'run' && h(RunTab, { data, busy, run, refresh }),
@@ -1345,9 +1345,69 @@ window.__ModuleLoader__.load({
     }
 
     // ── 行为页 ──────────────────────────────────────────────────────────────
-    function BehaviorTab ({ cfg, saveConfig, env }) {
+    // ── MiniMax 模型/音色清单（与 lib/store.js 的 MINIMAX_* 保持一致）────────
+    // 为什么在 client 里也写一份：client bundle 是独立打包的，require 只认
+    // 宿主预注入的包，拿不到我们自己 lib/store.js 的导出。
+    // ⚠️ 改这里时记得同步 lib/store.js（两边都改）。
+    const MM_MODELS = [
+      ['speech-2.5-hd-preview', 'speech-2.5-hd-preview（最新 HD，韵律最佳）'],
+      ['speech-2.5-turbo-preview', 'speech-2.5-turbo-preview（最新 Turbo，40 语种）'],
+      ['speech-02-hd', 'speech-02-hd（韵律/复刻最稳）'],
+      ['speech-02-turbo', 'speech-02-turbo（小语种更强，快）'],
+      ['speech-01-hd', 'speech-01-hd（复刻相似度高）'],
+      ['speech-01-turbo', 'speech-01-turbo（更快）'],
+    ]
+    const MM_VOICES = [
+      ['female-shaonv', '少女音色'],
+      ['female-yujie', '御姐音色'],
+      ['female-chengshu', '成熟女性'],
+      ['female-tianmei', '甜美女性'],
+      ['male-qn-qingse', '青涩青年'],
+      ['male-qn-jingying', '精英青年'],
+      ['male-qn-badao', '霸道青年'],
+      ['male-qn-daxuesheng', '青年大学生'],
+      ['lovely_girl', '萌萌女童'],
+      ['cute_boy', '可爱男童'],
+      ['clever_boy', '聪明男童'],
+      ['qiaopi_mengmei', '俏皮萌妹'],
+      ['tianxin_xiaoling', '甜心小玲'],
+      ['diadia_xuemei', '嗲嗲学妹'],
+      ['danya_xuejie', '淡雅学姐'],
+      ['wumei_yujie', '妩媚御姐'],
+      ['bingjiao_didi', '病娇弟弟'],
+      ['junlang_nanyou', '俊朗男友'],
+      ['chunzhen_xuedi', '纯真学弟'],
+      ['lengdan_xiongzhang', '冷淡学长'],
+      ['badao_shaoye', '霸道少爷'],
+      ['presenter_male', '男性主持人'],
+      ['presenter_female', '女性主持人'],
+      ['audiobook_male_1', '男性有声书1'],
+      ['audiobook_female_1', '女性有声书1'],
+      ['Charming_Lady', 'Charming Lady（英文）'],
+      ['Sweet_Girl', 'Sweet Girl（英文）'],
+      ['Cute_Elf', 'Cute Elf（英文）'],
+    ]
+    const MM_EMOTIONS = [
+      ['', '（不指定，模型自动判断）'],
+      ['happy', '高兴'], ['sad', '悲伤'], ['angry', '愤怒'],
+      ['fearful', '害怕'], ['disgusted', '厌恶'], ['surprised', '惊讶'],
+      ['calm', '中性'],
+    ]
+
+    function BehaviorTab ({ cfg, saveConfig, env, data }) {
       const p = cfg.policy || {}
       const f = cfg.features || {}
+      const tts = cfg.tts || {}
+      // 🔴 2026-10-31 修：语音卡片的 API Key 输入要用 data.secrets 判断「已设置」，
+      //   之前这个组件没接 data → render 时 ReferenceError: secrets is not defined
+      //   → 整个「行为」Tab 白屏（React 抛错后不再渲染子树）。
+      const secrets = data?.secrets || {}
+      // 在线 TTS 的「拉取模型」状态。
+      // ⚠️ 这些必须在组件顶部声明：上次就是漏了 secrets 这一个，整个 Tab 白屏。
+      const [pulling, setPulling] = useState(false)
+      const [pullMsg, setPullMsg] = useState('')
+      const [mmModelList, setMmModelList] = useState([])
+      const [mmAllIds, setMmAllIds] = useState([])
 
       const listToText = a => Array.isArray(a) ? a.join('\n') : ''
       const textToList = t => String(t).split(/[\s,，]+/).map(x => x.trim()).filter(Boolean)
@@ -1497,6 +1557,262 @@ window.__ModuleLoader__.load({
             on: f.learning === true,
             onChange: v => saveConfig({ features: { learning: v } }),
           }),
+        ),
+
+        // ── 语音（TTS）────────────────────────────────────────────────────
+        // 为什么要单独一张卡：features.voice 只是「要不要用语音」，
+        // 真正出声还得知道「用哪个引擎、连哪个地址、用哪段参考音频」。
+        // 之前这些字段完全没暴露 → 用户开了语音开关也只能靠默认值碰运气。
+        h('div', { className: 'card' },
+          h('div', { className: 'card-title' }, '语音（TTS）',
+            h('span', { className: 'muted', style: { marginLeft: 'auto', fontWeight: 400 } },
+              '[VOICE:] 用哪个引擎出声')),
+          h(SwitchRow, {
+            label: '启用语音',
+            desc: '关掉后 [VOICE:] 自动降级为文字',
+            on: tts.enabled === true,
+            onChange: v => saveConfig({ tts: { enabled: v }, features: { voice: v } }),
+          }),
+          tts.enabled ? h(React.Fragment, null,
+            h(Field, { label: '引擎', sub: '本机 TTS 要装模型；在线 API 只要一个 key' },
+              h('select', {
+                value: tts.engine || 'gsv',
+                onChange: e => saveConfig({ tts: { engine: e.target.value } }),
+                style: { width: '100%', padding: '6px 8px', borderRadius: 6 },
+              },
+                h('option', { value: 'gsv' }, 'GPT-SoVITS（本机 · 音色克隆）'),
+                h('option', { value: 'openai' }, '在线 API（OpenAI 兼容 /audio/speech）'),
+                h('option', { value: 'minimax' }, 'MiniMax 语音（国内直连 · 29 音色 · 情绪）'),
+                h('option', { value: 'piper' }, 'Piper（本机 · 轻量）'),
+                h('option', { value: 'sherpa' }, 'sherpa-onnx（本机）'),
+                h('option', { value: 'qq' }, 'QQ 内置音色（仅群聊 · 机械音）'),
+              )),
+            h('div', { className: 'grid2' },
+              h(Field, { label: '单条上限（字）', sub: '超出截断' },
+                h(NumberInput, {
+                  value: tts.maxChars ?? 200, min: 20, max: 2000,
+                  onCommit: v => saveConfig({ tts: { maxChars: v } }),
+                })),
+            ),
+
+            // ── GPT-SoVITS 字段 ──
+            (tts.engine || 'gsv') === 'gsv' ? h(React.Fragment, null,
+              h(Field, { label: 'GPT-SoVITS 地址', sub: '默认 http://127.0.0.1:9880/' },
+                h(TextInput, {
+                  value: tts.gsv?.url || 'http://127.0.0.1:9880/',
+                  placeholder: 'http://127.0.0.1:9880/',
+                  onCommit: v => saveConfig({ tts: { gsv: { url: v } } }),
+                })),
+              h(Field, { label: '参考音频（音色克隆）',
+                sub: '留空 = 用服务端启动时的默认参考。填了就是「用这个声音说话」' },
+                h(TextInput, {
+                  value: tts.gsv?.referWav || '',
+                  placeholder: '/path/to/reference.wav',
+                  onCommit: v => saveConfig({ tts: { gsv: { referWav: v } } }),
+                })),
+              h(Field, { label: '参考音频对应的文本', sub: '必须和参考音频内容一致，否则音色会跑偏' },
+                h(TextInput, {
+                  value: tts.gsv?.promptText || '',
+                  placeholder: '我是吉祥物，以后就用这个声音说话啦',
+                  onCommit: v => saveConfig({ tts: { gsv: { promptText: v } } }),
+                })),
+              h('div', { className: 'grid2' },
+                h(Field, { label: '语速' },
+                  h(NumberInput, {
+                    value: tts.gsv?.speed ?? 1.0, min: 0.5, max: 2.0, step: 0.05,
+                    onCommit: v => saveConfig({ tts: { gsv: { speed: v } } }),
+                  })),
+                h(Field, { label: '温度（越高越有起伏）' },
+                  h(NumberInput, {
+                    value: tts.gsv?.temperature ?? 1.0, min: 0.1, max: 2.0, step: 0.05,
+                    onCommit: v => saveConfig({ tts: { gsv: { temperature: v } } }),
+                  })),
+              ),
+            ) : null,
+
+            // ── 在线 API 字段 ──
+            tts.engine === 'openai' ? h(React.Fragment, null,
+              h(Notice, { kind: 'info' },
+                '任何实现了 POST /audio/speech 的服务都能用：OpenAI、硅基流动、Azure、自建网关等。'),
+              h(Field, { label: '接口地址', sub: '默认 https://api.openai.com/v1/audio/speech' },
+                h(TextInput, {
+                  value: tts.openai?.url || '',
+                  placeholder: 'https://api.openai.com/v1/audio/speech',
+                  onCommit: v => saveConfig({ tts: { openai: { url: v } } }),
+                })),
+              h(Field, { label: 'API Key', sub: '建议写在凭据里（不进 bridge-config.json 明文）' },
+                h(SecretInput, { field: 'ttsApiKey', filled: secrets?.ttsApiKey, placeholder: 'sk-...' })),
+              h('div', { className: 'grid2' },
+                h(Field, { label: '模型', sub: '可手填，也可点右边「拉取」从服务拿真实清单' },
+                  h(React.Fragment, null,
+                    h('div', { style: { display: 'flex', gap: 6 } },
+                      h('input', {
+                        type: 'text',
+                        value: mmModelList.length ? (tts.openai?.model || 'tts-1') : (tts.openai?.model || 'tts-1'),
+                        placeholder: 'tts-1 / tts-1-hd / 服务商自定义',
+                        onChange: e => saveConfig({ tts: { openai: { model: e.target.value } } }),
+                        style: { flex: 1, padding: '6px 8px', borderRadius: 6 },
+                        list: 'llminqq-tts-models',
+                      }),
+                      h('button', {
+                        className: 'tiny',
+                        disabled: pulling,
+                        onClick: async () => {
+                          setPulling(true); setPullMsg('')
+                          try {
+                            const r = await post('/tts/openai-models', {
+                              url: tts.openai?.url || '',
+                            })
+                            if (r.ok && Array.isArray(r.models)) {
+                              setMmModelList(r.models)
+                              setPullMsg(r.models.length
+                                ? `拿到 ${r.models.length} 个语音模型（共 ${r.total} 个）`
+                                : `没找到像语音模型的 id（共 ${r.total} 个），见下方清单`)
+                              if (r.allIds?.length) setMmAllIds(r.allIds)
+                            } else {
+                              setPullMsg('拉取失败：' + (r.reason || '未知'))
+                            }
+                          } catch (e) {
+                            setPullMsg('拉取失败：' + e.message)
+                          } finally {
+                            setPulling(false)
+                          }
+                        },
+                      }, pulling ? '拉取中…' : '↻ 拉取'),
+                    ),
+                    mmModelList.length ? h('datalist', { id: 'llminqq-tts-models' },
+                      ...mmModelList.map(id => h('option', { key: id, value: id }))) : null,
+                    pullMsg ? h('div', { className: 'muted', style: { marginTop: 4 } }, pullMsg) : null,
+                    (mmAllIds.length && !mmModelList.length)
+                      ? h('div', { className: 'muted', style: { marginTop: 4, maxHeight: 90, overflow: 'auto', fontSize: 11 } },
+                          '可用 id（点一个填入）：',
+                          ...mmAllIds.slice(0, 60).map(id =>
+                            h('span', {
+                              key: id,
+                              style: { cursor: 'pointer', marginLeft: 6, textDecoration: 'underline' },
+                              onClick: () => saveConfig({ tts: { openai: { model: id } } }),
+                            }, id)))
+                      : null,
+                  )),
+                h(Field, { label: '音色', sub: 'alloy / nova / shimmer / echo / fable / onyx / 服务商自定义' },
+                  h(TextInput, {
+                    value: tts.openai?.voice || 'alloy',
+                    placeholder: 'alloy / nova / shimmer / 自定义',
+                    onCommit: v => saveConfig({ tts: { openai: { voice: v } } }),
+                  })),
+              ),
+              h('div', { className: 'grid2' },
+                h(Field, { label: '输出格式', sub: 'mp3 / opus / wav' },
+                  h('select', {
+                    value: tts.openai?.format || 'mp3',
+                    onChange: e => saveConfig({ tts: { openai: { format: e.target.value } } }),
+                    style: { width: '100%', padding: '6px 8px', borderRadius: 6 },
+                  },
+                    h('option', { value: 'mp3' }, 'mp3'),
+                    h('option', { value: 'opus' }, 'opus'),
+                    h('option', { value: 'wav' }, 'wav'),
+                    h('option', { value: 'aac' }, 'aac'),
+                  )),
+                h(Field, { label: '语速' },
+                  h(NumberInput, {
+                    value: tts.openai?.speed ?? 1.0, min: 0.5, max: 2.0, step: 0.05,
+                    onCommit: v => saveConfig({ tts: { openai: { speed: v } } }),
+                  })),
+              ),
+            ) : null,
+
+            // ── MiniMax 字段 ──
+            tts.engine === 'minimax' ? h(React.Fragment, null,
+              h(Notice, { kind: 'info' },
+                '从 platform.minimaxi.com 拿 API Key 和 GroupId。音色 29 种，部分模型支持情绪。'),
+              h(Field, { label: '接口地址', sub: '国内 https://api.minimaxi.com/v1/t2a_v2' },
+                h(TextInput, {
+                  value: tts.minimax?.url || '',
+                  placeholder: 'https://api.minimaxi.com/v1/t2a_v2',
+                  onCommit: v => saveConfig({ tts: { minimax: { url: v } } }),
+                })),
+              h('div', { className: 'grid2' },
+                h(Field, { label: 'API Key', sub: '存进 secrets，不进明文配置' },
+                  h(SecretInput, { field: 'ttsMinimaxKey', filled: secrets?.ttsMinimaxKey, placeholder: '填 MiniMax API Key' })),
+                h(Field, { label: 'GroupId', sub: 'MiniMax 控制台里那一串' },
+                  h(TextInput, {
+                    value: tts.minimax?.groupId || '',
+                    placeholder: 'GroupId',
+                    onCommit: v => saveConfig({ tts: { minimax: { groupId: v } } }),
+                  })),
+              ),
+              h(Field, { label: '模型', sub: '音质和速度的取舍' },
+                h('select', {
+                  value: tts.minimax?.model || 'speech-2.5-hd-preview',
+                  onChange: e => saveConfig({ tts: { minimax: { model: e.target.value } } }),
+                  style: { width: '100%', padding: '6px 8px', borderRadius: 6 },
+                }, ...MM_MODELS.map(([v, lbl]) => h('option', { key: v, value: v }, lbl))),
+              ),
+              h(Field, { label: '音色', sub: '29 种可选；想用自己复刻的音色就手填 id' },
+                h('select', {
+                  value: tts.minimax?.voiceId || 'female-shaonv',
+                  onChange: e => saveConfig({ tts: { minimax: { voiceId: e.target.value } } }),
+                  style: { width: '100%', padding: '6px 8px', borderRadius: 6 },
+                }, ...MM_VOICES.map(([v, lbl]) => h('option', { key: v, value: v }, lbl + '（' + v + '）'))),
+              ),
+              h(Field, { label: '自定义音色 id', sub: '留空 = 用上面选的；填了就覆盖（复刻音色用这里）' },
+                h(TextInput, {
+                  value: tts.minimax?.voiceIdCustom || '',
+                  placeholder: '比如你复刻出来的 voice_id',
+                  onCommit: v => saveConfig({ tts: { minimax: { voiceIdCustom: v } } }),
+                })),
+              h('div', { className: 'grid2' },
+                h(Field, { label: '情绪', sub: '仅部分模型生效' },
+                  h('select', {
+                    value: tts.minimax?.emotion || '',
+                    onChange: e => saveConfig({ tts: { minimax: { emotion: e.target.value } } }),
+                    style: { width: '100%', padding: '6px 8px', borderRadius: 6 },
+                  }, ...MM_EMOTIONS.map(([v, lbl]) => h('option', { key: v || 'none', value: v }, lbl))),
+                ),
+                h(Field, { label: '语速', sub: '0.5 ~ 2.0' },
+                  h(NumberInput, {
+                    value: tts.minimax?.speed ?? 1.0, min: 0.5, max: 2.0, step: 0.05,
+                    onCommit: v => saveConfig({ tts: { minimax: { speed: v } } }),
+                  })),
+              ),
+              h('div', { className: 'grid2' },
+                h(Field, { label: '音调', sub: '-12 ~ 12，0 = 原音' },
+                  h(NumberInput, {
+                    value: tts.minimax?.pitch ?? 0, min: -12, max: 12, step: 1,
+                    onCommit: v => saveConfig({ tts: { minimax: { pitch: v } } }),
+                  })),
+                h(Field, { label: '输出格式' },
+                  h('select', {
+                    value: tts.minimax?.format || 'mp3',
+                    onChange: e => saveConfig({ tts: { minimax: { format: e.target.value } } }),
+                    style: { width: '100%', padding: '6px 8px', borderRadius: 6 },
+                  },
+                    h('option', { value: 'mp3' }, 'mp3'),
+                    h('option', { value: 'wav' }, 'wav'),
+                    h('option', { value: 'flac' }, 'flac'),
+                  )),
+              ),
+            ) : null,
+
+            // ── Piper 字段 ──
+            tts.engine === 'piper' ? h(Field, { label: 'Piper 地址', sub: '默认 http://127.0.0.1:5006/synthesize' },
+              h(TextInput, {
+                value: tts.piper?.url || '',
+                placeholder: 'http://127.0.0.1:5006/synthesize',
+                onCommit: v => saveConfig({ tts: { piper: { url: v } } }),
+              })) : null,
+
+            // ── sherpa 字段 ──
+            tts.engine === 'sherpa' ? h(Field, { label: 'sherpa 地址', sub: '默认 http://127.0.0.1:9881/synthesize' },
+              h(TextInput, {
+                value: tts.sherpa?.url || '',
+                placeholder: 'http://127.0.0.1:9881/synthesize',
+                onCommit: v => saveConfig({ tts: { sherpa: { url: v } } }),
+              })) : null,
+
+            tts.engine === 'qq' ? h(Notice, { kind: 'warn' },
+              'QQ 内置音色只有群聊能用，私聊会降级为文字；声音是机械音，不是你自己的音色。') : null,
+          ) : null,
         ),
 
         h('div', { className: 'card' },
