@@ -8,7 +8,45 @@
 
 ## [Unreleased]
 
-暂无。
+### Fixed
+
+- **「重新获取二维码」以前根本没换码**。`POST /qr/refresh` 走的是 `fetchQrCode()`，
+  而它只是 `docker cp` 容器里那张 `qrcode.png` —— 全程没调 NapCat 的刷新接口。
+  于是接口诚实地回了 `ok: true`（cp 成功），但图片字节级和上一张一模一样，
+  用户看到的就是「点了没反应」。现在真的调 `POST /api/QQLogin/RefreshQRcode`，
+  并等文件落盘后比对 md5 才算成功；换不动就如实回 `changed: false` + 原因。
+  顺带修了 WebUI 凭证要缓存（NapCat 的 `loginRate` 默认 3，每次刷新都重登会撞限流）。
+- **WebUI token 会和容器里实际那张分叉**。实测 `secrets.json` 是 `c26704…`，
+  而容器 `webui.json` 是 `c5a4838a…`；用前者调 `/api/auth/login` 返回
+  `token is invalid`，于是设置页「打开 NapCat WebUI」打不开、刷新二维码也鉴权失败。
+  现在以盘上的 `webui.json` 为唯一真源（`resolveWebuiToken`），并把 secrets 镜像过去。
+- **打开设置页慢**，实测拆出来是三件事叠加：
+  - 预热带用 `cfg.mcp?.bili?.pythonBin || cfg.memory?.pythonBin` 自己算缓存 key，
+    而 `buildMcpServers` 实际解析出的是 bili-duty 的 venv python —— key 对不上，
+    预热永远命中不了，第一次 `/overview` 仍然同步 `execFileSync(python -c "import…")`，
+    **实测钉住宿主事件循环 1141ms**。两边改成共用 `pickBiliPython()`，
+    并让 `/overview` 走 `blockOnMiss: false`（缓存空就报「探测中」，绝不同步等）。
+    冷启动构建耗时 1141ms → 126ms。
+  - `tailBridgeLog` 每次 `readFileSync` 整个桥日志（能到 8MB），而 `/overview`
+    每 4 秒轮询一次。改成从文件尾按行回读：17MB 日志 94ms/次 → 0ms/次。
+  - 折叠块（`<details>`）里的组件照常挂载，于是 `SetupWizard` 在用户没展开时
+    也会打一次 `/env/probe`（实测 380ms，内含 `docker images` + 扫七个端口）。
+    改成第一次展开前只渲染空壳。
+- **取二维码不再每个请求都起 `docker cp`**：容器缓存目录本来就 bind mount 到宿主机，
+  直接读那份是 1ms，而 `docker cp` 要起一个 docker 进程（76~103ms）。
+  `docker cp` 保留为「挂载不符合预期」时的兜底。
+- 设置页二维码区显示「这张是多久前拿到的 / 可能已过期，点一下换新码」——
+  QQ 的登录码约 2 分钟过期，过期后扫码没反应，用户会误以为是插件坏了。
+
+### Added
+
+- `scripts/sync-install.mjs` 过滤 `.git`：git worktree 里 `.git` 是**普通文件**，
+  原来会被当普通文件拷进安装副本，报 EACCES 中断同步（真拷成功更糟，
+  安装目录会变成指回源码仓库的 git 链接）。
+- 回归测试：`test/unit-napcat.test.mjs` 新增 5 条（刷新必须真调接口 / 凭证要缓存 /
+  token 取自 webui.json / 文件没变要如实报错 / 取码先走 bind mount），
+  `test/unit-panel-perf.test.mjs` 新增 8 条（预热的 key、`blockOnMiss` 语义、
+  日志尾读的正确性与速度、折叠块延迟挂载）。
 
 ## [0.5.2] - 2026-10-30
 

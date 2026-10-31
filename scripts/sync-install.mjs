@@ -60,6 +60,12 @@ if (!DEST) {
 // 日志和预览产物跟运行无关
 const SKIP_DIRS = new Set(['node_modules', '.git', '.preview', 'logs', 'dist', '.cache', '__pycache__', '.vendor-backup'])
 const SKIP_FILES = [/\.log$/i, /^\.DS_Store$/, /\.pyc$/i]
+// ⚠️ `.git` 在 **worktree** 里是**普通文件**（内容是一行 `gitdir: …`），不是目录。
+// 只按 SKIP_DIRS 过滤会把它当普通文件拷进安装副本，然后：
+//   ① 报 EACCES（安装副本属主/权限不同），整次同步中断
+//   ② 真拷成功了更糟：安装目录变成指回源码仓库的 git 链接，之后 git 操作全乱
+// 所以按文件名再挡一次。
+const SKIP_NAMES = new Set(['.git', '.gitignore', '.gitattributes', '.npmrc'])
 
 function walk (dir, base = dir, out = []) {
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -69,6 +75,7 @@ function walk (dir, base = dir, out = []) {
       if (SKIP_DIRS.has(ent.name)) continue
       walk(full, base, out)
     } else if (ent.isFile()) {
+      if (SKIP_NAMES.has(ent.name)) continue
       if (SKIP_FILES.some(re => re.test(ent.name))) continue
       out.push(rel)
     }

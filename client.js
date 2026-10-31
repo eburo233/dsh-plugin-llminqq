@@ -352,14 +352,24 @@ window.__ModuleLoader__.load({
       )
     }
 
-    // 折叠块：用 native <details>，不用 React state，键盘/无障碍都是现成的
+    // 折叠块：用 native <details>，不用 React state，键盘/无障碍都是现成的。
+    //
+    // 但**内容要延迟挂载**：<details> 折叠时子节点仍然在 DOM 里，React 也会照常
+    // 挂载它们。折叠块里装的是 SetupWizard / BiliSetup 这些「一挂载就自己发请求」的
+    // 组件（SetupWizard 会打一次 /env/probe，实测 380ms，里面还要跑 docker images
+    // 和七个端口的探测）。用户根本没展开，却每次打开设置页都付一遍这个钱。
+    // 现在第一次展开前只渲染空壳。
     function Collapse ({ title, children }) {
       // ⚠️ 类名必须带 qq- 前缀：宿主的全局内联样式里有 `.collapse{visibility:collapse}`，
       //   裸用 'collapse' 会被它命中 → DOM 在、高度在、但看不见（表现是「一块空白占位」）。
       //   改名根治，CSS 里的 !important 是双保险。
-      return h('details', { className: 'qq-collapse' },
-        h('summary', null, title),
-        h('div', { className: 'body' }, children),
+      const [opened, setOpened] = React.useState(false)
+      return h('details', {
+        className: 'qq-collapse',
+        onToggle: e => { if (e.currentTarget.open && !opened) setOpened(true) },
+      },
+      h('summary', null, title),
+      h('div', { className: 'body' }, opened ? children : null),
       )
     }
 
@@ -873,6 +883,53 @@ window.__ModuleLoader__.load({
       const bridge = (data && data.bridge) || {}
       const [qrNonce, setQrNonce] = useState(Date.now())
       const [qrBroken, setQrBroken] = useState(false)
+      const [qrBusy, setQrBusy] = useState(false)
+      const [qrMsg, setQrMsg] = useState(null)
+
+      // 二维码新鲜度文案。
+      //
+      // 为什么值得显示：QQ 的登录二维码大约 2 分钟就过期。过期后扫不出反应，
+      // 用户第一反应是「插件坏了」，而不是「码过期了」。把「这张是 X 分钟前拿到的
+      // / 可能过期了，点右边换一张」直接写在按钮旁边，比任何文档都管用。
+      function qrAgeText (ageMs, state) {
+        if (state === 'waiting-scan' && (ageMs === null || ageMs === undefined)) return ''
+        if (ageMs === null || ageMs === undefined || !Number.isFinite(ageMs)) return ''
+        const s = Math.round(ageMs / 1000)
+        if (s < 60) return '刚拿到的'
+        if (s < 120) return `${Math.round(s / 60)} 分钟前，还能扫`
+        return `${Math.floor(s / 60)} 分钟前，可能已过期 —— 点一下换新码`
+      }
+
+      // 「重新获取二维码」= 真的让 NapCat 换一张新码。
+      //
+      // 以前这个按钮只是 `setQrNonce(Date.now())` 换个 URL 参数重新请求 /qr.png，
+      // 而后端那边也只是重新 docker cp 一次**同一个文件** —— 两头都没让 NapCat 换码，
+      // 所以接口回 true、图片却和上一张一模一样。用户的原话就是「点了刷新没反应」。
+      //
+      // 现在：先 POST /qr/refresh 让后端调 NapCat 的 RefreshQRcode，等它落盘后再
+      // 换 nonce 重新取图；失败就如实说失败（而不是默默显示旧码）。
+      const refreshQr = async () => {
+        setQrBusy(true); setQrMsg(null); setQrBroken(false)
+        try {
+          const r = await post('/qr/refresh')
+          if (r && r.ok) {
+            setQrNonce(Date.now())
+            setQrMsg({ kind: 'ok', text: '已换新码，用手机 QQ 扫这张' })
+          } else {
+            setQrMsg({
+              kind: 'warn',
+              text: (r && (r.reason || r.error) || '刷新失败') +
+                (r && r.detail ? '：' + r.detail : ''),
+            })
+            // 刷新失败但后端还有旧码可显示 —— 仍然刷新一次，至少不是空白
+            if (r && r.hasImage) setQrNonce(Date.now())
+          }
+        } catch (err) {
+          setQrMsg({ kind: 'err', text: '刷新失败：' + err.message })
+        } finally {
+          setQrBusy(false)
+        }
+      }
 
       // 状态判定要同时看「Docker 容器」和「本机 NapCat」两条路。
       // 之前只有 Docker 一条，所以本机跑的 NapCat 一律显示「✗ Docker 不可用」——
@@ -1003,13 +1060,19 @@ window.__ModuleLoader__.load({
           ),
           h('div', { className: 'row' },
             h('button', {
-              onClick: async () => { setQrBroken(false); setQrNonce(Date.now()); await post('/qr/refresh') },
-            }, '重新获取二维码'),
+              disabled: qrBusy,
+              onClick: refreshQr,
+            }, qrBusy ? '正在换新码…' : '重新获取二维码'),
+            h('span', { className: 'muted' },
+              qrAgeText(env?.qr?.ageMs, login.state)),
             h('a', {
               href: env.webuiUrl, target: '_blank', rel: 'noreferrer',
               style: { color: 'var(--qq-brand)', fontSize: 12 },
             }, '打开 NapCat WebUI →'),
           ),
+          qrMsg
+            ? h(Notice, { kind: qrMsg.kind }, qrMsg.text)
+            : null,
           h(Notice, { kind: 'warn', title: '必须用小号' },
             '协议端在模拟官方客户端，违反 QQ 用户协议，有封号风险。'),
         ),
