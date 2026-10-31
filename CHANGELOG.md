@@ -50,12 +50,39 @@
   **实测对比**（同一份 `profile: "web"` 的配置，跑 60 秒）：
   修复前 4 分钟 99 次 spawn；修复后 **1 次**，全程 CPU 0.0%。
 
+- **打开总开关后调度器不启动（又是「只在加载时读一次配置」）**。用户把总开关打开、
+  桥也跑起来了，但 `/overview` 里始终是 `{"enabled": false, "tasks": []}` ——
+  两个字段都空，正是 `scheduler ? scheduler.status() : {enabled:false,tasks:[]}`
+  的默认值，说明 `scheduler` 变量是 null，调度器**根本没被创建**。
+
+  根因：调度器只在 `apply` 里创建，判断用的是
+  `const cfg = readConfig(); if (cfg.enabled) { ... }` —— 而 `cfg` 是**插件加载
+  那一刻的快照**。用户在加载**之后**才打开开关，那个 `if` 早就过去了。
+  于是桥起来了（`startBridge` 走实时配置），但
+  `ingest(5min) / reflect(8h) / digest(30min) / learn(12h)` **全部停摆**，
+  而设置页完全看不出来 —— 用户以为「打开开关就全好了」。
+
+  实测佐证：总开关为 true、桥跑了近 4 小时，但 `mem.db` 一条没增（ingest 该 5 分钟
+  跑一次）、`digest.md` 三小时没更新。
+
+  修法：抽出 `ensureScheduler(enabled)` 状态机 ——
+  `off→on` 创建并 start、`on→off` 停掉（SIGTERM 子进程不留孤儿 python）、
+  `on→on` 幂等 no-op（不重建，避免正在跑的任务被打断）。
+  三个触发点：插件加载、`POST /config` 保存、`POST /config/reset` 恢复默认。
+  现在开关是**真正实时生效**的，不用重启。
+
+  实测（重启后）：`enabled: true`、4 个任务都在、`ingest` 在 15:14:21 真的跑了一轮
+  且 `lastError: null`。
+
 ### Tests
 
 - 新增 `test/unit-acp-backoff.test.mjs`（10 条）：会起端口的 profile 必须落到 acp、
   正常 profile 名不被吞、空值兜底、`isHostProfile`、**连续 5 次 start() 只 spawn 1 次**、
   冷却期报错带原因和剩余秒数、退避指数增长且有上限、成功后清零、`EADDRINUSE`
   诊断、桥侧最终防线。
+- 新增 `test/unit-scheduler-hot.test.mjs`（6 条）：关闭时不创建、**开启时真的创建
+  （并要求任务表里有 ingest/reflect/digest/learn）**、重复调用幂等、on→off 真停、
+  off→on 能再起、保存配置路径确实调了 ensureScheduler。
 - `test/unit-scheduler.test.mjs` 补 digest 相关 5 条；并把一条依赖 1000ms 定时器
   的测试超时从 10s 放宽到 25s —— 它和全量测试并行跑时，宿主负载高会偶发误报
   「任务停摆」（单独跑 100% 通过），断言强度不变。
