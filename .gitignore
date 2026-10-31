@@ -18,3 +18,31 @@ __pycache__/
 secrets.json
 *.tmp-*
 dsh-plugin-llminqq-*.zip
+
+# ── 运行时数据（真实对话记忆、媒体产物、桥状态）──────────────────────────────
+# 这些是**用户机器上的活数据**，不该进仓库：
+#   qq-agent/memory/ 里有真实聊天记忆（mem.db 可能上千条），
+#   .qq-media/ 是 storyboard/tts 的产物，几十 MB。
+# 之前没忽略，导致 `git status` 里一堆噪音，而 `git add -A` 会把用户隐私提交上去。
+.qq-media/
+qq-agent/.qq-media/
+qq-agent/.bridge/
+qq-agent/memory/
+
+# ── 脚本版（legacy/scripts 分支）遗留的本地文件 ─────────────────────────────
+# qqacct/.env 里有**真实 QQ 号和 WebUI token**，而这个仓库是公开的。
+# 插件版有自己独立的 NapCat 数据（在 ~/.dsh/dsh-plugin-llminqq/napcat/），
+# 不读这里。
+qqacct/
+llminqq-qr.png
+
+# ── 本地 git worktree ───────────────────────────────────────────────────────
+# .template-worktree 是一个**独立 worktree**（自己的 .git 文件），
+# 嵌在主仓工作区里。不忽略的话，主仓的 `git add -A` 会试图把整个
+# worktree 内容当普通文件提交。
+.template-worktree/
+
+# ── 本地笔记 / 打包产物（个人草稿，不属于插件源码）────────────────────────
+PLUGINIZATION-PLAN.md
+docs/
+dsh-plugin-llminqq.zip
