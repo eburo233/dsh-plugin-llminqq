@@ -695,10 +695,15 @@ window.__ModuleLoader__.load({
       const [step, setStep] = useState('')
       const [result, setResult] = useState(null)
 
-      const refreshProbe = useCallback(async () => {
+      // force=true 时跳过服务端缓存。
+      //
+      // 首次挂载走缓存（30s 内复用上次结果）—— 用户只是打开设置页看二维码，
+      // 不该先等 270ms 的六项探测；而「测试连接 / 重新探测」必须传 force，
+      // 不然就是「点了不生效」，正是这次二维码刷新踩过的那个坑。
+      const refreshProbe = useCallback(async ({ force = false } = {}) => {
         setLoading(true)
         try {
-          const r = await api('/env/probe')
+          const r = await api('/env/probe' + (force ? '?force=1' : ''))
           if (r.ok) setProbe(r)
           else setResult({ kind: 'err', text: r.error || '探测失败' })
         } catch (e) {
@@ -753,7 +758,8 @@ window.__ModuleLoader__.load({
                 '可能还在启动（再等一会儿点刷新），或者去「运行」页看容器日志。',
             })
           }
-          await refreshProbe()
+          // 刚起完容器，状态确实变了 —— 必须 force，不能读到 30 秒内的旧快照
+          await refreshProbe({ force: true })
           onDone?.()
         } catch (e) {
           setResult({ kind: 'err', text: '一键安装中断：' + (e?.message || e) + '\n可以直接重试；也可以切到「手动」按步骤来。' })
@@ -779,6 +785,8 @@ window.__ModuleLoader__.load({
         } finally {
           setStep('')
         }
+        // 用户点「测试连接」就是要看当前真相，跳过缓存
+        await refreshProbe({ force: true })
       }
 
       if (loading) {
@@ -2369,8 +2377,9 @@ window.__ModuleLoader__.load({
 
         h('div', { className: 'card' },
           h('div', { className: 'card-title' }, '桥日志',
+            h('span', { className: 'muted', style: { fontWeight: 400 } }, '最后 100 行'),
             h('button', { className: 'tiny', onClick: loadLog, style: { marginLeft: 'auto' } }, '刷新')),
-          h('div', { className: 'logbox' }, log || '（暂无日志）'),
+          h('div', { className: 'logbox', style: { maxHeight: 420 } }, log || '（暂无日志）'),
           h('div', { className: 'muted mono' },
             `完整日志 ${data.env?.dataDir}/logs/bridge.out`),
         ),

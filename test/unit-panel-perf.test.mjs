@@ -153,3 +153,75 @@ test('tailBridgeLog 的尾部读取结果与大文件全量切分一致', async 
 
   fs.rmSync(tmpDir, { recursive: true, force: true })
 })
+
+// ── ⑥ /env/probe 的缓存必须能被「重新探测」打穿 ─────────────────────────────
+//
+// 这一条是防「刷新按钮不刷新」的翻版：/env/probe 每次要跑六项探测（实测 251~294ms，
+// docker images 一项就 151ms），而 SetupWizard 在没连上 OneBot 时每次打开设置页
+// 都会无条件调它。加缓存是对的，但如果「测试连接 / 重新探测」也吃缓存，
+// 用户点了看到的还是 30 秒前的旧结论 —— 和这次二维码刷新的 bug 是同一类错误。
+
+test('/env/probe 支持 force 打穿缓存', () => {
+  assert.match(INDEX_SRC, /route === '\/env\/probe'/, '定位不到 /env/probe 路由')
+  const route = INDEX_SRC.slice(
+    INDEX_SRC.indexOf("route === '/env/probe'"),
+    INDEX_SRC.indexOf("route === '/env/probe'") + 600,
+  )
+  assert.match(route, /force/, '/env/probe 没有 force 入口 —— 重新探测只能拿到缓存')
+  assert.match(route, /probeEnvironment\(\{ force \}\)/, '没把 force 传给 probeEnvironment')
+})
+
+test('客户端主动探测（测试连接 / 装完刷新）都传 force', () => {
+  // 「测试连接」必须 force
+  const useExisting = CLIENT_SRC.slice(
+    CLIENT_SRC.indexOf('const useExisting ='),
+    CLIENT_SRC.indexOf('const useExisting =') + 1200,
+  )
+  assert.match(useExisting, /refreshProbe\(\{ force: true \}\)/,
+    '「测试连接」没传 force —— 点完可能还在看 30 秒前的旧结论')
+
+  // 一键装完也必须 force（容器刚起来，状态确实变了）
+  const oneClick = CLIENT_SRC.slice(
+    CLIENT_SRC.indexOf('const oneClickDocker ='),
+    CLIENT_SRC.indexOf('const oneClickDocker =') + 3000,
+  )
+  assert.match(oneClick, /refreshProbe\(\{ force: true \}\)/,
+    '一键装完没传 force —— 刚起的容器可能还显示「未创建」')
+})
+
+test('probeEnvironment 的缓存是 TTL + 并发去重，不是永久缓存', () => {
+  const envSrc = fs.readFileSync(path.join(ROOT, 'lib', 'env.js'), 'utf8')
+  const fn = envSrc.slice(
+    envSrc.indexOf('export async function probeEnvironment'),
+    envSrc.indexOf('async function probeEnvironmentInner'),
+  )
+  assert.match(fn, /ENV_PROBE_CACHE_MS/, '没有 TTL —— 时间长了会一直给旧结论')
+  assert.match(fn, /envProbeInflight/, '没有并发去重 —— 同时打开两处会重复跑六项探测')
+  assert.match(fn, /force/, '没有 force —— 缓存打不穿')
+})
+
+// ── ⑦ 桥日志行数只有一个真源 ────────────────────────────────────────────────
+//
+// 原来三个调用点各写各的（overview 里 40、/bridge/status 里 60、/bridge/log 里 200）。
+// 后果：前端「运行」页一进来显示 40 行，5 秒后轮询一次突然变成 200 行 ——
+// 用户盯着日志会看到它「自己长出来」，而且改行数要改三处、漏一处就不一致。
+
+test('桥日志行数收成一个常量，三处调用都不再写死', () => {
+  assert.match(INDEX_SRC, /const BRIDGE_LOG_LINES = \d+/, '没有 BRIDGE_LOG_LINES 常量')
+  assert.match(INDEX_SRC, /function tailBridgeLog \(lines = BRIDGE_LOG_LINES\)/,
+    'tailBridgeLog 的默认值没指向常量')
+
+  // 三处调用点必须是 tailBridgeLog()，不能带数字
+  const calls = INDEX_SRC.match(/tailBridgeLog\(\d+\)/g) || []
+  assert.equal(calls.length, 0,
+    `还有硬编码行数的调用：${calls.join(', ')} —— 改一处漏两处就会不一致`)
+})
+
+test('桥日志默认显示 100 行', () => {
+  const m = INDEX_SRC.match(/const BRIDGE_LOG_LINES = (\d+)/)
+  assert.equal(Number(m[1]), 100, '用户要求的是最后 100 行')
+})
+
+test('前端标明「最后 100 行」，不同 tab 之间不会突然变长', () => {
+  assert.match(CLIENT_SRC, /最后 100 行/, '界面上没写清楚这是最后多少行')
+})
