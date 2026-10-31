@@ -74,12 +74,59 @@
   实测（重启后）：`enabled: true`、4 个任务都在、`ingest` 在 15:14:21 真的跑了一轮
   且 `lastError: null`。
 
+- **`bridge.log` 涨到 35GB 写满磁盘（EPIPE 自激死循环）**。日志里是这样的：
+
+  ```
+  ERROR 未捕获异常（第 50130295 次，桥继续运行）: Error: write EPIPE
+  ...完整堆栈...
+  ```
+
+  **五千万次**，一行约 700 字节 ≈ 35GB。根因是一个闭环：
+
+  1. 宿主关掉了桥的 stdout 管道 → `console.log` 抛 `EPIPE`
+  2. 异常变成 `uncaughtException` → `crashGuard()` 记一条 ERROR
+  3. crashGuard 里又 `logger.log` → 又 `console.log` → stdout **仍是断的** → 再抛 EPIPE
+  4. 回到 2，无限循环
+
+  三层修复（缺一层循环都还能转起来）：
+  - **stdout 熔断**：`console.log` 裹 try/catch；一旦 EPIPE 就**永久停写**并计数
+    （管道断了不会自己恢复，继续试就是烧磁盘）。
+  - **crashGuard 防重入 + 限流**：处理异常期间再来的异常只计数不写日志；
+    同一类错误每分钟最多写 20 条。
+  - **`bridge.log` 体积上限**：这个文件**从来没被轮转过**（宿主只给 `bridge.out`
+    做了 8MB 轮转），现在 16MB 上限、保留 2 份，启动时检查一次 + 运行期每写 4MB 复查一次。
+
+  实测（10 万次异常风暴）：旧逻辑写 10 万行（≈70MB），新逻辑 **console.log 只调 1 次、
+  日志只写 20 行**。
+
+- **重启后留下孤儿桥进程没人管**。实测两个桥并存：
+  `PID 561089 PPid=1（孤儿，CPU 45.9%、内存 1.9GB、累计 CPU 3h13m）` +
+  `PID 626677`（本次 dsh 的子进程）。它们死连同一个 OneBot 端口，
+  孤儿还占着 18080 → 新桥 `EADDRINUSE`。
+
+  根因：`lib/bridge/index.js` 里本来就有「启动前清孤儿」的调用，
+  但它引用的 `scripts/cleanup-orphan-acp.mjs` **从来没被创建过** ——
+  那段代码一直是死代码（`if (fs.existsSync(script))` 判断不过，静默跳过）。
+  而且原设计只管 `dsh --profile` 子进程，**根本不管桥自己**。
+
+  现在补上这个脚本，判据保守（三条全中才算孤儿）：
+  `PPid == 1` + 命令行里有本插件桥入口路径 + 不是当前进程自己。
+  默认**只看不杀**，要杀必须 `--kill`。实测能准确识别孤儿，
+  且不碰活桥（活桥 PPid 不是 1）和不相关的 PPid=1 进程（dockerd 之类）。
+
 ### Tests
 
 - 新增 `test/unit-acp-backoff.test.mjs`（10 条）：会起端口的 profile 必须落到 acp、
   正常 profile 名不被吞、空值兜底、`isHostProfile`、**连续 5 次 start() 只 spawn 1 次**、
   冷却期报错带原因和剩余秒数、退避指数增长且有上限、成功后清零、`EADDRINUSE`
   诊断、桥侧最终防线。
+- 新增 `test/unit-log-runaway.test.mjs`（7 条）：console.log 必须裹 try/catch、
+  stdout 熔断 + 计数、crashGuard 防重入与限流、`bridge.log` 体积上限、
+  运行期轮转、**10 万次异常风暴只写有限行**。
+- 新增 `test/unit-orphan-cleanup.test.mjs`（9 条）：脚本存在、能列进程、
+  PPid=1+本插件路径=孤儿、**父进程还活着绝不能杀（防误杀活桥）**、
+  PPid=1 但不是我们插件不碰、不认死某一条绝对路径、自己受保护、默认不杀、
+  桥启动时确实调用。
 - 新增 `test/unit-scheduler-hot.test.mjs`（6 条）：关闭时不创建、**开启时真的创建
   （并要求任务表里有 ingest/reflect/digest/learn）**、重复调用幂等、on→off 真停、
   off→on 能再起、保存配置路径确实调了 ensureScheduler。
