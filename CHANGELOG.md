@@ -6,9 +6,60 @@
 > 说明：本仓库的公开历史从 `0.5.0` 开始。更早的迭代是作者自用阶段的脚本形态，
 > 没有以版本号发布过，因此下面没有 `0.4.x` 之类的条目，也不会编造。
 
-## [Unreleased]
+## [0.5.4] - 2026-10-31
+
+> 这一版收的都是「打开总开关之后才暴露」的问题。0.5.3 的功能都通了，
+> 但真正把总开关打开、让桥跑起来，才会踩到下面这些。
 
 ### Fixed
+
+- **打开总开关后 CPU 被打满（4 分钟 99 次进程启动）**。这是两个 bug 叠在一起：
+
+  **① profile 推导错了。** 插件装在 `~/.dsh/profiles/web/node_modules/` 下，
+  `detectProfileName()` 反推出 `web`，桥就用 `dsh --profile web` 起 ACP 子进程。
+  而 **`web` 是会起 HTTP 服务的那个 profile**（`@deepseek-ai/dsh-host-webserver`
+  + ui-settings 全家桶），它要占 3080 端口 —— 已被正在运行的宿主占了：
+
+  ```
+  listen EADDRINUSE: address already in use 127.0.0.1:3080
+  dsh: startup failed: 2 required plugins did not activate
+  ```
+
+  原来的保留名单只有 `desktop`，漏了 `web`（和同样会组装 web 服务的 `headless`）。
+  现在 `desktop` / `web` / `headless` 一律落到随附的 `acp`（纯 stdio，不起端口）。
+
+  **② `start()` 没有失败退避。** 失败时 `startPromise = null`，而
+  `_ensureSession` / `prompt` 都是 `if (!this.ready) await this.start()` ——
+  所以下一次调用立刻又全量 spawn 一遍。每次 spawn = 加载整套 DSH + 9 个插件
+  + 撞端口 + exit 1。实测日志里 **99 次**「bridge 启动」+ **99 次** `dsh` 启动，
+  而里面一条消息都没有，CPU 就是这么顶满的。
+  现在失败进入指数退避（5s → 10s → 20s → … 上限 5 分钟），冷却期内直接报
+  「上次失败」而**不再 spawn**；成功一次就清零。
+
+  **③ 桥侧还有第二道防线。** 只修插件侧推导不够 —— `bridge-config.json` 是
+  「插件写、桥读」的，旧版本写进去的 `profile: "web"` **已经落盘**，升级插件后
+  桥读到的仍是旧值。所以桥启动时自己再判一次（`DSH_PROFILE`），
+  把会起端口的 profile 名也改写成 `acp`。实测拿一份 `profile: "web"` 的配置
+  真跑桥，日志出现「已改用 "acp"」且 `acp: 启动 dsh --profile acp`。
+
+  **④ 根因不再只留 `code=1`。** 起不来时 stderr 里的 `EADDRINUSE` /
+  `startup failed` 现在会被翻译成一句人话并挂到 exit 日志上，
+  直接点明「profile 抢了宿主端口，把 ACP profile 留空或填 acp」。
+  原来用户只能看到 `acp exited code=1`，根本查不出原因。
+
+  **实测对比**（同一份 `profile: "web"` 的配置，跑 60 秒）：
+  修复前 4 分钟 99 次 spawn；修复后 **1 次**，全程 CPU 0.0%。
+
+### Tests
+
+- 新增 `test/unit-acp-backoff.test.mjs`（10 条）：会起端口的 profile 必须落到 acp、
+  正常 profile 名不被吞、空值兜底、`isHostProfile`、**连续 5 次 start() 只 spawn 1 次**、
+  冷却期报错带原因和剩余秒数、退避指数增长且有上限、成功后清零、`EADDRINUSE`
+  诊断、桥侧最终防线。
+- `test/unit-scheduler.test.mjs` 补 digest 相关 5 条；并把一条依赖 1000ms 定时器
+  的测试超时从 10s 放宽到 25s —— 它和全量测试并行跑时，宿主负载高会偶发误报
+  「任务停摆」（单独跑 100% 通过），断言强度不变。
+
 
 - **「重新获取二维码」以前根本没换码**。`POST /qr/refresh` 走的是 `fetchQrCode()`，
   而它只是 `docker cp` 容器里那张 `qrcode.png` —— 全程没调 NapCat 的刷新接口。
@@ -60,9 +111,6 @@
   `test/unit-panel-perf.test.mjs` 新增 14 条（预热的 key、`blockOnMiss` 语义、
   日志尾读的正确性与速度、折叠块延迟挂载、`/env/probe` 的 force 打穿、
   桥日志行数单一真源、滚动跟随的判断时机）。
-
-### Changed
-
 - **桥日志显示行数收成一个常量 `BRIDGE_LOG_LINES = 100`**。原来三处各写各的
   （overview 40 / status 60 / log 200）：前端「运行」页一进来显示 40 行、
   5 秒后轮询一次突然变成 200 行，用户会看到日志自己「长出来」；而且改行数
@@ -73,9 +121,6 @@
   一个布尔表达不了。插件自己的前端是唯一消费者，已同步；
   但**如果你有外部脚本在读 `qrCached`，需要改读 `env.qr.cached`**。
   这是本次唯一一处破坏性变更。
-
-### Added
-
 - **`digest.md` 现在会被自动生成**。用户导入 844 条记忆后发现摘要文件仍然不存在 ——
   根因和 ingest 一模一样：脚本版靠手工跑 `memctl digest`，插件化时只搬了
   reflect/learn，digest 从没进过任务表。

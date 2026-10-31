@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-llminqq",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "让 LLM 接管一个真实 QQ 号：NapCat(OneBot 11) 桥 + 设置页（扫码登录 / 模型路由 / 降级链 / 人格 / 策略）",
   "type": "module",
   "main": "./lib/index.js",

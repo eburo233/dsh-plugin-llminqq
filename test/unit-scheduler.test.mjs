@@ -85,7 +85,12 @@ test('定时器路径：第一轮抛错后第二轮照常触发', async () => {
   })
   try {
     s.start()
-    const ok = await waitFor(() => calls >= 2)
+    // ⚠️ 超时给足 25s：这条测试依赖「1000ms 定时器触发两轮」，而它常和全量
+    //    测试并行跑。宿主负载高时（比如同时在跑 vendor-storyboard 的真出图测试）
+    //    两轮 1000ms 可能挤不进默认的 10s 窗口，会**偶发**误报成「任务停摆」。
+    //    实测：单独跑 100% 过，全量并发时偶发失败一次。给足余量而不是放宽断言
+    //    —— 真正停摆时 waitFor 仍然会超时，断言强度不变。
+    const ok = await waitFor(() => calls >= 2, { timeoutMs: 25000 })
     assert.ok(ok, `第二轮没有触发（calls=${calls}）——任务很可能永久停摆了`)
     const snap = statusOf(s, 'beat')
     assert.equal(snap.running, false)
