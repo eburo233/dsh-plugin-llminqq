@@ -46,3 +46,11 @@ llminqq-qr.png
 PLUGINIZATION-PLAN.md
 docs/
 dsh-plugin-llminqq.zip
+
+# ── 本地备份 ───────────────────────────────────────────────────────────────
+# local-backups/ 里存着从已删除/已覆盖的文件中抢救出来的内容，
+# 包括真实 QQ 号 + WebUI token（qqacct.env）和本机绝对路径。
+# **绝对不能进仓库** —— 这个仓库是公开的。
+# 目录权限已是 700 / 文件 600，但 gitignore 是第二道保险。
+# 说明见 local-backups/README.md（那份也在忽略范围内）。
+local-backups/
