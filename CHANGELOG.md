@@ -16,8 +16,7 @@
   用户看到的就是「点了没反应」。现在真的调 `POST /api/QQLogin/RefreshQRcode`，
   并等文件落盘后比对 md5 才算成功；换不动就如实回 `changed: false` + 原因。
   顺带修了 WebUI 凭证要缓存（NapCat 的 `loginRate` 默认 3，每次刷新都重登会撞限流）。
-- **WebUI token 会和容器里实际那张分叉**。实测 `secrets.json` 是 `c26704…`，
-  而容器 `webui.json` 是 `c5a4838a…`；用前者调 `/api/auth/login` 返回
+- **WebUI token 会和容器里实际那张分叉**。实测 `secrets.json` 和容器 `webui.json` 里的 token 不是同一个；用前者调 `/api/auth/login` 返回
   `token is invalid`，于是设置页「打开 NapCat WebUI」打不开、刷新二维码也鉴权失败。
   现在以盘上的 `webui.json` 为唯一真源（`resolveWebuiToken`），并把 secrets 镜像过去。
 - **打开设置页慢**，实测拆出来是三件事叠加：
