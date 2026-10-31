@@ -40,28 +40,12 @@
 
 ### Added
 
-- `scripts/sync-install.mjs` 过滤 `.git`：git worktree 里 `.git` 是**普通文件**，
-  原来会被当普通文件拷进安装副本，报 EACCES 中断同步（真拷成功更糟，
-  安装目录会变成指回源码仓库的 git 链接）。
-- 回归测试：`test/unit-napcat.test.mjs` 新增 5 条（刷新必须真调接口 / 凭证要缓存 /
-  token 取自 webui.json / 文件没变要如实报错 / 取码先走 bind mount），
-  `test/unit-panel-perf.test.mjs` 新增 11 条（预热的 key、`blockOnMiss` 语义、
-  日志尾读的正确性与速度、折叠块延迟挂载、`/env/probe` 的 force 打穿、
-  桥日志行数单一真源）。
-
-### 追加（同日第二轮）
-
 - **`/env/probe` 加了 30 秒缓存**。它每次要跑六项探测（实测 251~294ms，
   `docker images` 一项就 151ms），而「还没连上 OneBot」时 SetupWizard 在每次
   打开设置页都会无条件调一次 —— 用户只是来看二维码，却先等 270ms。
   现在默认读缓存（实测 274ms → 1ms）；「测试连接 / 一键装完」传 `force=1` 真跑，
   并发的多个请求只跑一次探测。缓存**必须**能被 force 打穿，否则又是
   「按钮点了不生效」——和这次二维码刷新同一类错误，测试里锁了这条。
-- **桥日志显示行数收成一个常量 `BRIDGE_LOG_LINES = 100`**。原来三处各写各的
-  （overview 40 / status 60 / log 200）：前端「运行」页一进来显示 40 行、
-  5 秒后轮询一次突然变成 200 行，用户会看到日志自己「长出来」；而且改行数
-  要改三处，漏一处就不一致。现在统一「最后 100 行」，界面上标明范围，
-  日志框高度 260px → 420px（100 行的可读性比 40 行需要的空间大）。
 - **日志改成「贴底才跟随」**：停在最底部时新日志自动滚到底；往上翻看历史时
   新日志**不会**把你弹回底部，并显示「已暂停跟随 / 回到底部」。
   关键是判断时机——必须在内容更新**之前**记住当时是否贴底（用 scroll 事件
@@ -69,6 +53,100 @@
   新行一追加 `scrollHeight` 就变大、容器立刻「不在底部」，于是永远不跟随、
   日志看起来像死的。阈值取 24px 而不是 0：高 DPI 下底部可能差零点几像素，
   严判 0 会「明明在底部却不跟随」。
+- `scripts/sync-install.mjs` 过滤 `.git`：git worktree 里 `.git` 是**普通文件**，
+  原来会被当普通文件拷进安装副本，报 EACCES 中断同步（真拷成功更糟，
+  安装目录会变成指回源码仓库的 git 链接）。
+- 回归测试：`test/unit-napcat.test.mjs` 新增 5 条（刷新必须真调接口 / 凭证要缓存 /
+  token 取自 webui.json / 文件没变要如实报错 / 取码先走 bind mount），
+  `test/unit-panel-perf.test.mjs` 新增 14 条（预热的 key、`blockOnMiss` 语义、
+  日志尾读的正确性与速度、折叠块延迟挂载、`/env/probe` 的 force 打穿、
+  桥日志行数单一真源、滚动跟随的判断时机）。
+
+### Changed
+
+- **桥日志显示行数收成一个常量 `BRIDGE_LOG_LINES = 100`**。原来三处各写各的
+  （overview 40 / status 60 / log 200）：前端「运行」页一进来显示 40 行、
+  5 秒后轮询一次突然变成 200 行，用户会看到日志自己「长出来」；而且改行数
+  要改三处，漏一处就不一致。现在统一「最后 100 行」，界面上标明范围，
+  日志框高度 260px → 420px（100 行的可读性比 40 行需要的空间大）。
+- ⚠️ **不兼容字段变更**：`GET /overview` 的 `env.qrCached`（布尔）换成
+  `env.qr`（`{ cached, ageMs }`）。原因是要显示「这张码多久前拿到的」，
+  一个布尔表达不了。插件自己的前端是唯一消费者，已同步；
+  但**如果你有外部脚本在读 `qrCached`，需要改读 `env.qr.cached`**。
+  这是本次唯一一处破坏性变更。
+
+## [0.5.3] - 2026-10-31
+
+> 说明：这一版开发时曾用 0.5.4~0.5.7 等本地打包号试过，都没对外发布，
+> 最终统一收敛到 `0.5.3`（`cd007d9`）。下面的条目几乎全是**用户实测反馈出来的
+> bug**，不是计划内的新功能 —— 所以按「坏在哪」而不是「加了什么」来排。
+
+### Added
+
+- **语音（TTS）从「只有一个开关」变成能真调音色**。之前插件版只把
+  `features.voice` 这一个布尔传给桥，引擎名/地址/参考音频全部丢失，桥只能走
+  默认的 GPT-SoVITS + `127.0.0.1:9880`。脚本版有 8 个字段，插件版只剩 1 个布尔。
+  - `config.tts` 现在是完整配置段：`engine` / `maxChars` / `character`
+    + `gsv` / `piper` / `sherpa` / `openai` / `minimax` 五套引擎参数。
+  - 两个**在线**引擎（机器带不动本地 TTS 时只要一个 key 就能出声）：
+    `openai`（OpenAI 兼容 `POST /audio/speech`，直接拿二进制）、
+    `minimax`（T2A v2，URL 带 GroupId，返回 JSON + hex 音频，
+    支持 29 种音色 + 情绪 + 语速 + 音调）。
+  - 设置页新增「语音」卡片：引擎下拉 + 各引擎专属字段 + 「拉取模型」按钮
+    （`POST /tts/openai-models` 从服务的 `/v1/models` 按 `tts`/`audio`/`speech`
+    关键字过滤；OpenAI 的 /models 没有 type 字段，拉不到时回传全量 id 供手选）。
+  - API key 走 `secrets.json`，不落明文进 `config.json`。
+- **抓取清单支持「关键词」而不只认 BV 号**。需求是让模型自己挑话题 ——
+  它只知道「想学哪个领域的说话方式」，不知道具体 BV 号，硬要它先查再填
+  等于把搜索这步甩回给用户。`crawl-bili-comments.mjs` 的 `loadSources`
+  现在接受三种写法：`{bvid,domain}` / `"BV1xx"` /
+  `{keyword,domain}`（脚本自己调 `bili_search` 解析，搜不到就跳过，不硬编造）。
+- **AGENTS.md 补上并随包发布**。远端仓库里根本没有这个文件，但
+  `DEFAULT_PERSONA` 写着「可选项见 AGENTS.md」—— 指向一个不存在的文件。
+  - 新增 `qq-agent/AGENTS.md`（脱敏版）：去掉真实 QQ 号和本机路径，
+    换成 `<工作区>/`、`<插件数据目录>/`、示例号 `1000000001`；
+    保留 12 条通道约束 + 4 条安全红线 + 39 种性格 + OCEAN 机制。
+  - `ensureAgentScaffold` 启动时把包内那份复制到 agent 工作区，
+    **只在不存在时写**，不覆盖用户改过的；包里没带时还有一份极简兜底。
+  - `package.json` 的 `files` 加 `qq-agent/AGENTS.md`
+    （只带这一个文件，不带那 1.9M 图片）。
+
+### Fixed
+
+- **设置页「行为」Tab 白屏**。`BehaviorTab` 用了 `secrets` 但组件没接 `data`
+  → render 时 `ReferenceError` → React 卸掉整棵子树 → 用户看到整页空白。
+  现在 `data` 传进去，`secrets` 用 `data?.secrets || {}` 兜底。
+- **折叠块「DOM 在、但看不见」**。现象是「B站工具（MCP）」下面一块 41px 空白：
+  查 DOM 元素存在、文字在、颜色也正常，就是看不见。根因是宿主的全局内联样式
+  有一条 `.collapse { visibility: collapse }`，而插件 `Collapse` 组件裸用了
+  `className: 'collapse'`（`visibility:collapse` 对非 table 元素等价于 `hidden`，
+  元素还占位但整块不可见）。
+  修法：类名改 `qq-collapse`（`collapse` 这词太常见，迟早还会撞）
+  + `visibility: visible !important` 双保险。**只加 `!important` 不算修好**——
+  那是靠兜底，宿主改规则或换个主题插件再插一条就又会命中。
+  注意这是 **web 侧独有的坑**：Windows desktop 的 v0.5.2 上完全正常，
+  因为 desktop 没加载那条全局规则，只看代码看不出来。
+- **B站语料抓取：点一下 0 秒完成、还扣了次数**。用户点「现在抓 2 个视频」，
+  提示「用时 0 秒，学到 若干 个词汇」，但语料目录里一个文件都没有。
+  三个问题叠加：
+  1. `learning.crawlSources` **没有默认值** → 清单永远是空的，脚本直接 return 0；
+  2. `memory-admin.mjs` 只要脚本退出码 0 就 `bumpCrawlUsage`，哪怕 `fetched=0`；
+  3. 前端用 `?? '若干'` 兜底，把「什么都没抓到」显示成「学到 若干 个」，等于骗用户。
+  修法：`store.js` 补 3 个开箱即用的关键词条目；`index.js` 把
+  `crawlSources`/`commentsPerVideo` 透传进 bridge-config（之前压根没传，
+  脚本永远读不到）；只有 `fetched > 0` 才计次，空跑返回 `note` 说明原因；
+  前端不再用「若干」兜底。
+- **`messaging.js` 缺 3 个 import**（`fs`/`path`/`crypto`）：`synthesizeToFile`
+  一调就 `ReferenceError: path is not defined`。这是**原有 bug**，
+  一直没人走通那条路径所以没暴露。
+- **`bili_search` 返回字段认错**：实际是 `videos`，之前只认
+  `results`/`data`/`items`，导致关键词搜索一直「搜不到」。
+- **`--json` + dryRun 不输出结构化结果**：dryRun 分支只 `log()`（而 `--json`
+  模式下 log 是静默的）→ 调用方 `JSON.parse('')` 得到 null。
+
+### Changed
+
+- `DEFAULT_PERSONA` 的性格从写死「搞怪」改成留空待填，并说明可以自己改。
 
 ## [0.5.2] - 2026-10-30
 
