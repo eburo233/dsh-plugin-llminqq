@@ -1511,12 +1511,54 @@ def _job_prune():
         _TRANSCRIBE_JOBS.pop(k, None)
 
 
+# ── 「转写完了，但这一轮早就结束了」怎么办 ────────────────────────────────────
+# 🔴 2026-11-01 真实事故：用户发了个视频链接，模型调 bili_transcribe_start 拿了
+#    job_id，说了句「等转好了看看它怎么说」就结束了这一轮（37 秒）。
+#    ASR 在后台跑，09:52 转完（3574 字，成功），**但没有任何人再去取**：
+#      · 模型这一轮已经结束，没有「下一次工具调用」的机会；
+#      · _TRANSCRIBE_JOBS 只在 MCP 进程内存里，桥看不到；
+#      · 用户那边就永远等不到「那个视频讲了什么」。
+#
+# 解法：转写完把结果**落盘**到一个「待送达」目录。桥下一轮拼上下文时扫这个目录，
+#      把还没送达的结果作为一条系统提示注入（然后用 `.sent` 标记消费掉）。
+#
+# 为什么不用「让桥轮询 API」：MCP 进程是 ACP 子进程的子进程，桥没有任何
+# 直连它的通道；磁盘是唯一双方都能碰的地方。也避免了给 MCP 开 HTTP 端口。
+#
+# 目录选 STATE_DIR（和 bridge-config 同一套），桥知道这个路径。
+_TRANSCRIBE_READY_DIR = Path(
+    os.environ.get("LLMINQQ_STATE_DIR")
+    or (Path.home() / ".dsh" / "dsh-plugin-llminqq" / "state")
+) / "transcribe-ready"
+
+
+def _write_ready_marker(job_id: str, bv: str, state: str, text: str) -> None:
+    """把一次转写的结果写成「待送达」标记文件（桥下一轮会扫）。"""
+    try:
+        _TRANSCRIBE_READY_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "job_id": job_id,
+            "bvid": bv,
+            "state": state,
+            "text": (text or "")[:20000],
+            "finishedAt": _dt.datetime.now().isoformat(timespec="seconds"),
+        }
+        out = _TRANSCRIBE_READY_DIR / (job_id + ".json")
+        tmp = out.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(out)          # 原子替换：桥不会读到半个文件
+    except Exception as e:        # 落盘失败不该让转写本身失败
+        print("[bili] write transcribe-ready 失败：%s" % e, file=sys.stderr)
+
+
 async def _job_run(job_id: str, bv: str):
     try:
         text = await _transcribe_run(bv)
         _TRANSCRIBE_JOBS[job_id] = {"state": "done", "text": text, "bvid": bv, "started": _TRANSCRIBE_JOBS.get(job_id, {}).get("started", 0)}
+        _write_ready_marker(job_id, bv, "done", text)
     except Exception as e:
         _TRANSCRIBE_JOBS[job_id] = {"state": "error", "text": "转写异常：" + str(e), "bvid": bv, "started": 0}
+        _write_ready_marker(job_id, bv, "error", "转写异常：" + str(e))
 
 
 @tool()

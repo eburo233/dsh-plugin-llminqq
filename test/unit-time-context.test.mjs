@@ -29,9 +29,17 @@ const SRC = fs.readFileSync(path.join(ROOT, 'lib', 'bridge', 'index.js'), 'utf8'
 function loadSceneHint () {
   const i = SRC.indexOf('function timeSceneHint')
   assert.ok(i > 0, '定位不到 timeSceneHint')
-  const j = SRC.indexOf('/** 深夜时给模型的提示', i)
-  assert.ok(j > i, '定位不到函数结尾')
-  const body = SRC.slice(i, j).trim()
+  // ⚠️ 不能截到「/** 深夜时...」—— 中间后来又插进了别的函数
+  //    （transcribeReadyDir 等），eval 时会多出好几个顶层定义 → 语法错。
+  //    按**花括号配平**取到 timeSceneHint 自己结束。
+  const start = SRC.indexOf('{', i)
+  let depth = 0
+  let end = start
+  for (let k = start; k < SRC.length; k++) {
+    if (SRC[k] === '{') depth++
+    else if (SRC[k] === '}') { depth--; if (depth === 0) { end = k + 1; break } }
+  }
+  const body = SRC.slice(i, end).trim()
   // eslint-disable-next-line no-eval
   return eval(`(${body})`)
 }
