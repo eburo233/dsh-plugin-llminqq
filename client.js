@@ -2262,10 +2262,17 @@ window.__ModuleLoader__.load({
     function CrawlCard ({ setMsg }) {
       const [st, setSt] = useState(null)
       const [running, setRunning] = useState(false)
+      const [hist, setHist] = useState(null)
+      const [showHist, setShowHist] = useState(false)
 
       const load = useCallback(async () => {
         const r = await api('/memory/crawl/status')
         if (r.ok) setSt(r)
+        // 历史单独拉：可能没有（首次用），失败也别影响主状态
+        try {
+          const h = await api('/memory/crawl/history')
+          if (h.ok) setHist(h.history)
+        } catch { /* ignore */ }
       }, [])
       useEffect(() => { load() }, [load])
 
@@ -2278,12 +2285,18 @@ window.__ModuleLoader__.load({
             //   「学到 若干 个词汇」，用户以为成功。宁可说清楚没抓到及原因。
             const got = Number(r.result?.fetched ?? 0) + Number(r.result?.files?.length ?? 0)
             const secs = Math.round((r.ms || 0) / 1000)
+            // 把这轮模型挑的词显示出来 —— 用户要能看见「为什么抓这些」
+            const kws = r.decided?.keywords
+            const kwText = kws?.length
+              ? `模型挑了 ${kws.map(k => `「${k.keyword}」(${k.domain})`).join('、')}` +
+                (r.decided.reasoning ? `：${r.decided.reasoning}` : '')
+              : ''
             if (r.note) {
-              setMsg({ kind: 'warn', text: `${r.note}（用时 ${secs}s，未计次）` })
+              setMsg({ kind: 'warn', text: `${kwText ? kwText + '。' : ''}${r.note}（用时 ${secs}s，未计次）` })
             } else if (got > 0) {
-              setMsg({ kind: 'ok', text: `抓取完成：${got} 个视频，用时 ${secs}s。下一轮学习会自动吃进语料池。` })
+              setMsg({ kind: 'ok', text: `${kwText ? kwText + '。' : ''}抓取完成：${got} 个视频，用时 ${secs}s。下一轮学习会自动吃进语料池。` })
             } else {
-              setMsg({ kind: 'warn', text: `跑完了但没抓到内容（用时 ${secs}s，未计次）。${r.result ? JSON.stringify(r.result).slice(0, 120) : ''}` })
+              setMsg({ kind: 'warn', text: `${kwText ? kwText + '。' : ''}跑完了但没抓到内容（用时 ${secs}s，未计次）。` })
             }
           } else setMsg({ kind: 'err', text: r.error || '抓取失败' })
           await load()
@@ -2303,18 +2316,51 @@ window.__ModuleLoader__.load({
         h('div', { className: 'hint' },
           '从 B站公开评论区抓语料，学「别人怎么说话」（词汇/梗/句式）。'),
         h('div', { className: 'hint' },
-          '**只手动、不定时** —— 自动抓会撞 B站风控。一天最多 3 次。'),
+          '**抓什么由模型自己决定** —— 它会看着「人格」页的 persona 挑话题，'),
+        h('div', { className: 'hint' },
+          '并且参考历史记录避免重复。只手动、不定时（自动抓会撞 B站风控，一天最多 3 次）。'),
         !env.ok ? h(Notice, { kind: 'warn', title: '抓取依赖未就绪' }, env.reason || '') : null,
         h('div', { className: 'row' },
           h('button', {
             disabled: running || noRoom || !env.ok,
             onClick: go,
-          }, running ? '抓取中…（几分钟）' : '现在抓 2 个视频'),
+          }, running ? '抓取中…（几分钟）' : '让模型挑话题并抓 2 个视频'),
           noRoom ? h('span', { className: 'muted' }, '今天的次数用完了，明天再来') : null,
           !env.ok ? h('span', { className: 'muted' }, '先装 B站工具依赖（见「登录」页环境体检）') : null,
         ),
+        // 历史记录：用户要求「keyword 要有历史记录，调用时模型能看见该记录」。
+        // 折叠起来，不占常驻空间；展开能看到每轮挑了什么、抓到多少。
+        hist && hist.runs && hist.runs.length > 0
+          ? h('div', null,
+              h('div', { className: 'row', style: { marginTop: 4 } },
+                h('span', { className: 'muted' },
+                  `历史记录 ${hist.runs.length} 轮（模型每次决定前都会看到这些）`),
+                h('button', {
+                  className: 'tiny',
+                  style: { marginLeft: 'auto' },
+                  onClick: () => setShowHist(!showHist),
+                }, showHist ? '收起' : '展开'),
+              ),
+              showHist
+                ? h('div', { className: 'rows', style: { marginTop: 6 } },
+                    hist.runs.slice().reverse().map((r, i) =>
+                      h('div', { key: 'cr' + i, className: 'switchrow' },
+                        h('div', { className: 'lbl' },
+                          h('div', null,
+                            (r.keywords || []).map(k => `「${k.keyword}」(${k.domain})`).join('、') || '（无关键词）'),
+                          h('div', { className: 'dsc' },
+                            `${new Date(r.at).toLocaleString('zh-CN')} · ` +
+                            (r.fetched > 0 ? `抓到 ${r.fetched} 个` : '没抓到') +
+                            (r.reasoning ? ` · ${r.reasoning}` : '')),
+                        ),
+                      )),
+                  )
+                : null,
+            )
+          : null,
       )
     }
+
 
     // ── 运行页 ──────────────────────────────────────────────────────────────
     /**
