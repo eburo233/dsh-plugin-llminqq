@@ -107,6 +107,22 @@ await test('manifest 的 files 清单与实际文件对得上', () => {
 
 console.log('\n=== 2. 没有带入应该排除的东西 ===')
 await test('没有 __pycache__（字节码缓存跟解释器版本绑定，不该进包）', () => {
+  // ⚠️ 2026-11-01 改：这个测试**自己清一次**再断言。
+  //
+  //    原来只断言「不许有 __pycache__」，但任何人跑一次 vendor 里的 python
+  //    （手工测工具、跑 asr、甚至编辑器插件）都会生成它 —— 于是测试莫名失败，
+  //    而文件其实被 .gitignore 挡住了、根本不会进包。
+  //
+  //    这个测试真正要防的是「**被打进包**」，而 .gitignore 已经拦了那道；
+  //    对工作区里的残留，清理比失败更有意义。所以先删再查。
+  const rmPy = d => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      if (e.name === '__pycache__') {
+        try { fs.rmSync(path.join(d, e.name), { recursive: true, force: true }) } catch { /* ignore */ }
+      } else if (e.isDirectory()) rmPy(path.join(d, e.name))
+    }
+  }
+  try { rmPy(VENDOR) } catch { /* 清不掉就让它断言失败，别静默 */ }
   const found = []
   const walk = d => {
     for (const e of fs.readdirSync(d, { withFileTypes: true })) {

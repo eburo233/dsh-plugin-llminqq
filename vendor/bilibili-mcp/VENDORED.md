@@ -21,7 +21,7 @@
 
 ## 本目录相对上游的改动
 
-`requirements.txt` / `LICENSE` / `README.md` 原样未动。**`mcp_server.py` 有三处本地适配**
+`requirements.txt` / `LICENSE` / `README.md` 原样未动。**`mcp_server.py` 有五处本地适配**
 （都是 2026-11-01 用户实测/要求触发的，上游尚未合并）：
 
 1. **`bili_frames` 帧数上限 6 → 200**（用户要求「上限顶格 200 帧，模型可以自己传」）。
@@ -32,12 +32,22 @@
    只是白烧 token（每张 100-200 token，200 张就是 2-4 万）。
    现在同一个格子只给一张图，并在 `frames` 里如实反映「这一帧是故事板第几格」。
 
-3. **`transcribe` 完成后写待送达标记** `<stateDir>/transcribe-ready/<job_id>.json`
+3. **`CRED_FILE` 优先读 `BILI_CREDENTIAL_PATH`**。原来硬编码 `<包目录>/bili_credential.json`，
+   而插件下发的是 `~/.dsh/bili-duty/` 那份 → `load_credential()` 永远返回 None →
+   `bili_subtitle` / `bili_comments` / `bili_reply` 全部退化成「未登录」。
+   用户看到的表现是机器人说「视频没公开字幕」，其实有 86 段字幕读不到。
+
+4. **`bili_subtitle` 保留时间戳**。原来只取 body 的 `content`，
+   把 `from` / `to`（这句话在第几秒）扔了。现在新增 `timedText`（`[0:06] 台词`）
+   与 `segmentsWithTime`（`[{from,to,text}]`），原 `text` 不变。
+   这是「字幕和宫格图对时间戳」的前提 —— 不做这个，图文只能靠猜。
+
+5. **`transcribe` 完成后写待送达标记** `<stateDir>/transcribe-ready/<job_id>.json`
    （临时文件 + 原子替换）。原因：ASR 是后台异步任务，而模型这一轮说完就结束了 ——
    实测转写 09:52 成功（3574 字节，文件都在），但**没有任何人再取**，用户永远等不到
    「那个视频讲了什么」。桥下一轮扫这个目录，把结果注入上下文，然后打 `.sent` 标记。
 
-⚠️ **升级 vendor 时，上面三处要重新打上**（上游还没有）。
+⚠️ **升级 vendor 时，上面五处要重新打上**（上游还没有）。
 
 ⚠️ **不复制 `__pycache__`**：那是 Python 字节码缓存，跟 Python 版本和平台绑定，
 进 npm 包既变大又可能失效（换 Python 版本会读到不匹配的 .pyc）。首次运行自动生成即可。

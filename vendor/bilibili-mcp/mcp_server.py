@@ -47,7 +47,21 @@ async def _throttle():
 
 # ========== 初始化 ==========
 
-CRED_FILE = Path(__file__).parent / "bili_credential.json"
+# 🔴 2026-11-01：凭据路径要**听环境变量**，不能硬编码在包里。
+#
+#    真实事故：插件那边通过 `BILI_CREDENTIAL_PATH` 下发的是
+#    `~/.dsh/bili-duty/bili_credential.json`（用户真正登录过的那份），
+#    但这里硬编码成 `<包目录>/bili_credential.json` —— **那个文件根本不存在**。
+#    于是 `load_credential()` 返回 None，所有需要登录的工具（bili_subtitle /
+#    bili_comments / bili_reply …）全部退化成「未登录」。
+#
+#    用户那边的表现：机器人说「视频没公开字幕，我还在后台从视频里转文字」——
+#    其实有字幕，是工具没登录读不到。
+#
+#    修：优先读环境变量（插件 config.mcp.bili.credentialPath 会传进来），
+#    再退回包目录那份（手工跑的老行为）。
+_cred_env = os.environ.get("BILI_CREDENTIAL_PATH", "").strip()
+CRED_FILE = Path(_cred_env) if _cred_env else (Path(__file__).parent / "bili_credential.json")
 
 mcp = FastMCP("bilibili-mcp")
 
@@ -564,15 +578,54 @@ async def bili_subtitle(bvid: str) -> str:
         async with session.get(sub_url) as resp:
             sub_data = await resp.json()
 
-    texts = [item.get("content", "") for item in sub_data.get("body", [])]
-    full_text = "\n".join(texts)
+    # 🔴 2026-11-01：**保留时间戳**（原来只留 content，时间信息全丢了）。
+    #
+    #    用户问「字幕有时间戳吗」—— 有，但被我们扔了。
+    #    B站字幕的 body 每段是 {"from": 0.3, "to": 3.31, "content": "..."}，
+    #    原来只取 content，等于把「这句话在第几秒说的」这条最有用的信息删掉。
+    #
+    #    为什么时间戳重要（`= 图文理解的前提`）：
+    #      · 用户问「第 30 秒那个东西是啥」→ 没有时间戳就只能干瞪眼；
+    #      · 想让模型「对着宫格图讲」→ 宫格每格标着时间戳，
+    #        字幕也必须带时间戳才**对得上**（不然只能猜）；
+    #      · 想跳过片头/只看某段 → 得知道哪句在哪秒。
+    #
+    #    输出两种形式都留：
+    #      text        纯文本（老调用方/只想看内容时用，行为不变）
+    #      segments    [{from, to, text}] —— 带时间戳，给「对着画面讲」用
+    body = sub_data.get("body", []) or []
+    segs = []
+    for item in body:
+        t = str(item.get("content", "") or "").strip()
+        if not t:
+            continue
+        try:
+            fr = float(item.get("from", 0) or 0)
+            to = float(item.get("to", 0) or 0)
+        except (TypeError, ValueError):
+            fr, to = 0.0, 0.0
+        segs.append({"from": round(fr, 2), "to": round(to, 2), "text": t})
+
+    full_text = "\n".join(x["text"] for x in segs)
+
+    # 带时间戳的紧凑文本：`[mm:ss] 台词`。模型读这个就能对上宫格图的时间戳。
+    def _mmss(sec):
+        sec = max(0.0, float(sec or 0))
+        m, s2 = divmod(int(sec), 60)
+        return "%d:%02d" % (m, s2)
+    timed_text = "\n".join("[%s] %s" % (_mmss(x["from"]), x["text"]) for x in segs)
 
     return json.dumps({
         "bvid": bvid,
         "title": info.get("title", ""),
         "language": target.get("lan_doc", ""),
-        "segments": len(texts),
+        "segments": len(segs),
+        "duration": float(info.get("duration") or 0),
+        # 纯文本（老行为，不改）
         "text": full_text,
+        # 带时间戳：给「对着宫格图讲」用
+        "timedText": timed_text,
+        "segmentsWithTime": segs,
     }, ensure_ascii=False)
 
 
