@@ -112,7 +112,10 @@ test('冷却期内的报错带上「上次失败原因」和剩余秒数', async
   try { await r.start() } catch (err) { msg = String(err.message) }
   assert.match(msg, /冷却中/, '冷却期内的报错应说明在冷却')
   assert.match(msg, /还要等\s*\d+s/, '应告诉调用方还要等多久')
-  assert.match(msg, /acp exited/, '应带上上次失败的真实原因，否则根本查不出根因')
+  // 失败原因现在可能是「找不到 dsh」或「acp exited」——关键是**要带上真实原因**，
+  // 不能只说「冷却中」。这里放宽成「必须提到具体原因」而不是死绑某一种。
+  assert.match(msg, /acp exited|cannot find dsh|路径不存在/,
+    '应带上上次失败的真实原因，否则根本查不出根因')
 })
 
 test('退避是指数增长且有上限（不会退化成永久等待）', async () => {
@@ -187,4 +190,47 @@ test('桥源码对会起端口的 profile 有最终防线（不止插件侧判�
     'AcpRuntime 还在裸读 config.dsh.profile —— 旧配置的 web 会被直接拿去 spawn')
   assert.match(acpInit, /profile:\s*DSH_PROFILE/,
     'AcpRuntime 应该用归一化后的 DSH_PROFILE')
+})
+
+// ── 配置的 dsh 路径不存在时，绝不能静默换用别的 dsh ─────────────────────────
+//
+// 2026-11-01 实测：测试里用 `bin: '/nonexistent/x'` 期望「启动必失败」，
+// 结果它**真的启动成功了**并完成 ACP 初始化 —— 因为 resolveDshCommand 在
+// 「配置了但文件不存在」时**继续往下找**，悄悄用了 PATH 里的那个 dsh。
+//
+// 这是最坏的一种失败：用户以为跑的是自己指定的 dsh（特定版本/profile），
+// 实际跑的是另一个。版本或行为不一致时，根本查不出来。
+//
+// 而且它还有个副作用：测试会真的起一个 dsh 子进程挂在那儿（等 ACP 响应），
+// 让整个测试套件卡死（实测超时 90s+）。
+
+const FIND = await import(pathToFileURL(path.join(ROOT, 'lib', 'find-dsh.js')).href)
+
+test('配置的路径不存在 → 直接失败，不自动换用 PATH 里的 dsh', () => {
+  const r = FIND.resolveDshCommand('/nonexistent/definitely-not-here')
+  assert.equal(r.kind, 'none',
+    '配置了不存在的路径却返回了其他 kind —— 它会静默换用别的 dsh，用户永远查不出来')
+  assert.match(String(r.reason), /不存在/,
+    '报错要说明「路径不存在」，否则用户不知道该去填什么')
+  assert.match(String(r.reason), /不会自动换用/,
+    '要明确告知不会自动换用别的 dsh —— 否则用户会以为已经回退了')
+})
+
+test('默认值 "dsh" 仍然允许自动探测（那才是「没配置」）', () => {
+  // configured === 'dsh' 是设置页的默认值，语义上等于「没指定」，
+  // 这时应该正常往下探测 PATH，而不是报错。
+  const r = FIND.resolveDshCommand('dsh')
+  assert.notEqual(r.kind, 'none',
+    '"dsh" 是默认值（等于没配），必须允许自动探测，否则装完就用不了了')
+})
+
+test('启动成本的回归：不存在的 bin 必须**快速**失败（不该真去 spawn）', async () => {
+  const r = makeFailingRuntime()
+  const t0 = Date.now()
+  try { await r.start() } catch { /* 预期失败 */ }
+  const ms = Date.now() - t0
+  // 修复前：2135ms（它真的起了一个 dsh 在等 ACP 握手）
+  // 修复后：几毫秒（解析阶段就失败了）
+  assert.ok(ms < 500,
+    `失败耗时 ${ms}ms（应 <500ms）—— 说明它还在真去 spawn 一个进程，测试会卡死`)
 })

@@ -115,3 +115,47 @@ test('桥启动时调用清理脚本，且不再依赖「文件存在才跑」�
   )
   assert.match(block, /log/i, '清理失败/缺失时要有日志，不能静默')
 })
+
+// ── 判据盲区：不带 --patch 的 ACP 子进程 ─────────────────────────────────────
+//
+// 2026-11-01 实测踩到：有个孤儿是 `dsh --profile acp`（**没有 --patch 参数**）。
+// 原判据只认「命令行里有 dsh-plugin-llminqq 或 patch 路径」，
+// 于是它被判成「不匹配本插件特征」→ 扫 437 个进程报「0 个孤儿」，孤儿还在跑。
+
+test('能识别不带 --patch 的 ACP 孤儿（靠 cwd）', () => {
+  const c = M.classify({
+    pid: 90001, ppid: 1,
+    cmd: 'node /home/jojo/.local/bin/dsh --profile acp',   // 注意：没有 --patch
+    cwd: '/home/jojo/.dsh/dsh-plugin-llminqq/agent',
+  })
+  assert.equal(c.orphan, true,
+    'cwd 在插件数据目录下的 dsh 子进程必须被认出来 —— 否则这类孤儿一直没人清')
+  assert.equal(c.kind, 'acp')
+})
+
+test('不带 --patch 但 cwd 不在插件目录 → 不碰（可能是别人家的 dsh）', () => {
+  const c = M.classify({
+    pid: 90002, ppid: 1,
+    cmd: 'node /home/jojo/.local/bin/dsh --profile acp',
+    cwd: '/opt/other-project',   // 不是我们的目录
+  })
+  assert.equal(c.orphan, false,
+    '别人家的 dsh --profile acp 不能误杀 —— dsh 是通用程序，同名进程到处都有')
+})
+
+test('isPluginDataDir 只认插件数据目录', () => {
+  assert.equal(M.isPluginDataDir('/home/jojo/.dsh/dsh-plugin-llminqq/agent'), true)
+  assert.equal(M.isPluginDataDir('/home/jojo/.dsh/dsh-plugin-llminqq'), true)
+  assert.equal(M.isPluginDataDir('/tmp'), false)
+  assert.equal(M.isPluginDataDir('/opt/other-project'), false)
+  assert.equal(M.isPluginDataDir(''), false)
+  assert.equal(M.isPluginDataDir(null), false)
+})
+
+test('进程枚举要带 cwd（classify 靠它判断）', () => {
+  const procs = M.listProcesses()
+  const self = procs.find(p => p.pid === process.pid)
+  assert.ok(self, '扫不到自己')
+  assert.equal(typeof self.cwd, 'string', 'listProcesses 必须返回 cwd 字段')
+  assert.ok(self.cwd.length > 0, '当前进程应该能读到自己的 cwd')
+})

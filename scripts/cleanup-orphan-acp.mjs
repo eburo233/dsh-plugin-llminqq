@@ -107,7 +107,12 @@ function listProcesses () {
         try {
           cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ').trim()
         } catch { cmd = '' }
-        out.push({ pid, ppid, cmd })
+        // cwd：ACP 子进程的判据之一（见 classify 里对「不带 --patch」的说明）
+        let cwd = ''
+        try {
+          cwd = fs.readlinkSync(`/proc/${pid}/cwd`)
+        } catch { cwd = '' }
+        out.push({ pid, ppid, cmd, cwd })
       } catch { /* 进程刚好退出 */ }
     }
     return out
@@ -138,12 +143,35 @@ function classify (p) {
   if (isOurBridge(p.cmd)) {
     return { orphan: true, kind: 'bridge', why: '桥孤儿（PPid=1，父 DSH 已退出）' }
   }
-  // ACP 子进程：`dsh --profile <name>` 且带本插件的 route patch
-  const patchMarker = path.join(PKG_ROOT, '..', '..', 'dsh-plugin-llminqq', 'acp-route.patch.yml')
-  if (/dsh\s+--profile/.test(p.cmd) && (p.cmd.includes('dsh-plugin-llminqq') || p.cmd.includes(patchMarker))) {
-    return { orphan: true, kind: 'acp', why: 'ACP 子进程孤儿（PPid=1）' }
+  // ACP 子进程：`dsh --profile <name>`，且能确认是**本插件**起的。
+  //
+  // ⚠️ 2026-11-01 实测踩到判据盲区：有个孤儿是 `dsh --profile acp`（**不带 --patch**），
+  //    原来只认「命令行里有 dsh-plugin-llminqq 或 patch 路径」，
+  //    于是它被判成「不匹配本插件特征」→ 扫 437 个进程报「0 个孤儿」，孤儿还在跑。
+  //
+  // 现在用 cwd 作为可靠判据：
+  //   我们桥起的 ACP 子进程，cwd 一定在插件数据目录下（通常是 .../dsh-plugin-llminqq/agent）；
+  //   别人家的 `dsh --profile acp` 不会恰好跑在那个目录里。
+  //
+  // 三重条件任一成立即认定（宁严不宽）：
+  //   ① 命令行里有 dsh-plugin-llminqq 路径（带 --patch 的常规情况）
+  //   ② cwd 落在本插件数据目录内（不带 --patch 时也能认出来）
+  if (/dsh\s+--profile/.test(p.cmd)) {
+    const marker = p.cmd.includes('dsh-plugin-llminqq')
+    if (marker) return { orphan: true, kind: 'acp', why: 'ACP 子进程孤儿（PPid=1，命令行含插件路径）' }
+    if (p.cwd && isPluginDataDir(p.cwd)) {
+      return { orphan: true, kind: 'acp', why: `ACP 子进程孤儿（PPid=1，cwd=${p.cwd}）` }
+    }
   }
   return { orphan: false, why: '不匹配本插件特征' }
+}
+
+/** 这个路径是不是本插件的数据目录（或其子目录）。 */
+function isPluginDataDir (dir) {
+  if (!dir) return false
+  const norm = dir.replace(/\\/g, '/')
+  // 插件数据目录固定叫 dsh-plugin-llminqq（见 lib/store.js 的 dataDir）
+  return /\/dsh-plugin-llminqq(\/|$)/.test(norm)
 }
 
 function main () {
@@ -214,4 +242,4 @@ if (invokedDirectly) {
   }
 }
 
-export { listProcesses, classify, BRIDGE_ENTRY, BRIDGE_MARKERS, isOurBridge }
+export { listProcesses, classify, BRIDGE_ENTRY, BRIDGE_MARKERS, isOurBridge, isPluginDataDir }

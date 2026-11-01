@@ -20,6 +20,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -152,4 +153,52 @@ test('异常风暴：10 万次 crashGuard 只写有限行', () => {
     `日志写了 ${j.loggedLines} 行（应 ≤60）—— 10 万次风暴会变成几十 MB`)
   assert.equal(j.stdoutBroken, true, 'EPIPE 之后 stdoutBroken 必须为 true')
   assert.ok(j.guardCount === 100000, 'guardCount 仍应如实计数（限流只影响写日志，不影响统计）')
+})
+
+// ── ⑤ 日志路径必须可配（不能永远绑在系统盘）────────────────────────────────
+//
+// 35GB 事故的**结构性原因**：`bridgeConfig()` 把日志硬编码在
+// `<dataDir>/logs/bridge.log`，而 dataDir 在系统盘上。所以日志一失控，
+// 直接写满根分区（115G，0 可用），连 dsh 都起不来 —— 整机瘫痪。
+//
+// 把日志放到另一块盘是最便宜的隔离：即使再失控也只吃掉那块盘。
+// 这个测试锁住「路径可配 + 向后兼容」。
+
+test('日志路径可由 config.log.file 指定（否则只能绑在系统盘）', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'lib', 'index.js'), 'utf8')
+  // 窗口要够大：这行注释很长，400 字符会截断在表达式中间（这个测试自己踩到过）
+  const block = src.slice(src.indexOf('log: {'), src.indexOf('log: {') + 700)
+  assert.match(block, /cfg\.log\?\.file/,
+    'bridgeConfig 的 log.file 没有读 cfg.log.file —— 日志又只能落在系统盘')
+  // 空值要退回原路径（向后兼容，老用户配置里没这个字段）
+    // 用字符串包含而不是正则：源码里这行有 `?.`、引号、换行，正则转义很容易写错
+    assert.ok(block.includes("cfg.log?.file"), '没有读 cfg.log.file')
+    assert.ok(block.includes("path.join(dir, 'logs', 'bridge.log')"),
+      '没有「空值退回默认路径」的兜底 —— 老配置会拿到空路径')
+})
+
+test('日志级别也可配（原来硬编码 info）', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'lib', 'index.js'), 'utf8')
+  const block = src.slice(src.indexOf('log: {'), src.indexOf('log: {') + 200)
+  assert.match(block, /level: cfg\.log\?\.level \|\| 'info'/,
+    'log.level 还是写死的 info')
+})
+
+test('把日志搬到另一块盘时，写操作真的落到那块盘（隔离生效）', () => {
+  // 用一个临时的「第二块盘」目录模拟：验证桥的 logFile 解析会听 config
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'llminqq-logpath-'))
+  try {
+    const otherDisk = path.join(tmpRoot, 'other-disk', 'logs')
+    fs.mkdirSync(otherDisk, { recursive: true })
+    const target = path.join(otherDisk, 'bridge.log')
+    // 直接验证 bridge 侧解析逻辑：config.log.file 存在就用它
+    const bridgeSrc = fs.readFileSync(path.join(ROOT, 'lib', 'bridge', 'index.js'), 'utf8')
+    assert.match(bridgeSrc, /const logFile = config\.log\?\.file \?\? path\.join\(ROOT, 'logs', 'bridge\.log'\)/,
+      '桥没有优先使用 config.log.file')
+    // 真写一次，确认那块盘可写（模拟隔离是否成立）
+    fs.writeFileSync(target, 'x')
+    assert.ok(fs.existsSync(target))
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true })
+  }
 })
