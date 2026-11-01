@@ -294,3 +294,47 @@ test('等待有上限（不能因为等 provider 把启动卡死）', () => {
   assert.match(body, /Math\.min/,
     '等待必须有上限 —— startTimeoutMs 很短时不能等满 3 秒')
 })
+
+// ── ⑥ 恢复会话必须重新挂 MCP（否则所有 MCP 工具静默消失）────────────────────
+//
+// 2026-11-01 真实事故：用户发了个视频，机器人回得完全不沾边。
+//
+// 从会话原始记录里挖出决定性证据 —— turn 8 有一条 `tool-registry` 事件：
+//     一次性移除 **39 个工具**（全是 mcp__bilibili__* 和 mcp__storyboard__*），新增 0
+// 之后模型调 `bili_search` 直接报 `unknown tool "mcp__bilibili__bili_search"`，
+// 只能退回用 bash 瞎猜 —— 所以它答不出视频内容（那个视频恰恰是图文讲解类，
+// 不看画面根本不知道在讲什么）。
+//
+// 根因：`session/resume` 只传了 `{ sessionId, cwd }`，**没传 mcpServers**：
+//     // 修复前
+//     await this._request('session/resume', { sessionId: remembered, cwd: this.cwd }, 60000)
+//
+// 而 `dsh-acp` 的 `AcpSession.resume()` 里是：
+//     await mountAcpMcpServers(agentCtx, options.mcpServers, options.cwd)
+// 传空 = 一个都不挂 = 工具全没。`session/new` 那边是传了的，所以只有「恢复」这一路会丢。
+//
+// 实测对比（同一个会话，只改传不传 mcpServers）：
+//     不传 → dsh 子进程 0 个，系统里 MCP 进程 0 个
+//     传了 → dsh 子进程 2 个，系统里 MCP 进程 2 个
+
+test('session/resume 必须传 mcpServers（不传就丢掉全部 MCP 工具）', () => {
+  const SRC_ACP = fs.readFileSync(path.join(ROOT, 'lib', 'bridge', 'acp.js'), 'utf8')
+  // 抓到 resume 那个请求的参数块
+  const i = SRC_ACP.indexOf("'session/resume'")
+  assert.ok(i > 0, '定位不到 session/resume 调用')
+  const block = SRC_ACP.slice(i, i + 400)
+  assert.match(block, /mcpServers:\s*this\.mcpServers/,
+    'session/resume 没传 mcpServers —— 恢复过的会话会永久失去所有 MCP 工具，' +
+    '而模型不会报错，只会「优雅降级」用 bash 乱猜，表现为「回答不沾边」')
+})
+
+test('session/new 和 session/resume 都要挂 MCP（两条路不能只有一个对）', () => {
+  const SRC_ACP = fs.readFileSync(path.join(ROOT, 'lib', 'bridge', 'acp.js'), 'utf8')
+  const newIdx = SRC_ACP.indexOf("'session/new'")
+  const resIdx = SRC_ACP.indexOf("'session/resume'")
+  assert.ok(newIdx > 0 && resIdx > 0, '定位不到两个调用')
+  assert.match(SRC_ACP.slice(newIdx, newIdx + 300), /mcpServers/,
+    'session/new 没传 mcpServers')
+  assert.match(SRC_ACP.slice(resIdx, resIdx + 400), /mcpServers/,
+    'session/resume 没传 mcpServers')
+})
