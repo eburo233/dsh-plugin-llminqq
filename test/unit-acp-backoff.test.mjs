@@ -23,6 +23,7 @@
 // 断言「连续多次 start() 只 spawn 一次」，以及冷却期内不再反复 spawn。
 
 import { test } from 'node:test'
+import fs from 'node:fs'
 import assert from 'node:assert/strict'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -233,4 +234,63 @@ test('启动成本的回归：不存在的 bin 必须**快速**失败（不该�
   // 修复后：几毫秒（解析阶段就失败了）
   assert.ok(ms < 500,
     `失败耗时 ${ms}ms（应 <500ms）—— 说明它还在真去 spawn 一个进程，测试会卡死`)
+})
+
+/** 取一个类方法的完整方法体（从方法名到配平的花括号结束）。 */
+function methodBody (src, name) {
+  const i = src.indexOf(name + ' (')
+  if (i < 0) return ''
+  const start = src.indexOf('{', i)
+  if (start < 0) return ''
+  let depth = 0
+  for (let k = start; k < src.length; k++) {
+    if (src[k] === '{') depth++
+    else if (src[k] === '}') { depth--; if (depth === 0) return src.slice(i, k + 1) }
+  }
+  return ''
+}
+
+// ── ⑤ provider 注册竞态：为什么图片能力一直被误判 ───────────────────────────
+//
+// 2026-11-01 用户实测：「还在报图片不可用」，而宿主模型目录明明写着
+// `deepseek-v4.1-flash: inputModalities ['text','image']`。
+//
+// 根因在 dsh-acp 的 initialize：
+//     imagePromptEnabled = await supportsAcpImagePrompts(ctx, config.provider, config.model)
+// 它调 llm.resolveModelInfo(provider, model) 查 inputModalities。桥**一 spawn 就立刻**
+// 发 initialize —— 那时第三方 provider 插件（dsh-our-free-model）还没注册完，
+// 查询抛错被 catch 吞掉 → 返回 false，而**这个值整个进程生命周期内不再更新**。
+//
+// 实测（同一份配置，只改 initialize 时机）：
+//     500ms false / 1000ms false / 1500ms false / 2000ms false / 2500ms true
+//
+// 修法：initialize 前先等 provider 注册（实测约 2.5s，取 3s 留余量）。
+
+test('initialize 前必须等 provider 注册（否则图片能力被永久误判）', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'lib', 'bridge', 'acp.js'), 'utf8')
+  assert.match(src, /_waitForProviderReady/,
+    '没有等 provider 就发 initialize —— 第三方 provider 会竞态失败，图片能力固定成 false')
+
+  // 等待必须发生在 initialize 之**前**
+  const waitIdx = src.indexOf('await this._waitForProviderReady')
+  const initIdx = src.indexOf("this._request('initialize'")
+  assert.ok(waitIdx > 0 && initIdx > 0, '定位不到调用点')
+  assert.ok(waitIdx < initIdx,
+    '等待必须在 initialize 之前（initialize 一旦返回 false 就没有第二次机会）')
+})
+
+test('内置 provider 不需要等（它们由宿主注册，没有竞态）', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'lib', 'bridge', 'acp.js'), 'utf8')
+  // 用定界取方法体（正则截取不可靠：注释很长会截不到关键代码）
+  const body = methodBody(src, '_waitForProviderReady')
+  assert.ok(body.length > 0, '定位不到 _waitForProviderReady')
+  assert.match(body, /deepseek-official/,
+    '内置 provider 应该跳过等待 —— 白等 3 秒没必要')
+})
+
+test('等待有上限（不能因为等 provider 把启动卡死）', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'lib', 'bridge', 'acp.js'), 'utf8')
+  const body = methodBody(src, '_waitForProviderReady')
+  assert.match(body, /Math\.min/,
+    '等待必须有上限 —— startTimeoutMs 很短时不能等满 3 秒')
 })

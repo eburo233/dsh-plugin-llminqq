@@ -50,6 +50,53 @@
   **实测对比**（同一份 `profile: "web"` 的配置，跑 60 秒）：
   修复前 4 分钟 99 次 spawn；修复后 **1 次**，全程 CPU 0.0%。
 
+- **配的模型一个都没被调用过（`-32603` 的真因）**。用户反馈「为什么整自动回复」，
+  日志里三个模型全报 `Internal error (code -32603)`。
+  查下来是**上游 profile 根本没有那个 provider**：
+  - 插件配 `trae/deepseek-v4.1-flash`，而 trae 是由 `dsh-our-free-model`
+    注册进 **web** profile 的；
+  - 桥起的 ACP 子进程用的是 **acp** profile —— bundles 只有 `dsh-base` +
+    `dsh-acp-app`，里面**只注册了 `deepseek-official`**；
+  - 于是 `session/set_config_option` 设 `trae` **静默失败** → 回落到
+    `deepseek-official` → 而它没有 API key →
+    `llm-deepseek: no API key for provider route "deepseek-official"`。
+
+  **没有任何一处报出真正原因**，用户只能看到「模型暂时不可用」，换模型、重试都没用。
+  修复：本机已把 `dsh-our-free-model` 挂进 acp profile（凭据在全局
+  `~/.dsh/.credentials.yaml`，不用重登），ACP 现在能看到
+  `trae/qodercn/cline/gemini/our-free-model` 共 5 组 provider。
+  三个路由实测全部可用（ds41f 7.4s / dfmodel 7.0s / glm-5.3-flashx 9.8s）。
+  `INSTALL-PLUGIN.md` 补了完整自查与修复步骤 —— 否则换台机器还会踩。
+
+- **图片能力被误判成不可用（provider 注册竞态）**。用户指出「ds41f 应该支持图片」，
+  而宿主模型目录确实写着 `inputModalities: ['text','image']`，但 ACP 一直报
+  `inline image prompts were not advertised by this connection`。
+
+  根因在 `dsh-acp` 的 `initialize`：
+  ```js
+  imagePromptEnabled = await supportsAcpImagePrompts(ctx, config.provider, config.model)
+  ```
+  它调 `llm.resolveModelInfo(provider, model)` 查 inputModalities。而桥**一 spawn
+  就立刻发 initialize** —— 那时第三方 provider 插件还没注册完，查询抛错被 catch
+  吞掉 → 返回 `false`，**这个值在整个子进程生命周期内不再更新**。
+
+  实测（同一份配置，只改 initialize 时机）：
+  | 延迟 | image |
+  |---|---|
+  | 500ms | false |
+  | 1000ms | false |
+  | 1500ms | false |
+  | 2000ms | false |
+  | **2500ms** | **true** |
+
+  修法：initialize 前先等 provider 注册就绪（实测约 2.5s，取 3s 留余量），
+  只对**非内置** provider 生效（`deepseek-official` 由宿主自注册，没有竞态，
+  白等 3 秒没必要）。实测修复后：
+  ```
+  acp: 已等 3002ms 让 provider 注册就绪（路由 trae/deepseek-v4.1-flash）
+  acp: 图片输入 可用
+  ```
+
 - **打开总开关后调度器不启动（又是「只在加载时读一次配置」）**。用户把总开关打开、
   桥也跑起来了，但 `/overview` 里始终是 `{"enabled": false, "tasks": []}` ——
   两个字段都空，正是 `scheduler ? scheduler.status() : {enabled:false,tasks:[]}`

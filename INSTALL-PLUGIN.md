@@ -56,6 +56,95 @@ dsh plugin --profile web add file:C:/Users/你/code/dsh-plugin-llminqq
 4. 先点「① 启动 QQ 容器」，等二维码出来，用**小号**扫；
 5. 登录成功后去「运行」页点「启动桥」。
 
+### ⚠️ 桥用哪个 profile：配的模型可能根本不存在
+
+桥会起一个 **`dsh --profile acp` 子进程**来跑对话。`acp` 是 DSH 随附的**最精简**
+profile，bundles 只有：
+
+```
+@deepseek-ai/dsh-base
+@deepseek-ai/dsh-acp-app
+```
+
+**它不认识你装在任何第三方渠道插件里的 provider。** 如果你的模型路由指向
+`trae/xxx`、`qodercn/xxx` 这类（由 `dsh-our-free-model` 等插件注册到 **web** profile），
+而 `acp` profile 里没装那些插件，就会出现：
+
+```
+Internal error (code -32603)
+→ 再往下翻日志才看到：
+llm-deepseek: no API key for provider route "deepseek-official"
+```
+
+**看起来是「所有模型都不可用」，真相是你配的模型一个都没被调用过** ——
+`session/set_config_option` 设一个不存在的 provider 会**静默失败**，
+自动回落到 profile 的默认路由（通常是 `deepseek-official`），而它没有凭据。
+
+自查（看 acp profile 到底认识哪些 provider）：
+
+```bash
+dsh --profile acp --dump-config | grep -A3 "id: acp"
+```
+
+如果只有 `deepseek-official`，而你配的是 trae/qodercn，就需要把提供 provider 的
+插件也挂进 acp profile。以 `dsh-our-free-model` 为例（凭据在全局
+`~/.dsh/.credentials.yaml`，**不用重新登录**）：
+
+```bash
+# 1) 软链过去（不用重装，省几百 MB）
+mkdir -p ~/.dsh/profiles/acp/node_modules
+ln -sfn ~/.dsh/profiles/web/node_modules/dsh-our-free-model \
+        ~/.dsh/profiles/acp/node_modules/dsh-our-free-model
+
+# 2) 把 bundle 加进 acp profile
+python3 - <<'EOF'
+import json, os
+p = os.path.expanduser('~/.dsh/profiles/acp/package.json')
+d = json.load(open(p))
+b = d['dsh']['profile']['bundles']
+if 'dsh-our-free-model' not in b:
+    b.append('dsh-our-free-model')
+json.dump(d, open(p, 'w'), ensure_ascii=False, indent=2)
+EOF
+
+# 3) 重启 dsh web 让它生效
+```
+
+验证（应该能看到 trae / qodercn 等分组）：
+
+```bash
+dsh --profile acp --dump-config | grep "our-free-model"
+```
+
+> 也可以把「高级 → ACP profile」直接填成 `web`，那样所有 provider 都在 ——
+> 但 `web` 会起 HTTP 服务抢宿主端口（`EADDRINUSE 3080`），**不推荐**，
+> 插件已经把 `web`/`headless`/`desktop` 都重定向到 `acp` 了。
+
+### 图片输入（发图给机器人看）
+
+模型支持归模型支持，**能不能用还取决于 ACP 这条链路**。
+
+`dsh-acp` 在 `initialize` 时按 profile 配置的 provider/model 查一次
+`inputModalities`，结论**在整个子进程生命周期内固定**。所以：
+
+- 模型目录里 `deepseek-v4.1-flash` 明明写着 `['text','image']`，
+  但 ACP 可能报 `inline image prompts were not advertised by this connection`；
+- 如果这一步算得太早（第三方 provider 还没注册完），会被判成不支持。
+
+插件已做两件事：**启动时先等 provider 注册就绪（实测约 2.5 秒）再 initialize**；
+并且**只在配了非内置 provider 时等**（`deepseek-official` 是宿主自注册的，没有竞态）。
+
+如果还是报不可用，先看桥日志有没有这两行：
+
+```
+acp: 已等 3002ms 让 provider 注册就绪（路由 trae/deepseek-v4.1-flash）
+acp: 图片输入 可用
+```
+
+没有「已等」那行 → 说明等逻辑没跑到（profile 是内置 provider 或版本旧）；
+有「已等」但仍报不可用 → 那个模型的 `inputModalities` 确实不含 `image`
+（去设置页「模型」页看该模型的标签有没有「看图」）。
+
 ### 想旁路试，不动正在用的 web profile
 
 给一个临时 `DSH_HOME`，数据和依赖都会落在临时目录：
