@@ -202,3 +202,71 @@ test('把日志搬到另一块盘时，写操作真的落到那块盘（隔离�
     fs.rmSync(tmpRoot, { recursive: true, force: true })
   }
 })
+
+// ── ⑥ 自动清理的**路径**：这次让孤儿堆了 4 个的元凶 ────────────────────────
+//
+// 2026-11-01 实测：桥启动时那段「清孤儿」**从没生效过** —— 日志里
+// `grep "acp清理"` 返回 0 条。
+//
+// 根因是路径少上溯一级：
+//    index.js 在 `<pkg>/lib/bridge/`，脚本在 `<pkg>/scripts/`
+//    原来只 `path.join(dirname(index.js), '..', 'scripts', ...)`
+//    → 算出 `<pkg>/lib/scripts/` —— 那个目录不存在 → existsSync false → 静默跳过
+//
+// 后果：孤儿桥一天天堆积，实测同时 4 个桥（3 个 PPid=1），同一条 QQ 消息
+// 被处理 4 次、发出多条矛盾的回复、还有「脑子卡了一下」的兜底。
+
+test('自动清理脚本的路径必须是 <pkg>/scripts/（不能是 lib/scripts/）', () => {
+  assert.match(SRC, /'\.\.', '\.\.', 'scripts', 'cleanup-orphan-acp\.mjs'/,
+    '路径必须上溯两级（lib/bridge → lib → <pkg>），只上溯一级会算成 lib/scripts/（不存在）')
+
+  // 用真实安装布局验证路径能落到存在的文件
+  const pkgs = [
+    path.join(ROOT, 'lib', 'bridge', 'index.js'),        // 仓库布局
+    '/home/jojo/.dsh/profiles/web/node_modules/dsh-plugin-llminqq/lib/bridge/index.js', // 安装布局
+  ]
+  for (const idx of pkgs) {
+    const calc = path.join(path.dirname(idx), '..', '..', 'scripts', 'cleanup-orphan-acp.mjs')
+    // 仓库那份一定在；安装那份可能没同步，只在存在时断言
+    if (idx.includes(ROOT)) {
+      assert.ok(fs.existsSync(calc), `路径算错：${calc}`)
+    }
+  }
+})
+
+test('脚本缺失时必须告警，不能静默跳过（这次就是静默藏了 bug）', () => {
+  const idx = SRC.indexOf('cleanup-orphan-acp.mjs')
+  const block = SRC.slice(idx - 300, idx + 900)
+  assert.match(block, /!fs\.existsSync\(script\)/, '没有「脚本缺失」分支')
+  assert.match(block, /logger\.log\(`WARN acp 孤儿清理脚本缺失/, '缺失时没有打 WARN')
+})
+
+// ── ⑦ 失败不再回兜底文案（用户明确要求）────────────────────────────────────
+
+test('模型失败时不再回「脑子卡了一下」这类兜底文案', () => {
+  // 去掉注释再看 —— 注释里会引用这些文案解释「为什么删掉」，不算真的还在用
+  // 注意：注释是**缩进后**的 `//`，不是行首 —— 所以按「全部 // 到行尾」剥
+  const codeOnly = SRC.replace(/\/\/[^\n]*/g, '')
+  assert.doesNotMatch(codeOnly, /脑子卡了一下，等下再说/,
+    '兜底文案还在代码里 —— 用户明确要求「失败就不回复了」')
+  assert.doesNotMatch(codeOnly, /刚刚没接住，你再说一遍/,
+    '另一条兜底文案也要去掉')
+  // 但必须有日志留痕（静默不等于不留证据）。
+  // 注意窗口要从 catch 的**起点之前**取 —— logger.log 那行在 '处理消息异常' 前面。
+  const catchIdx = SRC.indexOf('} catch (err) {\n    logger.log(`处理消息异常')
+  assert.ok(catchIdx > 0, '定位不到 catch 块（日志行应该在 catch 的第一句）')
+  const catchBlock = SRC.slice(catchIdx, catchIdx + 600)
+  assert.match(catchBlock, /logger\.log/, '失败要记日志，否则出问题查不到')
+})
+
+// ── ⑧ 打字延迟必须**每段各自算**，不能只有第一段有 ─────────────────────────
+
+test('短句拆分后每段都有自己的打字延迟（不是只有第一条）', () => {
+  const i = SRC.indexOf('const parts = splitLongSentence(cappedPlain)')
+  assert.ok(i > 0, '定位不到拆分逻辑')
+  const block = SRC.slice(i, i + 700)
+  // 关键：延迟计算必须在**循环内**（每段一次），而不是循环外算一次
+  assert.match(block, /for \(let i = 0; i < parts\.length; i\+\+\)/, '没找到逐段循环')
+  assert.match(block, /replyDelayMs\(parts\[\[?i/, '延迟没用该段的文本算 —— 补发的那条会秒出')
+  assert.match(block, /第 \$\{i \+ 1\}\/\$\{parts\.length\} 段/, '日志要能看出是第几段，便于排查')
+})
