@@ -18,7 +18,14 @@
     "README.md"
   ],
   "adaptations": [
-    "零改动（原样复制）"
+    "本地适配（非上游代码）：",
+    "① bili_frames 帧数上限 6 → 200（用户要求「上限顶格 200，模型可以自己传」）；",
+    "   实际返回仍受 B站故事板格数限制（实测 347 秒视频只有 43 格）。",
+    "② bili_frames 增加**同格去重**：请求 200 帧而故事板只有 43 格时，",
+    "   按时间最近取会让多帧落到同一格 —— 同一张图传多次只是白烧 token（每张 100-200）。",
+    "③ transcribe 完成时写 <stateDir>/transcribe-ready/<job_id>.json（原子替换），",
+    "   让桥能在下一轮把 ASR 结果注入上下文（原来转完了没人取，用户永远等不到）。",
+    "⚠️ 更新 vendor 时这三处要重新打上（它们的上游都还没有）。"
   ],
   "upgradeNotes": [
     "它没有独立 npm 发布，只能从 dsh-bili-scroll 的 vendor/bilibili-mcp/ 里取",

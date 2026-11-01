@@ -1,7 +1,8 @@
 # VENDORED: bilibili-mcp
 
 - **来源**：npm 包 `dsh-bili-scroll@2.3.0` 内嵌的 `vendor/bilibili-mcp/`（MIT）。
-  原样复制，未做任何改动。
+  复制后做了**少量本地适配**（见下面「本目录相对上游的改动」，
+  每一条都是上游没有的，升级 vendor 时要重新打上）。
 - **版本**：`embedded-in-dsh-bili-scroll@2.3.0`（升级时同步更新本行与 `vendor-manifest.json`）。
 - **上游（宿主持有者）**：https://github.com/c1overzz/dsh-bili-scroll
 - **原始作者**：**AGI_Ananas**（`bilibili-mcp`），`Copyright (c) 2026 AGI_Ananas`（见 `LICENSE`）
@@ -20,7 +21,23 @@
 
 ## 本目录相对上游的改动
 
-**零改动。** `mcp_server.py` / `requirements.txt` / `LICENSE` / `README.md` 全部原样。
+`requirements.txt` / `LICENSE` / `README.md` 原样未动。**`mcp_server.py` 有三处本地适配**
+（都是 2026-11-01 用户实测/要求触发的，上游尚未合并）：
+
+1. **`bili_frames` 帧数上限 6 → 200**（用户要求「上限顶格 200 帧，模型可以自己传」）。
+   实际返回仍受 B站故事板格数限制 —— 实测一个 347 秒的视频只有 **43 格**。
+
+2. **`bili_frames` 同格去重**。请求 200 帧而故事板只有 43 格时，按「时间最近」取
+   会让多帧落到同一格；同一张 480×270 的图传多次，模型看不到任何新信息，
+   只是白烧 token（每张 100-200 token，200 张就是 2-4 万）。
+   现在同一个格子只给一张图，并在 `frames` 里如实反映「这一帧是故事板第几格」。
+
+3. **`transcribe` 完成后写待送达标记** `<stateDir>/transcribe-ready/<job_id>.json`
+   （临时文件 + 原子替换）。原因：ASR 是后台异步任务，而模型这一轮说完就结束了 ——
+   实测转写 09:52 成功（3574 字节，文件都在），但**没有任何人再取**，用户永远等不到
+   「那个视频讲了什么」。桥下一轮扫这个目录，把结果注入上下文，然后打 `.sent` 标记。
+
+⚠️ **升级 vendor 时，上面三处要重新打上**（上游还没有）。
 
 ⚠️ **不复制 `__pycache__`**：那是 Python 字节码缓存，跟 Python 版本和平台绑定，
 进 npm 包既变大又可能失效（换 Python 版本会读到不匹配的 .pyc）。首次运行自动生成即可。

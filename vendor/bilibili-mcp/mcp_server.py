@@ -1777,7 +1777,16 @@ async def bili_cover(bvid: str) -> list:
 # Video.get_video_snapshot() 有封装，但 pvideo 默认 True 会走老接口，必须传 False。
 # 裁切用 Pillow（requirements 里的 qrcode[pil] 已经带进来）。
 
-_FRAME_MAX = 6
+# 单次最多返回多少帧。
+# 🔴 2026-11-01 用户要求「上限顶格 200 帧，模型可以自己传」。
+#
+# ⚠️ 但这**只是请求上限**，真实能拿到的帧数受两件事限制：
+#   ① B站故事板本身有多少格（实测一个 347 秒的视频只有 43 格）；
+#   ② 重复帧会被去重 —— 请求 200 帧而故事板只有 43 格时，
+#      按时间最近取会产生大量**同一格**，那没有意义（同一张图传 5 次只是白烧 token）。
+#
+# 所以 200 是「模型最多可以要多少」，实际返回 = min(请求数, 故事板格数)。
+_FRAME_MAX = 200
 _TILE_W_DEFAULT = 480
 _TILE_H_DEFAULT = 270
 
@@ -1861,13 +1870,19 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
 
     Args:
         bvid: 视频BV号，如"BV1uNk1YxEJQ"
-        num: 取几帧，1-6，默认 3
+        num: 取几帧，**1-200**，默认 3。想要更密的覆盖就往上加，
+            但**实际能拿到多少取决于 B站故事板有几格**（实测 347 秒的视频只有 43 格）；
+            同一格不会重复返回，所以要 200 张只拿到 42 张是正常的。
         at: 指定时间点（秒）的列表；传了就以它为准，忽略 num
 
     Returns:
         若干张 480×270 的画面 + 一句说明（时长、实际取到的那一刻、哪几帧失败）。
         失败会写进 failed。**多P 视频的故事板通常只覆盖第 1P**，返回里会用
         covered_sec / pages 标明实际覆盖范围。图能否被看见取决于模型是否支持图片输入。
+
+    ⚠️ 什么时候必须用它：教程/手工/做饭（步骤在动作里）、舞蹈/表演、游戏实况、
+    对方问「这个怎么样」、字幕为空或明显和标题不符 —— 这些**只看文字会理解错**。
+    教程类建议 num=10 起，盯某一段用 at。
     """
     cred = load_credential()          # 故事板不登录也能取
     try:
@@ -1923,9 +1938,23 @@ async def bili_frames(bvid: str, num: int = 3, at: list | None = None) -> list:
         n = max(1, min(int(num or 3), _FRAME_MAX))
         targets = [covered * (i + 1) / (n + 1) for i in range(n)]
 
+    # 🔴 2026-11-01：**同一个故事板格子只给一张图**。
+    #
+    #    为什么（用户把上限提到 200 帧之后必须加）：
+    #      B站故事板一格就那么大，一个 347 秒的视频实测只有 **43 格**。
+    #      请求 200 帧时，按「时间最近」取会让多帧落到同一格 ——
+    #      同一张 480×270 的图被传 5 次，模型看不到任何新信息，只是白烧 token。
+    #
+    #    所以先去重、再按原始请求的时间顺序保留**首次**出现的那一格。
+    #    返回里 frames 的 index 会如实反映「这一帧对应故事板第几格」，
+    #    模型看得出来「我要了 200 张，实际给了 43 张，因为片子就这么多画面」。
     picked = []
+    seen_tiles = set()
     for t in targets:
         ts, tile = min(entries, key=lambda e: abs(e[0] - t))
+        if tile in seen_tiles:
+            continue
+        seen_tiles.add(tile)
         picked.append((round(t, 1), round(ts, 1), tile))
 
     tw = int(snap.get("img_x_size") or _TILE_W_DEFAULT)
