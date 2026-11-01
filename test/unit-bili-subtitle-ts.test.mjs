@@ -86,3 +86,43 @@ test('AGENTS.md 要说明字幕时间戳怎么和宫格图配合', () => {
   assert.match(AGENTS, /对得上|对时间戳/,
     '没说明「字幕时间戳 + 宫格时间戳」怎么配合 —— 这才是图文理解的关键')
 })
+
+// ── ④ 安装文档必须写清 yt-dlp（否则换台机器不会知道要装）─────────────────────
+//
+// 2026-11-01 实测发现：`video_storyboard` 能直接吃 URL 拿高清帧，
+// 但**只缺 yt-dlp 这个外部命令**（vendor 刻意不打包它）。
+// 不写进安装文档的话，换台机器只会发现「画面看不清」，不知道差什么。
+
+const INSTALL = fs.readFileSync(path.join(ROOT, 'INSTALL-PLUGIN.md'), 'utf8')
+
+test('INSTALL-PLUGIN.md 要说清楚 why：storyboard 比 bili_frames 强在哪', () => {
+  assert.match(INSTALL, /yt-dlp/, '安装文档里完全没提 yt-dlp')
+  assert.match(INSTALL, /video_storyboard/, '没提 storyboard')
+  assert.match(INSTALL, /bili_frames/, '没提 bili_frames（读者不知道还有个更弱的现成工具）')
+  // 要让读者明白「不装也能用，只是看不清」
+  assert.match(INSTALL, /不装也能用/, '没说明「不装也能用」—— 会让读者以为插件缺依赖')
+})
+
+test('要给三种平台的安装方式（Linux/Windows/macOS）', () => {
+  for (const kw of ['python3 -m venv', 'winget install yt-dlp', 'brew install yt-dlp']) {
+    assert.ok(INSTALL.includes(kw), `缺安装方式：${kw}`)
+  }
+})
+
+test('要警告 PEP 668（apt 管的 python 不让 pip --user）', () => {
+  assert.match(INSTALL, /PEP 668|externally-managed-environment/,
+    '没警告 PEP 668 —— 读者会照着 pip --user 装然后失败')
+})
+
+test('要写 venv 拷贝后的 shebang 坑（实测踩过）', () => {
+  assert.match(INSTALL, /shebang/, '没提 shebang 问题')
+  assert.match(INSTALL, /cannot execute/, '没写实际报错文案 —— 读者对不上自己的错误')
+  assert.match(INSTALL, /sed -i .*1s\|.*\|/, '没给修 shebang 的命令')
+})
+
+test('要教怎么验证它被找到了（PATH 检查 + 日志特征）', () => {
+  assert.match(INSTALL, /\.local\/bin/, '没提 ~/.local/bin')
+  assert.match(INSTALL, /findOnPath|PATH/, '没说明查找方式')
+  assert.match(INSTALL, /\[fetch\] downloaded/, '没给「成功长什么样」的日志特征')
+  assert.match(INSTALL, /yt-dlp not found/, '没给「失败长什么样」')
+})

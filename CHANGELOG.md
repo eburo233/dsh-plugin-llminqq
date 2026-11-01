@@ -220,6 +220,8 @@
   安装方式（本机）：PEP 668 挡住 `pip --user`，改用 venv + 软链
   （`~/.local/share/yt-dlp-venv` → `~/.local/bin/yt-dlp`，已在 PATH 里）。
   `AGENTS.md` §5.2 已改成 **storyboard 优先、bili_frames 只作快速预览**。
+  `INSTALL-PLUGIN.md` 补了完整安装章节（PEP 668 警告 / 三平台装法 /
+  venv 拷贝后的 shebang 坑 / PATH 验证 / 「成功与失败各长什么样」的日志特征）。
 
 - **「很多视频需要图片才能理解意思」：帧数上限 6 → 200 + 提示词补「必须看图」规则**
   （用户要求）。

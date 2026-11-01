@@ -145,6 +145,112 @@ acp: 图片输入 可用
 有「已等」但仍报不可用 → 那个模型的 `inputModalities` 确实不含 `image`
 （去设置页「模型」页看该模型的标签有没有「看图」）。
 
+### 看视频画面：要装 `yt-dlp`（可选，但强烈建议）
+
+「这视频讲了啥」这类问题，**光有字幕不够** —— 教程/手工/做饭/舞蹈/游戏实况，
+内容全在画面里。
+
+插件有 **两个看画面的工具**，但它们的清晰度差得很远（2026-11-01 实测）：
+
+| | `bili_frames` | `video_storyboard` |
+|---|---|---|
+| 输入 | 只要 BV 号 | **B站 URL 或本地文件** |
+| 来源 | B站自带故事板（为进度条预览做的）| 真扫全片（如 10380 帧），按**画面变化**选帧 |
+| 尺寸 | 480×270 | 874×701（每格 286-331px）|
+| 效果 | **字小到看不清** | 能读清画面上的文字 |
+
+同一个图文讲解视频，`bili_frames` 给的帧只能看到「EP02 12/22」这种页码和
+残缺词条；`storyboard` 一眼能看出「7+8=15 被划掉改成 13」这种具体对话示例。
+
+**`video_storyboard` 只缺一个外部命令 `yt-dlp`**（它刻意不打包，见
+`vendor/dsh-video-storyboard/src/fetch.js` 的注释）。装了之后就能直接吃 URL：
+
+```
+[fetch] downloaded 4.2MB → 360p (source max 1080p, auth=anonymous)
+[scan]  10380 帧 → 22 个切点
+[sheet] 874x701  3x4  cell≈286x159
+[done]  9090ms
+```
+
+一次「下载 + 出图」约 11 秒（下载 360p 只有 4.2MB，它不需要高分辨率）。
+
+#### 怎么装
+
+> ⚠️ **不要** `pip install --user yt-dlp`。Ubuntu 24.04+ 等系统有 PEP 668 保护，
+> 会直接报 `externally-managed-environment` 拒绝。
+
+**Linux / macOS（用 venv，最干净）：**
+
+```bash
+python3 -m venv ~/.local/share/yt-dlp-venv
+~/.local/share/yt-dlp-venv/bin/pip install -U yt-dlp
+mkdir -p ~/.local/bin
+ln -sfn ~/.local/share/yt-dlp-venv/bin/yt-dlp ~/.local/bin/yt-dlp
+~/.local/bin/yt-dlp --version     # 能打印版本就成了
+```
+
+⚠️ 如果 venv 是**从别处拷来的**（而不是原地新建），`yt-dlp` 脚本第一行的
+shebang 还指向老路径，会报 `cannot execute: required file not found`。
+修一下：
+
+```bash
+sed -i '1s|.*|#!/home/你/.local/share/yt-dlp-venv/bin/python3|' \
+  ~/.local/share/yt-dlp-venv/bin/yt-dlp
+```
+
+**Windows：**
+
+```powershell
+winget install yt-dlp
+# 或者
+scoop install yt-dlp
+```
+
+**macOS（更省事）：**
+
+```bash
+brew install yt-dlp
+```
+
+#### 验证它真的能被找到
+
+插件是按 **PATH + `~/.local/bin`** 去找的（见 `fetch.js` 的 `findOnPath`）。
+确认 `~/.local/bin` 在 PATH 里：
+
+```bash
+echo "$PATH" | tr ':' '\n' | grep -F "$HOME/.local/bin"
+```
+
+没有就加到 shell 配置里（`~/.bashrc` 或 `~/.zshrc`）：
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+装完怎么验：让对方发个 B站链接问「这视频讲了啥」，然后看桥日志有没有
+
+```
+[fetch] downloaded …MB → 360p
+```
+
+有就是成了；报 `yt-dlp not found` 就是 PATH 没配好。
+
+> **不装也能用**：`bili_frames` 不依赖 yt-dlp（直接裁 B站故事板）。
+> 只是清晰度差、看不清画面里的字。字幕（`bili_subtitle`）也不依赖它。
+
+#### 字幕带时间戳（和宫格图对得上）
+
+`bili_subtitle` 返回三种形式，**带时间戳的那两种是「图文理解」的关键**：
+
+| 字段 | 内容 |
+|---|---|
+| `text` | 纯文本（老行为） |
+| `timedText` | `[0:06] Agent，你被人类抱怨过吗？` 每行带时间 |
+| `segmentsWithTime` | `[{from: 6.65, to: 9.04, text: "…"}]` 结构化 |
+
+宫格图每格都标着时间戳，字幕也带时间戳，模型才能说清
+「第 3 格（15-23 秒）在演示什么、对应字幕哪一句」。
+
 ### 想旁路试，不动正在用的 web profile
 
 给一个临时 `DSH_HOME`，数据和依赖都会落在临时目录：
