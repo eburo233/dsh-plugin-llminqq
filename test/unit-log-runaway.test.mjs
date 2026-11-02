@@ -262,7 +262,9 @@ test('模型失败时不再回「脑子卡了一下」这类兜底文案', () =>
 // ── ⑧ 打字延迟必须**每段各自算**，不能只有第一段有 ─────────────────────────
 
 test('短句拆分后每段都有自己的打字延迟（不是只有第一条）', () => {
-  const i = SRC.indexOf('const parts = splitLongSentence(cappedPlain)')
+  // v2-3 起拆句收进 splitReplyForSend（模型标了 [SPLIT] 就按标记拆，没标才走老逻辑）。
+  // 断言名要跟着改：否则这里 indexOf 返回 -1，测试会因为「定位不到」而假红/假绿。
+  const i = SRC.indexOf('const parts = splitReplyForSend(cappedPlain)')
   assert.ok(i > 0, '定位不到拆分逻辑')
   const block = SRC.slice(i, i + 700)
   // 关键：延迟计算必须在**循环内**（每段一次），而不是循环外算一次
