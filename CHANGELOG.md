@@ -6,6 +6,21 @@
 > 说明：本仓库的公开历史从 `0.5.0` 开始。更早的迭代是作者自用阶段的脚本形态，
 > 没有以版本号发布过，因此下面没有 `0.4.x` 之类的条目，也不会编造。
 
+## [未发布]
+
+### Added
+
+- **表情包图库随插件分发**（`lib/memepack.js` + `qq-agent/meme-pack/`）：
+  脚本版自带的 99 张图 + 含义索引（caption / keywords / tag）在封装成插件时漏搬了 ——
+  AGENTS.md 让模型去工作区 `meme-pack/` 找图，那里却不存在，只能去借第三方插件
+  dsh-expression 的 node_modules 图库，学到的表情也写进那个包目录（升级即丢）。
+  现在：插件启动时把随包图库落到 agent 工作区（`<dataDir>/agent/meme-pack`），
+  用 `meanings.json` 重建与 dsh-expression 同 schema 的 `index.db`（含 FTS5），
+  **幂等**：已存在的图片不重拷、已有索引行不覆盖 —— 升级不会冲掉学到的表情。
+- 第三方插件 `dsh-expression` 的 `memeRoot` 指向同一份图库（Web 面板与 QQ 共用），
+  `qq-meme` skill 的学习结果也落在这里。
+- AGENTS.md 表情包章节改成「按 caption/keywords 找含义」，并写明学习走 `qq_meme.py learn`。
+
 ## [0.5.4] - 2026-10-31
 
 > 这一版收的都是「打开总开关之后才暴露」的问题。0.5.3 的功能都通了，
