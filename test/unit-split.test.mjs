@@ -99,6 +99,27 @@ test('句号/顿号/换行也都能当切点', () => {
   assert.deepEqual(splitAtBoundary('第一行\n第二行', 4), ['第一行', '第二行'])
 })
 
+test('！？不作切点：感叹/疑问不能被拆散（2026-11-02 用户要求）', () => {
+  // 若把 ！？ 当切点，这里会切成「你怎么这样！」「我真是服了，走了」——
+  // 语气被拆成两条，用户明确不要。只能在逗号处断开。
+  const s = '你怎么这样！我真是服了，走了'
+  const parts = splitAtBoundary(s, 6)
+  assert.equal(parts[0], '你怎么这样！我真是服了，', '应该在逗号处断，而不是断在「！」后')
+  assert.ok(!parts[0].endsWith('！'), '不能断在感叹号后')
+  assert.deepEqual(parts[1], '走了')
+  // 只有 ！？ 没有其它切点的长句 → 整条不切
+  const q = '你怎么这样！我真是服了！再也不理你了！'
+  assert.deepEqual(splitAtBoundary(q, 6), [q], '只有感叹号的句子不该被拆')
+})
+
+test('无 [SPLIT] 时出站拆句也走切点规则（不再退回按 。！？ 拆的老逻辑）', () => {
+  const i = SRC.indexOf('function splitReplyForSend')
+  assert.ok(i > 0)
+  const body = SRC.slice(i, i + 1800)
+  assert.doesNotMatch(body, /splitLongSentence/, '没标 [SPLIT] 的老路径不该再按 。！？ 拆')
+  assert.match(body, /splitAtBoundary\(/, '两种路径都必须走 splitAtBoundary')
+})
+
 // ══════════════════════════════════════════════════════════════════════════
 // ② [SPLIT]：模型标的断点 → 提取 + 剥离
 // ══════════════════════════════════════════════════════════════════════════
