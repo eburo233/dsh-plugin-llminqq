@@ -39,13 +39,17 @@
 ## 3. 通道硬约束（违反会静默失败）
 
 1. **`[表情: 描述]` 在 QQ 无效。** 那是 Web 端的协议。要发表情包**必须发真实图片文件**。
-2. **发表情包用插件自带的图库**（如果装了这个插件，图库在工作区 `meme-pack/` 下）：
+2. **发表情包用工作区自带的图库** `meme-pack/`（随插件分发，**带含义索引**：每张图都有
+   caption 描述和 keywords，存在 `meme-pack/index.db` 里，别只看文件名瞎猜）：
    ```bash
-   # 看有哪些表情
-   ls meme-pack/memes/
-   # 直接把图发出去（路径必须在工作区或暂存区内）
-   # 在回复正文里写: [SEND_FILE: <工作区>/meme-pack/memes/happy/xxx.jpg]
+   # 按情绪/关键词找（会打印 caption，按「含义贴不贴题」挑）
+   python3 ~/.dsh/skills/qq-meme/scripts/qq_meme.py find --mood happy --limit 8
+   python3 ~/.dsh/skills/qq-meme/scripts/qq_meme.py find --query 无语 --limit 8
    ```
+   找到后把 `[SEND_FILE: <工作区>/meme-pack/memes/<tag>/<文件>]` 写进回复即可
+   （路径在工作区内，白名单放行）。
+   **用户让你「收藏/学这张图」时**，用 `qq_meme.py learn` 入库 —— 新图会写进同一个
+   `meme-pack/`（属于插件数据目录，升级插件不会丢；别去改第三方包的 node_modules 图库）。
 3. **`[SEND_FILE: 路径]` 只放行工作区与暂存区（`.qq-media/`）内的文件。** 外部路径会被静默拦掉。
 4. **`[SEND_FILE]` 会被桥从文本里抽掉**，对方看不到这行字。别把重要信息只写在指令里。
 5. **单条上限约 1500 字**，超出会被拆成几条连发。
