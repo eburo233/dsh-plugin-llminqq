@@ -102,3 +102,21 @@ test('取二维码默认走 bind mount 直读，不再每个请求都 docker cp'
   const cpIdx = body.indexOf("'docker', ['cp'")
   assert.ok(hostIdx > 0 && cpIdx > hostIdx, 'bind mount 快路径不在 docker cp 之前')
 })
+
+// ── 快速登录（-q）──────────────────────────────────────────────────────────
+// NapCat 的 entrypoint 只有在传 `-q <号>` 时才会用本地凭证登录；不传就一律弹二维码。
+// 实测事故（2026-11-02）：重启容器后一直卡在二维码，日志每 2 分钟一条
+// `Login Error ErrType: 1 ErrCode: 3` —— 机器人整段时间不可用。
+test('napcat.account 填了才写 ACCOUNT（快速登录），留空/非法值不出现', async () => {
+  const { defaults } = await import(pathToFileURL(path.join(ROOT, 'lib', 'store.js')).href)
+  const base = defaults()
+  const pack = (account) => ({ ...base, napcat: { ...base.napcat, account } })
+
+  assert.ok(!/ACCOUNT:/.test(M.renderCompose(base)), '没填 QQ 号时不该出现 ACCOUNT')
+  assert.ok(!/ACCOUNT:/.test(M.renderCompose(pack(''))), '空字符串不该出现 ACCOUNT')
+  assert.match(M.renderCompose(pack('1398198377')), /ACCOUNT: "1398198377"/)
+  // 这是直接拼进 YAML 的值：任何非纯数字都必须被丢掉，不能被写进模板
+  for (const bad of ['abc', '12"inject', '1234567890123456']) {
+    assert.ok(!/ACCOUNT:/.test(M.renderCompose(pack(bad))), `非法值 ${bad} 不该被写进 compose`)
+  }
+})
