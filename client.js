@@ -558,7 +558,7 @@ window.__ModuleLoader__.load({
         tab === 'login' && h(LoginTab, { data, cfg, env, busy, run, refresh, saveConfig }),
         tab === 'model' && h(ModelTab, { data, cfg, env, busy, run, saveConfig, setMsg }),
         tab === 'behavior' && h(BehaviorTab, { cfg, saveConfig, env, data }),
-        tab === 'memory' && h(MemoryTab, { run, setMsg }),
+        tab === 'memory' && h(MemoryTab, { run, setMsg, data }),
         tab === 'persona' && h(PersonaTab, { run, setMsg }),
         tab === 'run' && h(RunTab, { data, busy, run, refresh }),
         tab === 'advanced' && h(AdvancedTab, { data, cfg, saveConfig, run, setMsg }),
@@ -2108,6 +2108,116 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // ── 定时任务状态卡片（记忆后台任务的可观测性）───────────────────────────
+    //
+    // 为什么这块 UI 必须存在（docs/MEMORY-AUDIT-AND-V5.md §2 P1-5 / §4-8）：
+    //   ingest / reflect / digest / learn 全是**后台子进程**，用户完全看不到；
+    //   而它们坏掉的方式恰好都是「看起来一切正常」：
+    //     · learn 没有新语料（mode=none）被当成失败 → 用户以为学习一直挂；
+    //     · reflect 彻底失败（LLM 不可用）退出码却是 0 → 显示成功，实际 0 产出。
+    //   加上设置页原本 `grep -c scheduler client.js` = 0，用户唯一的发现途径
+    //   是去翻 scheduler.json。这里把状态摆到「记忆」页第一屏。
+    //
+    // 数据来源：/overview 里的 env.scheduler（4 秒轮询顺手带回来的那份）。
+    // **不新增路由、不额外发请求** —— 设置页每多一次 fetch 都会变成轮询成本
+    // （见 test/unit-panel-perf.test.mjs 那三条性能不变量）。
+    const TASK_INFO = {
+      ingest: { label: '抓取', desc: '把桥日志里的对话吃进记忆库' },
+      reflect: { label: '反思', desc: '情节记忆 → 语义记忆（调模型）' },
+      digest: { label: '摘要', desc: '生成给模型看的摘要文件' },
+      learn: { label: '学习', desc: '从语料池学说话方式（不现抓 B站）' },
+    }
+
+    /** 相对时间：设置页只看「新鲜不新鲜」，不需要精确到秒。 */
+    function agoText (ts) {
+      const t = Number(ts) || 0
+      if (!t) return '从未'
+      const s = Math.max(0, Math.round((Date.now() - t) / 1000))
+      if (s < 45) return '刚刚'
+      const m = Math.round(s / 60)
+      if (m < 60) return `${m} 分钟前`
+      const hh = Math.round(m / 60)
+      if (hh < 24) return `${hh} 小时前`
+      return `${Math.round(hh / 24)} 天前`
+    }
+
+    /** 每任务一行：任务名 + 三态徽标 + 上次运行/结果 + 连续失败次数。 */
+    function SchedulerCard ({ scheduler }) {
+      if (!scheduler) return null
+      const tasks = Array.isArray(scheduler.tasks) ? scheduler.tasks : []
+      const dead = Array.isArray(scheduler.deadLetters) ? scheduler.deadLetters : []
+      // 没启用（总开关关着 / features.scheduler=false）：也得说一句，
+      // 否则用户会以为「记忆页没数据」是坏了，其实后台任务根本没跑。
+      if (scheduler.enabled !== true && tasks.length === 0) {
+        return h('div', { className: 'card' },
+          h('div', { className: 'card-title' }, '定时任务', h(Badge, null, '未启用')),
+          h('div', { className: 'hint' },
+            '总开关关着（或 features.scheduler=false）时，后台任务不会跑 —— '
+            + '记忆只靠桥每轮增量写入，不会反思 / 摘要 / 学习。'),
+        )
+      }
+      const pyBad = scheduler.python && scheduler.python.ok === false
+      return h('div', { className: 'card' },
+        h('div', { className: 'card-title' }, '定时任务',
+          dead.length
+            ? h(Badge, { kind: 'bad' }, `${dead.length} 个死信`)
+            : h(Badge, { kind: 'ok' }, '运行中'),
+          pyBad ? h(Badge, { kind: 'warn' }, 'python 不可用') : null,
+          h('span', { className: 'hint', style: { marginLeft: 'auto', fontWeight: 400 } },
+            '后台维护记忆，不占对话')),
+        pyBad
+          ? h(Notice, { kind: 'err', title: 'python 不可用' },
+              scheduler.python.reason || '所有记忆任务都会被跳过')
+          : null,
+        dead.length
+          ? h(Notice, { kind: 'err', title: `连续失败 ${scheduler.deadLetterAfter || 5} 次，已记为死信` },
+              ...dead.map(d => h('div', { key: d.name },
+                `${TASK_INFO[d.name]?.label || d.name}：${d.reason || '原因未知'}`
+                + `（连续 ${d.consecutiveFailures} 次，${agoText(d.at)}起）`)),
+              h('div', { className: 'muted', style: { marginTop: 4 } },
+                '任务不会停跑，下一轮成功会自动清掉死信。'))
+          : null,
+        h('div', { className: 'rows' },
+          tasks.map(t => {
+            const info = TASK_INFO[t.name] || { label: t.name, desc: t.tool }
+            const ok = t.ok === true
+            const bad = t.deadLetter === true || t.ok === false
+            // degraded = 成功但质量下降（比如 LLM 不可用走了拼接法）→ 黄色，
+            // 别让它混进绿色里（「绿着坏」正是这次要修的毛病）
+            const kind = bad ? 'bad' : t.kind === 'degraded' ? 'warn' : ok ? 'ok' : null
+            const statusText = t.deadLetter ? '死信'
+              : t.running ? '运行中'
+              : ok && t.kind === 'noop' ? '无事可做'
+              : ok && t.kind === 'degraded' ? '降级'
+              : ok ? '成功'
+              : t.ok === false ? '失败'
+              : '还没跑过'
+            const interval = Number(t.intervalMin) || 0
+            const intervalText = interval >= 60 ? `每 ${Math.round(interval / 60)} 小时` : `每 ${interval} 分钟`
+            return h('div', { key: t.name, className: 'switchrow' },
+              h('div', { className: 'lbl' },
+                h('div', null, info.label,
+                  h('span', { className: 'muted', style: { marginLeft: 6 } }, intervalText),
+                  t.consecutiveFailures > 0
+                    ? h('span', { style: { marginLeft: 6, color: 'var(--qq-bad)' } },
+                        `连续失败 ${t.consecutiveFailures}`)
+                    : null),
+                h('div', { className: 'dsc' },
+                  info.desc,
+                  ` · 上次 ${agoText(t.lastRunAt)}`,
+                  t.mode ? ` · mode=${t.mode}` : '',
+                  // 失败时给「为什么」，成功时给「做了什么」（summary 来自
+                  // lib/scheduler.mjs 的 classifyMemoryRun，和 scheduler.json 同一份文案）
+                  bad && t.reason ? ` · ${t.reason}` : (t.summary ? ` · ${t.summary}` : '')),
+              ),
+              h(Badge, { kind }, statusText),
+            )
+          }),
+        ),
+        tasks.length ? null : h('div', { className: 'hint' }, '没有启用的任务'),
+      )
+    }
+
     // ── 记忆页（第四期：看条数 / 按人分布 / 清除某人 / 备份恢复）─────────────
     //
     // 为什么这个页要有「清除」和「导出」两个危险按钮的独立确认流程：
@@ -2116,7 +2226,7 @@ window.__ModuleLoader__.load({
     //     ① 清某人 → 先调 dryRun 查影响面，弹出「会删 N 条」再确认
     //     ② 清全部 → 必须**手打确认词** DELETE-ALL（不是勾选框，勾选框会手滑）
     //   后端也独立校验（不靠前端拦，见 lib/agent/memory-admin.mjs 文件头 ②）。
-    function MemoryTab ({ run, setMsg }) {
+    function MemoryTab ({ run, setMsg, data }) {
       const [stats, setStats] = useState(null)
       const [recent, setRecent] = useState(null)
       const [loading, setLoading] = useState(true)
@@ -2235,6 +2345,10 @@ window.__ModuleLoader__.load({
             ],
           }) : null,
         ),
+
+        // 定时任务状态：紧跟「记忆库」概览，因为「库里数据不动」的第一嫌疑
+        // 就是这些后台任务没在跑 / 一直在失败。
+        h(SchedulerCard, { scheduler: data?.env?.scheduler }),
 
         // ── 按层 / 按人 ──────────────────────────────────────────────────────
         stats.ok && !stats.empty ? h('div', { className: 'card' },
