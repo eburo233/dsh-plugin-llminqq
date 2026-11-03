@@ -20,6 +20,9 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+// timeSceneHint 现在依赖 common.js 的共享 helper（时段划分/星期名只在那边有一份，
+// 主动搭话的【当前时间】行也用同一份）。eval 出来的函数按作用域链能找到这里 import 的绑定。
+import { timePhaseName, WEEKDAY_NAMES } from '../lib/bridge/common.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
