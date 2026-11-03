@@ -8,6 +8,30 @@
 
 ## [未发布]
 
+### Added（记忆 v5 · Step 2：提炼 + 检索 + 读路径切换）
+
+- **提炼 worker**（`lib/agent/memory-v5/distill.mjs` + `distill-prompt.mjs`）：
+  events → memories + profiles，jobs 驱动。中文结构化 prompt（六类 type、必须复用 topic、
+  valid_until 用本地墙钟换算），输出强校验 JSON（结构不对就抛错交给 jobs，不静默降级）；
+  失败分 `unavailable`（没配模型 → 跳过不算失败但 30min 后重试、留痕）与 `runtime`
+  （超时/坏输出 → 退避 60s→120s、3 次进死信），**失败可见**；同 key 新版本走
+  superseded 链；水位线只在写库成功后推进（崩溃重跑安全）。
+- **检索 + 注入渲染**（`lib/agent/memory-v5/search.mjs`）：绝对量打分
+  `score = TYPE_WEIGHT[type]·(0.55·rel(全库归一) + 0.22·salience + 0.18·recency + 0.10·pinned) − 0.25·MMR`；
+  按字数预算装填（默认 800，三块 350/120/60）；跳过当前上下文（events 水位线 / 桥传
+  contextSince）；`dm_only` 只在私聊注入；单字/短查询回退 LIKE；防复读块与人物画像块。
+  实测 886 条库 **p50 2.7ms / p99 4.3ms**（目标 P99<5ms）。
+- **桥读路径可切换**（`lib/bridge/index.js`）：`LLMINQQ_MEMORY_ENGINE=v4|v5`
+  （环境变量优先，默认仍 **v4**）+ `config.memory.v5.engine`；v5 任何失败自动回退 v4、
+  本轮回复不受影响；注入成功后只对真正渲染进块的条目 `touchMemory`。
+- **distill 定时任务**：仅 engine=v5 时挂到桥定时器（默认 10 分钟，防重入，进 shutdown
+  清理），失败交给 jobs 退避/死信。
+
+### Fixed
+
+- `test/unit-split.test.mjs`「静默恢复」用例的浮点 flaky：容差 1e-9 → 1e-3
+  （`Date.now()` 跨 1ms 就会超差，约 1/8 概率偶发失败）。
+
 ### Added（记忆 v5 · Step 1：双写）
 
 - **v5 数据层**（`lib/agent/memory-v5/store.mjs`，node:sqlite）：events / memories /
