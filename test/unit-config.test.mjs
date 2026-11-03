@@ -253,8 +253,13 @@ test('源码级：bridgeConfig 的 memory 段透传了 v5.enabled（不是只有
   const memAt = src.indexOf('memory: (() => {', start)
   assert.ok(memAt > start, 'bridgeConfig 里找不到 memory 段')
   const seg = src.slice(memAt, memAt + 3000)
-  assert.match(seg, /v5:\s*\{/, 'memory 段没透传 v5 —— 桥只能吃默认值，设置页关不掉')
-  assert.match(seg, /cfg\.memory\?\.v5\?\.enabled !== false/, 'v5.enabled 的默认语义必须是「只有显式 false 才关」')
+  // task-18 起 v5 段抽成了 memoryV5Config()（多出 engine/distill，单测直接验纯函数），
+  // 所以这里断言「bridgeConfig 确实 spread 了它」+「helper 里保留默认语义」。
+  assert.match(seg, /\.\.\.memoryV5Config\(cfg\.memory\)/, 'memory 段没透传 v5 —— 桥只能吃默认值，设置页关不掉')
+  const helperAt = src.indexOf('function memoryV5Config')
+  assert.ok(helperAt > 0, 'memoryV5Config helper 不见了')
+  const helperSeg = src.slice(helperAt, helperAt + 2000)
+  assert.match(helperSeg, /enabled: v5\.enabled !== false/, 'v5.enabled 的默认语义必须是「只有显式 false 才关」')
 })
 
 test('store 默认值：memory.v5.enabled 默认 true', async () => {
