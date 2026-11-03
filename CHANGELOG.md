@@ -26,6 +26,8 @@
   精确匹配不上。新增「同 type+同 subject 相似度」回退（`max(Jaccard, containment)`，阈值 0.5），
   并加 topic 冲突闸防并列事实误合并、只归档一条、可捞回。迁移副本端到端验证：
   迁移来的「安全底裤」旧结论被新提炼结论取代（`supersededFromMigratedKey=1`、`brokenChain=0`）。
+- **设置页「记忆引擎」选择卡**：v4（默认）/ v5 二选一，带前置条件提示（先迁移 + 盲评）；
+  保存走 `memory.v5.engine` 透传；提示 `LLMINQQ_MEMORY_ENGINE=v4` 线上秒回退。
 - **v4/v5 注入 A/B 盲评工具**（`scripts/memory-ab.mjs`）：只读、生产路径默认拒绝、跑完 sha256 自证；
   v4 侧走线上真实 `memoryRecallBlock` 口径（注释锚点 + vm 沙箱），v5 侧 `rankMemories`；
   输出打乱顺序的两栏盲评 markdown（不泄引擎名）+ `--json` 明细 + `--reveal` 揭盲。

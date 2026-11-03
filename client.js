@@ -558,7 +558,7 @@ window.__ModuleLoader__.load({
         tab === 'login' && h(LoginTab, { data, cfg, env, busy, run, refresh, saveConfig }),
         tab === 'model' && h(ModelTab, { data, cfg, env, busy, run, saveConfig, setMsg }),
         tab === 'behavior' && h(BehaviorTab, { cfg, saveConfig, env, data }),
-        tab === 'memory' && h(MemoryTab, { run, setMsg, data }),
+        tab === 'memory' && h(MemoryTab, { run, setMsg, data, cfg, saveConfig }),
         tab === 'persona' && h(PersonaTab, { run, setMsg }),
         tab === 'run' && h(RunTab, { data, busy, run, refresh }),
         tab === 'advanced' && h(AdvancedTab, { data, cfg, saveConfig, run, setMsg }),
@@ -2218,6 +2218,38 @@ window.__ModuleLoader__.load({
       )
     }
 
+    // ── 记忆引擎选择（v4 ↔ v5）───────────────────────────────────────────────
+    //
+    // 为什么单独一张卡：切引擎是「记忆系统换心脏」，但**默认必须是 v4** ——
+    // 切 v5 前要先跑历史迁移（scripts/memory-v4-to-v5.mjs），否则 v5 空库 =
+    // 不注入任何记忆（不是 bug，是新引擎还没数据）。所以这里不做成开关，
+    // 而是明确的二选一下拉 + 前置条件提示，避免手滑点到。
+    // 线上止血优先级更高的是环境变量 LLMINQQ_MEMORY_ENGINE=v4（不用改配置/重启页面）。
+    function EngineCard ({ cfg, saveConfig }) {
+      const cur = String(cfg?.memory?.v5?.engine || 'v4').toLowerCase() === 'v5' ? 'v5' : 'v4'
+      const [saving, setSaving] = useState(false)
+      const onChange = async (e) => {
+        const next = e.target.value === 'v5' ? 'v5' : 'v4'
+        if (next === cur) return
+        setSaving(true)
+        try { await saveConfig({ memory: { v5: { engine: next } } }) } finally { setSaving(false) }
+      }
+      return h('div', { className: 'card' },
+        h('div', { className: 'card-title' }, '记忆引擎'),
+        h(Field, {
+          label: '读路径',
+          sub: cur === 'v5'
+            ? 'v5：常驻检索（绝对量打分/预算装填/画像/防复读）。失败会自动回退 v4，本轮回复不受影响。'
+            : 'v4：见闻录摘要 + 跨通道检索（当前默认）。切到 v5 前请先跑历史迁移。',
+        }, h('select', { value: cur, onChange, disabled: saving },
+          h('option', { value: 'v4' }, 'v4（默认，稳）'),
+          h('option', { value: 'v5' }, 'v5（新检索，需先迁移）'))),
+        h('div', { className: 'hint' },
+          '切 v5 前置：① 跑过 scripts/memory-v4-to-v5.mjs 迁移历史；② 用 scripts/memory-ab.mjs 盲评过噪音/字数。',
+          ' 环境变量 LLMINQQ_MEMORY_ENGINE=v4 优先级更高（线上秒回退）。改完需重启桥生效。'),
+      )
+    }
+
     // ── 记忆页（第四期：看条数 / 按人分布 / 清除某人 / 备份恢复）─────────────
     //
     // 为什么这个页要有「清除」和「导出」两个危险按钮的独立确认流程：
@@ -2226,7 +2258,7 @@ window.__ModuleLoader__.load({
     //     ① 清某人 → 先调 dryRun 查影响面，弹出「会删 N 条」再确认
     //     ② 清全部 → 必须**手打确认词** DELETE-ALL（不是勾选框，勾选框会手滑）
     //   后端也独立校验（不靠前端拦，见 lib/agent/memory-admin.mjs 文件头 ②）。
-    function MemoryTab ({ run, setMsg, data }) {
+    function MemoryTab ({ run, setMsg, data, cfg, saveConfig }) {
       const [stats, setStats] = useState(null)
       const [recent, setRecent] = useState(null)
       const [loading, setLoading] = useState(true)
@@ -2349,6 +2381,9 @@ window.__ModuleLoader__.load({
         // 定时任务状态：紧跟「记忆库」概览，因为「库里数据不动」的第一嫌疑
         // 就是这些后台任务没在跑 / 一直在失败。
         h(SchedulerCard, { scheduler: data?.env?.scheduler }),
+
+        // 记忆引擎选择：紧跟在定时任务之后（两者都属于「记忆系统的运行方式」）
+        h(EngineCard, { cfg, saveConfig }),
 
         // ── 按层 / 按人 ──────────────────────────────────────────────────────
         stats.ok && !stats.empty ? h('div', { className: 'card' },

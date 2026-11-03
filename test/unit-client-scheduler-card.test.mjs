@@ -34,7 +34,8 @@ test('client.js 里真的有 scheduler 状态渲染（审计时这个数字是 0
   assert.ok(memTabAt > 0)
   assert.match(CLIENT_SRC, /h\(SchedulerCard, \{ scheduler: data\?\.env\?\.scheduler \}\)/,
     '卡片没接到 /overview 的 env.scheduler（数据来源要一次轮询带回，别自己再发请求）')
-  assert.match(CLIENT_SRC, /tab === 'memory' && h\(MemoryTab, \{ run, setMsg, data \}\)/,
+  // props 可能随功能增加（如 cfg/saveConfig），这里只要求把 data 传进去
+  assert.match(CLIENT_SRC, /tab === 'memory' && h\(MemoryTab, \{[^}]*\bdata\b[^}]*\}\)/,
     'MemoryTab 没拿到 data —— 卡片会永远是空')
 })
 
