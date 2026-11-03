@@ -294,8 +294,11 @@ test('连聊约 150 条从 0.9 掉到 0.15（floor），见底不穿', () => {
 test('静默恢复：按小时线性回升，封顶 ceil', () => {
   const s = mkState()
   s.state.energy = { value: 0.3, at: Date.now() - 3600000 }
-  assert.ok(Math.abs(s.energyState().value - 0.75) < 1e-9,
-    `1 小时应恢复 0.45，实际 ${s.energyState().value}`)
+  const v1 = s.energyState().value
+  // 容差 1e-3，不是 1e-9：从构造 at 到 energyState() 之间只要跨几毫秒，
+  // 就会多恢复「毫秒数 × 0.45/3600000」；断言精确到 1e-9 会约 1/8 概率偶发失败
+  // （实测：全量跑 10 次命中 1 次）。这里锁的是「线性回升」语义，不是浮点精度。
+  assert.ok(Math.abs(v1 - 0.75) < 1e-3, `1 小时应恢复 0.45，实际 ${v1}`)
   s.state.energy = { value: 0.9, at: Date.now() - 10 * 3600000 }
   assert.equal(s.energyState().value, 1.0, '恢复不能超过 ceil')
 })
