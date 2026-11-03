@@ -37,10 +37,46 @@ sys.path.insert(0, BASE)
 
 import memctl  # noqa: E402  （复用 tokenize / BM25Index / 日志正则，不重复实现）
 
-STYLE_DB = os.path.join(BASE, "style.db")
-STYLE_JSONL = os.path.join(BASE, "style-cases.jsonl")
-CURSOR_JSONL = os.path.join(BASE, ".style_cursor")
-CURSOR_LOG = os.path.join(BASE, ".style_cursor_log")
+# ── 数据落在哪：跟 node 侧 memoryStateDir() 用**同一个环境变量**（P1-4）──────
+# 为什么不能只用 BASE（本文件所在目录）：
+#   脚本版里代码和数据同在 memory/，BASE 没问题。插件版代码在 npm 包里（只读），
+#   数据在 stateDir —— run.py 会改写下面这些常量。但**桥拿旧 env 直接起
+#   stylebank.py** 时不会经过 run.py，于是同一份代码按不同 stateDir 写了两份
+#   style.db（实测 <dataDir>/state/style.db 106 条 vs <dataDir>/agent/memory/
+#   style.db 16 条，游标却只有一个 —— 谁先跑谁推进，另一份永远停在旧位置）。
+# 契约：node 侧 memoryEnv() 显式传 `LLMINQQ_STATE_DIR = memoryStateDir(cfg)`，
+#   桥/调度器/设置页/导出都用同一个值；python 侧就只认这一个变量（**不另造
+#   变量名** —— 每多一个名字就多一次 split-brain 的机会）。没有它 = 脚本版
+#   （代码和数据同目录），回退 BASE。
+# 注意 <dataDir>/state/style.db 的**自动迁移**还没做（TODO）：python 侧推导不出
+# <dataDir>（BASE 是包目录，不是数据目录），需要 node 侧把旧路径显式传给
+# `stylebank.py import --from <旧库>`（见 main 的 import 子命令）再删旧文件。
+STATE_DIR_ENV = "LLMINQQ_STATE_DIR"
+
+
+def memory_state_dir():
+    """记忆数据目录（node 侧 memoryStateDir(cfg) 的口径，经环境变量传进来）。"""
+    d = os.environ.get(STATE_DIR_ENV) or ""
+    return os.path.abspath(os.path.expanduser(d)) if d else BASE
+
+
+def resolved_paths():
+    """当前进程解析出的四个落盘路径（测试/诊断直接 import 断言，别各写一套）。"""
+    d = memory_state_dir()
+    return {
+        "stateDir": d,
+        "styleDb": os.path.join(d, "style.db"),
+        "styleJsonl": os.path.join(d, "style-cases.jsonl"),
+        "cursorJsonl": os.path.join(d, ".style_cursor"),
+        "cursorLog": os.path.join(d, ".style_cursor_log"),
+    }
+
+
+_DEFAULT_PATHS = resolved_paths()
+STYLE_DB = _DEFAULT_PATHS["styleDb"]
+STYLE_JSONL = _DEFAULT_PATHS["styleJsonl"]
+CURSOR_JSONL = _DEFAULT_PATHS["cursorJsonl"]
+CURSOR_LOG = _DEFAULT_PATHS["cursorLog"]
 
 # ── 过滤与注入的硬参数（测试会直接 import 来断言，别在函数里写死数字）──────────
 MIN_REPLY_CHARS = 4   # <4 字的回复没有风格信息（「嗯」「好」「行」）
@@ -350,6 +386,37 @@ def ingest_bridge_log(conn, path=None, cursor=None):
     return added
 
 
+def import_db(conn, src_path):
+    """把另一个 style.db 的样本并进当前库（P1-4 split-brain 迁移；按 fp 幂等）。
+
+    为什么要有它：历史上有两份库（<dataDir>/state/style.db 106 条是桥真正写的，
+    <dataDir>/agent/memory/style.db 16 条是设置页/导出看的）。统一 stateDir 之后
+    必须能把旧那份导过来，否则「导出/迁移」拿到的还是旧的 16 条。
+    ⚠️ 自动迁移没做（TODO）：python 侧推导不出 <dataDir>，需要 node 侧显式传
+    旧库路径过来，再自己决定是否删旧文件 —— 迁移是破坏性的，不该在 import 时
+    悄悄猜路径。
+    """
+    if not os.path.exists(src_path):
+        raise SystemExit(f"旧风格库不存在: {src_path}")
+    # 只读打开（旧库可能还被桥进程活着写；ro 下 SQLite 也能读到已提交数据）
+    src = sqlite3.connect(f"file:{src_path}?mode=ro", uri=True)
+    src.row_factory = sqlite3.Row
+    added = dup = 0
+    try:
+        for r in src.execute(
+                "SELECT peer, my_reply, context, ts FROM style_samples ORDER BY id"):
+            # 走 add_sample：清洗 + 三道闸 + (fp) UNIQUE 去重 → 重复跑幂等
+            rid, _why = add_sample(conn, r["peer"], r["my_reply"],
+                                   r["context"], r["ts"])
+            if rid:
+                added += 1
+            else:
+                dup += 1
+    finally:
+        src.close()
+    return added, dup
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 def main(argv=None):
     ap = argparse.ArgumentParser(description="自我风格样本库")
@@ -387,6 +454,10 @@ def main(argv=None):
     p.add_argument("--cursor-dir", default=None)
 
     p = sub.add_parser("stats", help="统计")
+
+    p = sub.add_parser("import", help="把旧库的样本导进当前库（split-brain 迁移，按 fp 幂等）")
+    p.add_argument("--from", dest="src", required=True,
+                   help="旧 style.db 路径（如 <dataDir>/state/style.db）")
 
     a = ap.parse_args(argv)
     global CURSOR_JSONL, CURSOR_LOG
@@ -427,6 +498,10 @@ def main(argv=None):
             print(f"  {r['peer']:24} {r['n']:4} 条")
         total = conn.execute("SELECT COUNT(*) FROM style_samples").fetchone()[0]
         print(f"共 {total} 条")
+    elif a.cmd == "import":
+        added, dup = import_db(conn, a.src)
+        print(f"从 {a.src} 导入 {added} 条（重复跳过 {dup} 条）"
+              f" → 当前库 {a.db or STYLE_DB}")
     return 0
 
 

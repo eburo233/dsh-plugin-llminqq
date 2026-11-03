@@ -42,9 +42,19 @@ sys.path.insert(0, HERE)
 
 
 def _state_dir():
+    """记忆数据目录 —— **就是 node 侧 memoryStateDir(cfg) 的值**（经环境变量传进来）。
+
+    为什么要统一（P1-4 的 split-brain 修法）：
+      node 侧 memoryEnv() 现在把桥、调度器、设置页、导出全部指向同一个
+      memoryStateDir(cfg)，通过 LLMINQQ_STATE_DIR 传给 python。这里如果还按
+      别的口径算（或者允许第二个变量名），就会出现「桥写的库」和「调度器读的库」
+      不是同一份 —— python 侧只认这一个变量，不再另造名字。
+    缺变量 → 报错退出（绝不默默落到包目录里写数据：npm 包只读，升级会冲掉记忆）。
+    """
     d = os.environ.get("LLMINQQ_STATE_DIR") or ""
     if not d:
-        sys.stderr.write("run.py: 缺少 LLMINQQ_STATE_DIR（插件应设置它指向 stateDir）\n")
+        sys.stderr.write(
+            "run.py: 缺少 LLMINQQ_STATE_DIR（插件应设置它指向 memoryStateDir(cfg)）\n")
         sys.exit(1)
     return os.path.abspath(os.path.expanduser(d))
 

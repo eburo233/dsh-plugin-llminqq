@@ -1394,7 +1394,16 @@ def main(argv=None):
                 print(f"   质量闸挡下：{res['dropped']}")
             if res.get("error"):
                 print(f"   ⚠ {res['error']}")
-        return 0 if res["mode"] == "llm" else 1
+        # ⚠️ 退出码语义（P1-5，实测的「绿着坏」）：旧代码是
+        #     `return 0 if res["mode"] == "llm" else 1`
+        #   —— 把正常状态反过来判了：mode='none'（语料池没新内容 / 这轮什么都没
+        #   学到）是完全正常的空转，却被记成 ok:false「退出码 1」；反过来真正该
+        #   报警的失败路径（batches 全挂但没抛到这一行）也可能拿 0。
+        # 调度器只看退出码，所以这里只把 **error** 当失败：
+        #   llm / llm-partial → 学到了（部分失败也已落盘）      → 0
+        #   none             → 正常空转，不是失败              → 0
+        #   error            → 彻底失败（没写库，下轮必须重试）  → 1
+        return 0 if res["mode"] != "error" else 1
 
     if a.cmd == "render":
         block, info = render_block(n=a.n, max_chars=a.max_chars, path=a.path)
