@@ -1700,6 +1700,58 @@ window.__ModuleLoader__.load({
           h('div', { className: 'hint' }, '保存后桥会自动重启一下才生效；没自动重启就去「运行」页点「重启桥」。'),
         ),
 
+        // ── 语音转文字（ASR）──────────────────────────────────────────────
+        // 为什么单独一张卡：QQ 语音消息以前只有 [语音] 5s 占位，模型根本不知道
+        // 对方说了什么（只能回「你说了啥」）。桥侧 task-10 加了 faster-whisper
+        // 转写，这里让用户显式打开 —— 默认关（要装依赖 + 首次下模型，不能在
+        // 用户不知情时干这事）。
+        // 链路：这张卡 → config.media.voiceTranscribe.* → lib/index.js bridgeConfig()
+        // → bridge-config.json → lib/bridge/messaging.js transcribeInboundVoices()。
+        h('div', { className: 'card' },
+          h('div', { className: 'card-title' }, '语音转文字',
+            h('span', { className: 'muted', style: { marginLeft: 'auto', fontWeight: 400 } },
+              '对方发来的语音')),
+          h(SwitchRow, {
+            label: '把收到的语音转成文字',
+            desc: '默认关闭。开启后桥会调本机 faster-whisper 转写，失败/超时就当没转（不会拖住回复）',
+            on: media.voiceTranscribe?.enabled === true,
+            onChange: v => saveConfig({ media: { voiceTranscribe: { enabled: v } } }),
+          }),
+          media.voiceTranscribe?.enabled === true ? h(React.Fragment, null,
+            h('div', { className: 'grid2' },
+              h(Field, { label: '模型', sub: '越大越准也越慢；首次使用要下载（只能下一次）' },
+                h('select', {
+                  // 默认 small：中文准确率和体积的平衡点（用户 2026-11-03 拍的板）
+                  value: media.voiceTranscribe?.model || 'small',
+                  onChange: e => saveConfig({ media: { voiceTranscribe: { model: e.target.value } } }),
+                  style: { width: '100%', padding: '6px 8px', borderRadius: 6 },
+                },
+                  h('option', { value: 'tiny' }, 'tiny（最快 · 约 75MB）'),
+                  h('option', { value: 'base' }, 'base（约 145MB）'),
+                  h('option', { value: 'small' }, 'small（推荐 · 约 480MB）'),
+                  h('option', { value: 'medium' }, 'medium（最准 · 约 1.5GB）'),
+                )),
+              h(Field, { label: '语言', sub: '默认 zh；auto = 让模型自己判断' },
+                h(TextInput, {
+                  value: media.voiceTranscribe?.lang || 'zh',
+                  placeholder: 'zh',
+                  onCommit: v => saveConfig({ media: { voiceTranscribe: { lang: String(v || 'zh').trim() } } }),
+                })),
+            ),
+            h(Field, { label: '转写超时（秒）',
+              sub: '整条消息的语音转写合计超过这个时间就放弃，当没转成功' },
+              h(NumberInput, {
+                value: Math.round((media.voiceTranscribe?.timeoutMs ?? 30000) / 1000),
+                min: 5, max: 120,
+                onCommit: v => saveConfig({ media: { voiceTranscribe: { timeoutMs: clampInt(v, 5, 120) * 1000 } } }),
+              })),
+            // 首次成本必须写在用户看得见的地方，否则「开了没反应」会被当成 bug。
+            h('div', { className: 'hint' },
+              '首次使用要先装依赖（pip install faster-whisper），并会从 HuggingFace 镜像下载模型（small ≈ 480MB，只下次）。CPU 上一条 10 秒语音约几秒。'),
+          ) : null,
+          h('div', { className: 'hint' }, '保存后桥会自动重启一下才生效；没自动重启就去「运行」页点「重启桥」。'),
+        ),
+
         // ── 语音（TTS）────────────────────────────────────────────────────
         // 为什么要单独一张卡：features.voice 只是「要不要用语音」，
         // 真正出声还得知道「用哪个引擎、连哪个地址、用哪段参考音频」。
