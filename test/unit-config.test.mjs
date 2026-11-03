@@ -242,3 +242,23 @@ test('源码级：bridgeConfig 的 media 段确实 spread 了 inboundFileMedia(c
   assert.match(block, /\.\.\.inboundFileMedia\(cfg\.media\)/,
     'bridgeConfig 的 media 段没有透传入站文件 4 项 —— 桥会收到 undefined，设置页又变成假配置')
 })
+
+// ── 记忆 v5 双写开关的透传（Step 1）────────────────────────────────────────
+// 桥侧 Step 1 只写 mem-v5.db（读路径仍是 v4），但开关必须能从插件配置到桥：
+// 之前的 inboundFile 4 个键就是这样「桥有默认值、插件不透传 → 设置页假配置」。
+test('源码级：bridgeConfig 的 memory 段透传了 v5.enabled（不是只有桥侧默认值）', async () => {
+  const src = fs.readFileSync(path.join(ROOT, 'lib', 'index.js'), 'utf8')
+  const start = src.indexOf('function bridgeConfig (cfg) {')
+  assert.ok(start > 0, '定位不到 bridgeConfig')
+  const memAt = src.indexOf('memory: (() => {', start)
+  assert.ok(memAt > start, 'bridgeConfig 里找不到 memory 段')
+  const seg = src.slice(memAt, memAt + 3000)
+  assert.match(seg, /v5:\s*\{/, 'memory 段没透传 v5 —— 桥只能吃默认值，设置页关不掉')
+  assert.match(seg, /cfg\.memory\?\.v5\?\.enabled !== false/, 'v5.enabled 的默认语义必须是「只有显式 false 才关」')
+})
+
+test('store 默认值：memory.v5.enabled 默认 true', async () => {
+  const { defaults } = await import(pathToFileURL(path.join(ROOT, 'lib', 'store.js')).href)
+  const d = defaults()
+  assert.equal(d.memory?.v5?.enabled, true, '记忆 v5 双写默认应开启（只写不读，零风险）')
+})

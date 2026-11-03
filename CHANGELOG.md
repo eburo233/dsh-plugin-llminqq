@@ -8,6 +8,22 @@
 
 ## [未发布]
 
+### Added（记忆 v5 · Step 1：双写）
+
+- **v5 数据层**（`lib/agent/memory-v5/store.mjs`，node:sqlite）：events / memories /
+  mem_fts / profiles / utterances / jobs 六张表（WAL + `busy_timeout=3000`）。
+  `appendEvent` 靠 `UNIQUE(conv,msg_id)` 幂等（重放不重复、不抛错）；jobs 带退避与死信
+  （claim 即计一次、3 次进 dead）；中文 2-gram FTS5（「开会」能命中「明天下午三点开会」，
+  单字查不到时回退 LIKE）。
+- **桥侧双写 events**（`lib/bridge/index.js`）：入站（含合并轮）与出站（文本/图片/语音）
+  各写一条进 `<记忆数据目录>/mem-v5.db`；`config.memory.v5.enabled` 透传 + 环境变量
+  `LLMINQQ_MEMORY_V5=0` 急停；**读路径完全不动**（注入仍走 v4），写库失败只告警一次并
+  永久降级，绝不影响收发消息。
+- **只读计量脚本** `scripts/memory-v5-count.mjs`：对比 v5.events 条数与 bridge.out 可解析
+  行数（默认拒绝生产路径，库/日志 cp 到 /tmp 即可跑）。
+
+## [未发布]
+
 ### Fixed（记忆 v5 · Step 0 止血）
 
 - **反思（reflect）在 fallback 下会随机烧掉未覆盖的记忆**：`mark_ids` 只在真正成功的
