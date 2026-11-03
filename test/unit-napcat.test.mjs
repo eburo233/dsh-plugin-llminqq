@@ -120,3 +120,26 @@ test('napcat.account 填了才写 ACCOUNT（快速登录），留空/非法值�
     assert.ok(!/ACCOUNT:/.test(M.renderCompose(pack(bad))), `非法值 ${bad} 不该被写进 compose`)
   }
 })
+
+// ── NapCat 日志持久化 ──────────────────────────────────────────────────────
+// 实测（2026-11-03）：docker 的 stdout 日志容器重建就清零；NapCat 自己的 fileLog
+// 写在容器内 /app/napcat/logs，从来没挂出来 —— 于是「重启一次日志全没」。
+// 这里锁住：日志目录挂到宿主机 + docker 自身日志加轮转（不然会无限涨）。
+test('compose：NapCat 日志目录挂到宿主机，且 docker 日志有轮转上限', () => {
+  const yaml = M.renderCompose(defaultsLike())
+  assert.match(yaml, /napcat[\\/]data[\\/]logs:\/app\/napcat\/logs/, 'data/logs 没挂到 /app/napcat/logs')
+  assert.match(yaml, /logging:/, '没配 logging')
+  assert.match(yaml, /driver:\s*json-file/)
+  assert.match(yaml, /max-size:\s*"20m"/)
+  assert.match(yaml, /max-file:\s*"3"/)
+})
+
+function defaultsLike () {
+  return {
+    napcat: {
+      containerName: 'llminqq-napcat', image: 'mlikiowa/napcat-docker:v4.15.19',
+      webuiPort: 6099, onebotPort: 3001, uid: 1000, gid: 1000,
+      timezone: 'Asia/Shanghai', memLimit: '2g', webuiToken: 't', account: '',
+    },
+  }
+}
