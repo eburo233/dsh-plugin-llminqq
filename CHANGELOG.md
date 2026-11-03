@@ -6,6 +6,36 @@
 > 说明：本仓库的公开历史从 `0.5.0` 开始。更早的迭代是作者自用阶段的脚本形态，
 > 没有以版本号发布过，因此下面没有 `0.4.x` 之类的条目，也不会编造。
 
+## [未发布]
+
+### Fixed（记忆 v5 · Step 0 止血）
+
+- **反思（reflect）在 fallback 下会随机烧掉未覆盖的记忆**：`mark_ids` 只在真正成功的
+  LLM 批次里打标；`_fallback_summaries` 的分桶改 `sorted(tokenize())`，消除
+  `PYTHONHASHSEED` 导致的「一半概率白跑、一半概率烧 80 条」。
+- **ingest 游标先写后提交**：游标移到 DB commit 之后 —— 崩溃时宁可重放，不可漏。
+- **`prune` 数学上永远归档 0 条**：改为独立三元组（低 importance + 少 hit + 超两个
+  半衰期），pinned 永不归档；生产库副本实测从 0 变成可归档 258 条。
+- **digest 被整体截断丢掉两层**：改为每层各 1/3 预算 + 逐层轮转，三层在 420 字窗口内
+  都可见。
+- **日志轮转后从行中间读**：轮转时归零 `.ingest_cursor` 并写 inode/size 指纹；
+  起桥前自愈（游标 > 日志大小或 inode 变了 → 归零），正常追加不动游标。
+- **style.db split-brain**：桥的 `LLMINQQ_STATE_DIR` 统一到 `memoryStateDir()`，
+  运行态目录（state.json）与记忆目录分开；桥 state.json 首次启动单向迁移（源保留）。
+- **`memoryEnv` 缺 `LLMINQQ_CONFIG`**：reflect/learn 子进程现在能读到
+  `bridge-config.json`（也保证首次安装时调度器启动前它已存在）。
+- **调度器把失败当成功、把空转当失败**：按「退出码 + 输出语义」判（none/llm-empty=成功、
+  mode=error 即使退出码 0 也判失败、fallback=降级），`scheduler.json` 记连续失败与死信，
+  设置页「记忆」页新增只读「定时任务」卡片。
+- **新增 `memctl sanitize`**（默认 dry-run）：扫/清 prompt 注入残留与排版污染。
+- **新增只读审计脚本 `scripts/memory-audit.mjs`** 与跨通道注入回归测试。
+
+### Note
+
+- 桥的状态文件从 `<dataDir>/state/state.json` 迁到 `<dataDir>/agent/memory/state.json`
+  （`migrateBridgeStateFile` 单向拷贝、源保留）。**回滚到 0.5.5 之前版本**会读旧快照，
+  可能丢掉迁移之后的新好感度/会话映射 —— 回滚前先备份新文件。
+
 ## [0.5.5] - 2026-11-03
 
 ### Added
