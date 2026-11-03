@@ -15,6 +15,8 @@
 //   · 文本清洗：v4 把排版气泡头/控制标记写成记忆正文（P0-5），迁进 v5 前必须洗；
 //     注入残留直接跳过（连归档都不值得）。
 //   · 幂等：重复 --apply 不能重复插入（实测第一次漏了「读已有 key」把库插了两遍）。
+//   · ⑪ 显式日期过期（task-22）：只认文本自带的完整日期 + 时间词；过去→archived(expired)，
+//     未来→valid_until；相对时间/歧义/非法/区间一律不猜（误删不可逆，宁可不做）。
 //
 // 全部用临时目录里的合成 v4 库（node:sqlite 现造），绝不碰生产库；`--v4` 也只会
 // 指向临时文件。生产路径拒绝用例用一个假的 DSH_HOME 来触发，而不是真的读 ~/.dsh。
@@ -538,4 +540,173 @@ test('纯函数：mapType/mapPeer/cleanV4Text/normalizeForKey/isMeaninglessShort
   assert.equal(S.isMeaninglessShort('明天下午三点开会', 0.35), false, '短但有效的事实不能算噪音')
   assert.equal(S.isMeaninglessShort('嗯嗯', 0.5), true, '即使 v4 importance 不低，白名单也认')
   assert.equal(S.isMeaninglessShort('这周工作量挺大的', 0.08), true, 'v4 自己打 0.08 的短句算无意义')
+})
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑩ 显式日期 → 过期归档 / valid_until（task-22，保守版）
+// ════════════════════════════════════════════════════════════════════════════
+
+/** 本地时区的 epoch 秒（测试里固定 now/created，避免依赖跑测试的具体日期）。 */
+const localEpoch = (y, m, d, hh = 12, mi = 0) => Math.floor(new Date(y, m - 1, d, hh, mi, 0).getTime() / 1000)
+/** 固定「迁移运行时刻」= 2026-11-03 12:00（本地），让过期/未来判定可重复。 */
+const NOW_1122 = localEpoch(2026, 11, 3, 12)
+
+test('⑪ 显式日期解析：完整日期+时间词才解析；过去/未来/当天结束；歧义/区间/相对时间不猜', { skip: SKIP }, () => {
+  const created = localEpoch(2026, 10, 25, 20)
+
+  // 生产库真实样本：明天(2026-10-26)下午三点 → 2026-10-26 15:00，早于 NOW → 过去
+  const past = S.resolveExplicitExpiry('明天(2026-10-26)下午三点开会，地点3楼', created, NOW_1122)
+  assert.equal(past.ok, true, JSON.stringify(past))
+  assert.equal(past.source, 'datetime')
+  const pastLocal = new Date(past.at * 1000)
+  assert.equal(pastLocal.getFullYear(), 2026)
+  assert.equal(pastLocal.getMonth(), 9)          // 10 月
+  assert.equal(pastLocal.getDate(), 26)
+  assert.equal(pastLocal.getHours(), 15)
+  assert.ok(past.at < NOW_1122, '应判定为已过期')
+
+  // 未来：显式年月日 + 晚上8点 → 当天 20:00，晚于 NOW
+  const future = S.resolveExplicitExpiry('2026年12月31日晚上8点一起跨年', created, NOW_1122)
+  assert.equal(future.ok, true, JSON.stringify(future))
+  assert.ok(future.at > NOW_1122)
+  assert.equal(new Date(future.at * 1000).getHours(), 20)
+
+  // 只有日期 + 时间词、没有钟点 → 当天 23:59:59（对过期判定最保守）
+  const dayEnd = S.resolveExplicitExpiry('2026-10-25上午处理这事', created, NOW_1122)
+  assert.equal(dayEnd.ok, true)
+  assert.equal(dayEnd.source, 'day-end')
+  assert.equal(new Date(dayEnd.at * 1000).getHours(), 23)
+  assert.equal(new Date(dayEnd.at * 1000).getMinutes(), 59)
+
+  // 相对时间（没有完整日期）一律不猜
+  assert.equal(S.resolveExplicitExpiry('明天下午三点开会', created, NOW_1122).reason, 'no-date')
+  assert.equal(S.resolveExplicitExpiry('下周三下午三点开会', created, NOW_1122).reason, 'no-date')
+
+  // 1-12 点且没有时段词 → 歧义
+  assert.equal(S.resolveExplicitExpiry('2026-12-31 三点开会', created, NOW_1122).reason, 'ambiguous-time')
+  // 非法日期 → 不猜（不是「归一化成 3 月 2 日」）
+  assert.equal(S.resolveExplicitExpiry('2026-02-30 下午三点开会', created, NOW_1122).reason, 'invalid-date')
+  // 多个日期 / 区间 → 不猜
+  assert.equal(S.resolveExplicitExpiry('10月5日到10月8日每天都开会', created, NOW_1122).reason, 'multiple-dates')
+  // 显式日期但没有时间词（不是时间承诺，是事件记录）→ 不猜
+  assert.equal(S.resolveExplicitExpiry('10月23日QQ头像已换成白团子', created, NOW_1122).reason, 'no-time-word')
+  // 时段词歧义（上午+下午同时出现在同一窗口）→ 不猜
+  assert.equal(S.resolveExplicitExpiry('2026-10-26上午和下午三点都开会', created, NOW_1122).reason, 'ambiguous-time')
+})
+
+test('⑪ M月D日：用 created 年份推断；推断日早于 created 那天 → 次年（唯一允许的推断）', { skip: SKIP }, () => {
+  // created 2026-06-15，写「10月5日下午三点」→ 2026-10-05（同一自然年）
+  const p1 = S.resolveExplicitExpiry('10月5日下午三点开会', localEpoch(2026, 6, 15), NOW_1122)
+  assert.equal(p1.ok, true, JSON.stringify(p1))
+  assert.equal(new Date(p1.at * 1000).getFullYear(), 2026)
+  assert.equal(new Date(p1.at * 1000).getMonth(), 9)
+  // created 2026-12-01，写「3月5日下午三点」→ 比 created 早 → 次年 2027
+  const p2 = S.resolveExplicitExpiry('3月5日下午三点开会', localEpoch(2026, 12, 1), localEpoch(2027, 1, 1))
+  assert.equal(p2.ok, true, JSON.stringify(p2))
+  assert.equal(new Date(p2.at * 1000).getFullYear(), 2027)
+  // 同一天写当天 → 仍同年（不因为「时刻比 created 早」就推次年）
+  const p3 = S.resolveExplicitExpiry('10月5日下午三点开会', localEpoch(2026, 10, 5, 9), NOW_1122)
+  assert.equal(new Date(p3.at * 1000).getFullYear(), 2026)
+  // created 缺失 → 无法推断年 → 不猜
+  assert.equal(S.resolveExplicitExpiry('10月5日下午三点开会', null, NOW_1122).reason, 'no-created-year')
+  // Excel 式数字解析：中文数字
+  assert.equal(S.cnNumber('十'), 10)
+  assert.equal(S.cnNumber('十二'), 12)
+  assert.equal(S.cnNumber('二十三'), 23)
+  assert.ok(Number.isNaN(S.cnNumber('一x')))
+})
+
+test('⑪ mapV4Row：过去的显式日期（含 pinned）→ archived(expired)；未来 → validUntil；可关', { skip: SKIP }, () => {
+  const base = {
+    peer: 'c2c-3022464706', kind: 'procedural', owner: '3022464706',
+    pinned: 1, importance: 0.8, created: localEpoch(2026, 10, 25, 20),
+    last_seen: localEpoch(2026, 10, 25, 20),
+  }
+  // 生产库实测样本（v4 id=222）：pinned + 已过期 8 天仍然 active —— 就是审计说的残留
+  const past = S.mapV4Row({ ...base, text: '明天(2026-10-26)下午三点开会，地点3楼' }, { now: NOW_1122 })
+  assert.equal(past.kind, 'memory')
+  assert.equal(past.memory.archivedReason, 'expired', '过去 → 直接归档 expired（pinned 也要归档）')
+  assert.equal(past.memory.validUntil, null)
+  assert.equal(past.expire.action, 'expired')
+  assert.equal(past.memory.salience, 0.9, 'pinned 的 salience 映射不受过期处理影响')
+
+  // 未来 → 保持 active，valid_until 交给 v5 的 dueExpire
+  const future = S.mapV4Row({
+    ...base, kind: 'semantic', pinned: 0,
+    text: '2026年12月31日晚上8点一起跨年',
+  }, { now: NOW_1122 })
+  assert.equal(future.memory.archivedReason, null)
+  assert.equal(future.expire.action, 'valid-until')
+  assert.equal(new Date(future.memory.validUntil * 1000).getHours(), 20)
+
+  // --no-expire-parse：同一条不归档、valid_until 空（回到 task-19 的行为）
+  const off = S.mapV4Row({ ...base, text: '明天(2026-10-26)下午三点开会，地点3楼' },
+    { now: NOW_1122, expireParse: false })
+  assert.equal(off.memory.archivedReason, null)
+  assert.equal(off.memory.validUntil, null)
+  assert.equal(off.expire, null)
+})
+
+test('⑪ CLI/report：dry-run 也给 expired 计数+10 条样例；--apply 真归档/写 valid_until；--no-expire-parse 关掉', { skip: SKIP }, () => {
+  const dir = tmpDir()
+  const rows = []
+  // 12 条已过期（不同文本避免 key 去重）→ 样例最多 10 条
+  for (let i = 0; i < 12; i++) {
+    rows.push({
+      text: `第${i}次排期：明天(2026-10-26)下午三点开会`,
+      kind: 'procedural', pinned: 1, importance: 0.8,
+      created: localEpoch(2026, 10, 25, 20), last_seen: localEpoch(2026, 10, 25, 20),
+    })
+  }
+  rows.push({ text: '2026年12月31日晚上8点一起跨年', kind: 'semantic', created: localEpoch(2026, 10, 25, 20) })
+  rows.push({ text: '2026-02-30 下午三点开会', kind: 'episodic', created: localEpoch(2026, 10, 25, 20) })
+  rows.push({ text: '明天下午三点开会（没有日期）', kind: 'episodic', created: localEpoch(2026, 10, 25, 20) })
+  const v4 = makeV4(dir, rows)
+  const out = path.join(dir, 'mem-v5.db')
+
+  // dry-run：不写文件，但必须给出计数 + 样例（复核用）
+  const dry = runJson(['--v4', v4, '--out', out])
+  assert.equal(dry.mode, 'dry-run')
+  assert.ok(!fs.existsSync(out), 'dry-run 不许创建输出库')
+  assert.equal(dry.expired.enabled, true)
+  assert.equal(dry.expired.archived, 12, `将 expired 条数：${JSON.stringify(dry.expired)}`)
+  assert.equal(dry.expired.validUntilSet, 1)
+  assert.equal(dry.expired.unresolved, 1, '2026-02-30 应记 unresolved，不许归一化')
+  assert.equal(dry.expired.unresolvedByReason['invalid-date'], 1)
+  assert.equal(dry.expired.samples.length, 10, '样例最多 10 条')
+  assert.equal(dry.memories.byArchivedReason.expired, 12)
+
+  // --apply：真归档 expired；未来条目写 valid_until；相对时间不猜
+  const applied = runJson(['--v4', v4, '--out', out, '--apply'])
+  assert.equal(applied.written.archived, 12)
+  const v5 = openV5(out)
+  try {
+    assert.equal(v5.db.prepare("SELECT COUNT(*) AS n FROM memories WHERE state='archived' AND archived_reason='expired'").get().n, 12)
+    assert.equal(v5.db.prepare("SELECT COUNT(*) AS n FROM memories WHERE state='archived' AND archived_reason='pruned'").get().n, 0)
+    const futureRow = v5.db.prepare("SELECT * FROM memories WHERE text LIKE '%跨年%'").get()
+    assert.equal(futureRow.state, 'active')
+    assert.ok(futureRow.valid_until > NOW_1122, '未来条目应写 valid_until 交给 dueExpire')
+    assert.equal(new Date(futureRow.valid_until * 1000).getHours(), 20)
+    const relativeRow = v5.db.prepare("SELECT * FROM memories WHERE text LIKE '%没有日期%'").get()
+    assert.equal(relativeRow.state, 'active', '相对时间不猜')
+    assert.equal(relativeRow.valid_until, null)
+    const ambiguous = v5.db.prepare("SELECT * FROM memories WHERE text LIKE '%02-30%'").get()
+    assert.equal(ambiguous.state, 'active', '歧义/非法日期不归档')
+    assert.equal(ambiguous.valid_until, null)
+    // 未来条目到点后 dueExpire 能归档（证明 valid_until 真的接线了）
+    const expiredRes = v5.dueExpire(futureRow.valid_until + 1)
+    assert.equal(expiredRes.expired, 1)
+  } finally { v5.close() }
+
+  // --no-expire-parse：同样的数据全部保持 active
+  const out2 = path.join(dir, 'mem-v5-off.db')
+  const off = runJson(['--v4', v4, '--out', out2, '--apply', '--no-expire-parse'])
+  assert.equal(off.expired.enabled, false)
+  assert.equal(off.expired.archived, 0)
+  assert.equal(off.expired.validUntilSet, 0)
+  const v5b = openV5(out2)
+  try {
+    assert.equal(v5b.db.prepare("SELECT COUNT(*) AS n FROM memories WHERE state='archived' AND archived_reason='expired'").get().n, 0)
+    assert.equal(v5b.db.prepare('SELECT COUNT(*) AS n FROM memories WHERE valid_until IS NOT NULL').get().n, 0)
+  } finally { v5b.close() }
 })

@@ -38,11 +38,10 @@
 //    v5 没有 pinned 列（文档约定：钉住 = salience 抬到 0.9）。0.9 是文档给的数，
 //    不再用 v4 那套 `max(imp, 0.8)` —— 0.8 落在「很重要」和「钉住」之间没有区分度。
 //
-// ③ created → created + valid_from；last_seen → last_seen；valid_until = null
+// ③ created → created + valid_from；last_seen → last_seen；valid_until 默认 null
 //    v5 的 valid_from 表示「这条结论从什么时候成立」。v4 只有 created（首次入库），
-//    它就是这个语义。valid_until 留空：**迁移时不知道哪条会过期**，靠 expire job
-//    按 distill 补上的时间边界去归档；迁移自己猜日期只会误杀（「明天三点开会」
-//    解析错一次就永久归档一条真实记忆）。
+//    它就是这个语义。valid_until 默认留空（相对时间「明天/下周三」不猜，见 ⑪，
+//    只有**文本自带完整显式日期**的才解析）。
 //    ⚠️ v4 列名是 `created`（不是 audit 文字里的 created_at）。脚本按实际列读。
 //
 // ④ retired=1 → state='archived'，archived_reason：
@@ -50,9 +49,8 @@
 //                                 v5 有独立列了，正好把这层补丁洗掉）
 //      其它                   → pruned（v4 的 retired 还兼着「低价值归档」；
 //                                 v5 的 pruned 就是干这个的）
-//    ⚠️ 文档 Step 3 原型还「新增 expired 归档 1 条（过期会议）」—— 本脚本**不做**：
-//    那需要把「2026-10-26 下午三点」解析成 valid_until，迁移不该猜自然语言时间；
-//    交给 expire job / distill（它们在 v5 里有结构化字段可写）。这条差异写进回执。
+//    文档 Step 3 原型的「新增 expired 归档 1 条（过期会议）」由 ⑪ 的显式日期解析
+//    补上（task-22）。v4 已归档的行**不覆盖**原因（保留 done/pruned）。
 //
 // ⑤ subject / conv / scope（scope 必须按 peer 前缀判，不能信 v4 visibility）：
 //      subject：owner 非空 → owner（v4 已按人归集好，群聊也能落到发言人）
@@ -102,6 +100,30 @@
 //    交给 v5 的 pruned 机制退场，是可逆的。
 //    ⚠️ 只对「无意义」判据命中的降权，不是「所有 <12 字」——后者会把短事实也压掉。
 //
+// ⑪ 显式日期过期（task-22，保守版；`--no-expire-parse` 可关）
+//    背景：审计验收要求「过期时间事实残留 = 0」，实测迁移库里「明天(2026-10-26)
+//    下午三点开会，地点3楼」还是 active（v4 里它 pinned，一直注入）。
+//    但「下周三」「明天」这类相对时间**绝对不猜**（解析错一次就永久归档一条真实
+//    记忆，不可逆）。所以只处理文本里自带**完整显式日期**的条目：
+//      · 认的日期格式：YYYY-MM-DD / YYYY年M月D日 / M月D日
+//        （M月D日 用 created 的年份推断：同一自然年；推断出的日历日早于 created
+//         那天 → 视为次年。这是唯一允许的推断——v4 正文里「10月5日」必然是写这条
+//         时最近的那个 10月5日。）
+//      · 还要求**同一句、离日期 ≤48 字**内有时间词/钟点（今天/明天/后天/上午/
+//        下午/晚上/凌晨/点/时/分…）。task 写的是「附近 48 小时」，但 v4 正文被
+//        截到 80 字（P1-1），按小时没有物理意义；实现为「48 字窗口 + 同一句」，
+//        等价于「它们是同一条消息里的同一次表述」。
+//      · 绝对时刻（有歧义就不定，宁可不猜）：
+//          - 时段词 + 钟点 → 按 24h 制换算（下午/晚上/傍晚 +12，凌晨/早上 12→0…）；
+//          - 24h 制钟点（13-23 点 / HH:MM 且小时 ≥13）→ 直接用；
+//          - 1-12 点且**没有**时段词 → 歧义 → 不猜；
+//          - 只有日期 + 时间词、没有钟点 → 当天 23:59:59（「这一天过完才算过期」
+//            对过期判定最保守；未来项的 valid_until 也定在当天结束）；
+//          - 多个日期 / 日期区间 / 非法日期（2026-02-30）→ 不猜（unresolved 计数）。
+//      · 结论：解析出的时刻 < 迁移运行时刻 → 直接 archived_reason='expired'；
+//        ≥ now → valid_until=该时刻（留给 v5 dueExpire 到点归档）。
+//      · 只对 v4 里**还没归档**的条目做（已 archived 的尊重 v4 的原因）。
+//
 // ── 用法 ────────────────────────────────────────────────────────────────────
 //   # 0) 先做只读快照（生产库是活的，别直接开）
 //   cp ~/.dsh/dsh-plugin-llminqq/agent/memory/mem.db /tmp/mem-v4.db
@@ -124,6 +146,7 @@
 //   --allow-prod         允许 --out 写生产路径（正式切换用；先备份！）
 //   --json               输出机器可读 JSON（测试/流水线用）
 //   --samples <n>        报告里样例条数（默认 10）
+//   --no-expire-parse    关闭「显式日期→过期归档/valid_until」（默认开启，见 ⑪）
 //
 // 退出码：0 成功（含 dry-run）；1 运行错误（读不到/库结构不对）；2 参数/安全闸；
 //         4 当前 Node 没有 node:sqlite。
@@ -135,7 +158,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
-import { openV5 } from '../lib/agent/memory-v5/store.mjs'
+import { openV5, nowSec } from '../lib/agent/memory-v5/store.mjs'
 
 const require = createRequire(import.meta.url)
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -266,6 +289,273 @@ export function buildKey (type, subject, text) {
   return crypto.createHash('sha1').update(raw, 'utf8').digest('hex')
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// ⑪ 显式日期 → 过期归档 / valid_until（见文件头；task-22，保守版）
+// ════════════════════════════════════════════════════════════════════════════
+
+const TIME_WORD_WINDOW = 48   // 日期附近的「同一条消息」窗口（见文件头 ⑪：v4 正文 ≤80 字）
+const PERIOD_WINDOW = 12      // 时段词「下午/上午…」离钟点多远内还算同一时刻
+
+const RE_DATE_YMD_DASH = /(\d{4})-(\d{1,2})-(\d{1,2})/g
+const RE_DATE_YMD_CN = /(\d{4})年(\d{1,2})月(\d{1,2})日?/g
+const RE_DATE_MD = /(\d{1,2})月(\d{1,2})日/g
+const RE_PERIOD_PATTERN = '(上午|下午|中午|晚上|凌晨|早上|清晨|傍晚|夜里|半夜)'
+const RE_PERIOD = new RegExp(RE_PERIOD_PATTERN, 'g')        // matchAll 用（必须 global）
+const RE_PERIOD_TEST = new RegExp(RE_PERIOD_PATTERN)       // .test 用（global 会带 lastIndex 状态）
+const RE_RELATIVE_DAY = /(今天|明天|后天|大后天|昨天|前天)/
+const RE_CLOCK_HM = /(\d{1,2})[:：](\d{1,2})/g
+const RE_CLOCK_CN = /([零一二三四五六七八九十两\d]{1,3})[点时](半|[零一二三四五六七八九十\d]{1,3}分?)?/g
+// 这些词会让「某日期」的语义变成区间/约数（「10月5日之后」「大概10月5日」），
+// 拿它当过期边界会误杀，所以整条不猜（见文件头 ⑪ 最后一条）。
+// 注意不要放单个「约」：v4 里「信风约好 2026-10-26 开会」是**确定**的约定（约好≠大约），
+// 单字「约」会把这类真实约定误判成区间而放弃解析。
+const RE_DATE_VAGUE = /(之前|以前|之后|以后|前后|左右|大概|大约|预计|截至|截止)/
+
+const CN_DIGITS = Object.freeze({ 零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 })
+
+/** 中文数字（含「十」「十二」「二十三」）→ Number；不是数字返回 NaN。 */
+export function cnNumber (s) {
+  const t = String(s ?? '')
+  if (/^\d+$/.test(t)) return Number(t)
+  if (t === '十') return 10
+  if (t.length === 1) return t in CN_DIGITS ? CN_DIGITS[t] : NaN
+  if (t.length === 2) {
+    if (t[0] === '十') return CN_DIGITS[t[1]] === undefined ? NaN : 10 + CN_DIGITS[t[1]]
+    if (t[1] === '十') return CN_DIGITS[t[0]] === undefined ? NaN : CN_DIGITS[t[0]] * 10
+  }
+  if (t.length === 3 && t[1] === '十') {
+    return CN_DIGITS[t[0]] === undefined || CN_DIGITS[t[2]] === undefined
+      ? NaN
+      : CN_DIGITS[t[0]] * 10 + CN_DIGITS[t[2]]
+  }
+  return NaN
+}
+
+/**
+ * 找文本里**所有完整显式日期**（YYYY-MM-DD / YYYY年M月D日 / M月D日）。
+ * 返回 [{kind:'ymd'|'md', start, end, year|null, month, day}]，按出现位置排序。
+ * 重叠的匹配只留更具体的（「2026年10月26日」不会再被 M月D日 匹配一次）。
+ */
+export function findExplicitDates (text) {
+  const t = String(text ?? '')
+  const out = []
+  const take = (re) => {
+    re.lastIndex = 0
+    let m
+    while ((m = re.exec(t)) !== null) {
+      const start = m.index
+      const end = start + m[0].length
+      if (out.some(d => start < d.end && end > d.start)) continue
+      if (m.length === 4) out.push({ kind: 'ymd', start, end, year: Number(m[1]), month: Number(m[2]), day: Number(m[3]) })
+      else out.push({ kind: 'md', start, end, year: null, month: Number(m[1]), day: Number(m[2]) })
+    }
+  }
+  take(RE_DATE_YMD_DASH)
+  take(RE_DATE_YMD_CN)
+  take(RE_DATE_MD)
+  return out.sort((a, b) => a.start - b.start)
+}
+
+/** 本地时区构造日期；非法日期（2026-02-30 / 13月）返回 null。 */
+function buildLocalDate (y, m, d, hh = 0, mi = 0, ss = 0) {
+  if (!(Number.isInteger(y) && y >= 1000 && y <= 9999)) return null
+  if (!(Number.isInteger(m) && m >= 1 && m <= 12)) return null
+  if (!(Number.isInteger(d) && d >= 1 && d <= 31)) return null
+  const dt = new Date(y, m - 1, d, hh, mi, ss, 0)
+  if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) return null
+  if (dt.getHours() !== hh || dt.getMinutes() !== mi) return null
+  return dt
+}
+
+/**
+ * M月D日 的年份推断：用 created 所在年份；若该日历日早于 created 那天 → 次年。
+ * （v4 正文写「10月5日」时指的必然是当时最近的那个 10月5日。）
+ */
+function inferYearFromCreated (month, day, created) {
+  if (!(Number(created) > 0)) return null
+  const c = new Date(Number(created) * 1000)
+  const y = c.getFullYear()
+  const candidate = buildLocalDate(y, month, day)
+  if (!candidate) return null
+  const createdDay = new Date(y, c.getMonth(), c.getDate())
+  return candidate.getTime() < createdDay.getTime() ? y + 1 : y
+}
+
+/** 一段文字里是否有「时间词」：相对日 / 时段词。钟点由 findClocks 另判。 */
+function hasTimeWord (sentence) {
+  return RE_RELATIVE_DAY.test(sentence) || RE_PERIOD_TEST.test(sentence)
+}
+
+/** 钟点附近的时段词；两种不同时段词在同一窗口内 → 歧义（不猜）。 */
+function periodNear (text, s, e) {
+  const from = Math.max(0, s - PERIOD_WINDOW)
+  const to = Math.min(text.length, e + PERIOD_WINDOW)
+  const found = new Set()
+  for (const m of text.slice(from, to).matchAll(RE_PERIOD)) found.add(m[1])
+  if (found.size === 1) return { period: [...found][0], ambiguous: false }
+  if (found.size > 1) return { period: null, ambiguous: true }
+  return { period: null, ambiguous: false }
+}
+
+/**
+ * 把「钟点 + 时段词」换算成 24 小时制。有歧义返回 null（不猜）。
+ * 这里的每一条规则都是「唯一合理解释」才接受；模棱两可的一律 null：
+ *   · 1-12 点且没有时段词 → null（上午还是下午不知道）；
+ *   · 「晚上1点」「夜里1点」这类 → 只有夜里1-4 点按 01:00 认（口语里几乎都是凌晨），
+ *     晚上 1-5 点也按 01:00-05:00 认；其余交给上层当歧义。
+ */
+function resolveClock (hour, minute, period) {
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) return null
+  if (minute < 0 || minute > 59) return null
+  if (hour === 24 && minute === 0) return { hour: 0, minute: 0, dayOffset: 1 }
+  if (hour < 0 || hour > 23) return null
+  if (!period) {
+    if (hour >= 13) return { hour, minute, dayOffset: 0 }   // 24h 制没有歧义
+    if (hour === 0) return { hour: 0, minute, dayOffset: 0 }
+    return null                                              // 1-12 点：歧义
+  }
+  switch (period) {
+    case '上午':
+    case '早上':
+    case '清晨':
+      if (hour === 12) return { hour: 0, minute, dayOffset: 0 }
+      if (hour >= 1 && hour <= 11) return { hour, minute, dayOffset: 0 }
+      return null
+    case '中午':
+    case '下午':
+    case '傍晚':
+      if (hour === 12) return { hour: 12, minute, dayOffset: 0 }
+      if (hour >= 1 && hour <= 11) return { hour: hour + 12, minute, dayOffset: 0 }
+      if (hour >= 13 && hour <= 19) return { hour, minute, dayOffset: 0 }
+      return null
+    case '晚上':
+      if (hour === 12) return { hour: 0, minute, dayOffset: 1 }   // 晚上 12 点 = 次日 0 点
+      if (hour >= 6 && hour <= 11) return { hour: hour + 12, minute, dayOffset: 0 }
+      if (hour >= 1 && hour <= 5) return { hour, minute, dayOffset: 0 }  // 「晚上 1 点」= 01:00
+      return null
+    case '夜里':
+    case '半夜':
+      if (hour === 12) return { hour: 0, minute, dayOffset: 1 }
+      if (hour >= 1 && hour <= 4) return { hour, minute, dayOffset: 0 }
+      if (hour >= 8 && hour <= 11) return { hour: hour + 12, minute, dayOffset: 0 }
+      return null
+    default:
+      return null
+  }
+}
+
+/**
+ * 找日期附近的钟点（同一句、距离 ≤ TIME_WORD_WINDOW），带时段词与 24h 换算结果。
+ * 返回 [{start, end, hour, minute, period, resolved|null, ambiguousPeriod}]
+ */
+function findClocksNear (text, dateStart, dateEnd) {
+  const from = Math.max(0, dateStart - TIME_WORD_WINDOW)
+  const to = Math.min(text.length, dateEnd + TIME_WORD_WINDOW)
+  const seg = text.slice(from, to)
+  const raw = []
+  const scan = (re, build) => {
+    re.lastIndex = 0
+    let m
+    while ((m = re.exec(seg)) !== null) {
+      const s = from + m.index
+      const e = s + m[0].length
+      const dist = s >= dateEnd ? s - dateEnd : (dateStart >= e ? dateStart - e : 0)
+      if (dist > TIME_WORD_WINDOW) continue
+      const c = build(m, s)
+      if (c) raw.push({ start: s, end: e, ...c })
+    }
+  }
+  scan(RE_CLOCK_HM, (m) => ({ hour: Number(m[1]), minute: Number(m[2]) }))
+  scan(RE_CLOCK_CN, (m, s) => {
+    const hour = cnNumber(m[1])
+    if (!Number.isFinite(hour)) return null
+    let minute = 0
+    const mm = m[2]
+    if (mm === '半') minute = 30
+    else if (mm) {
+      const n = cnNumber(String(mm).replace(/分$/, ''))
+      if (!Number.isFinite(n)) return null
+      minute = n
+    }
+    // 「好一点」「差一点」里的「一点」不是钟点（实测噪音源）。判据：匹配以「一点」
+    // 开头且前一个汉字是程度词 → 不是时间。宁可漏，不可猜。
+    if (m[0].startsWith('一点') && s > 0 && /[好差快慢大小多少高矮胖瘦早晚上下前后]/.test(text[s - 1])) {
+      return null
+    }
+    return { hour, minute }
+  })
+  return raw.map(c => {
+    const p = periodNear(text, c.start, c.end)
+    return {
+      ...c,
+      period: p.period,
+      ambiguousPeriod: p.ambiguous,
+      resolved: p.ambiguous ? null : resolveClock(c.hour, c.minute, p.period),
+    }
+  })
+}
+
+function sentenceBounds (text, start, end) {
+  const seps = ['。', '！', '？', '!', '?', '；', ';', '\n']
+  let s = 0
+  for (const ch of seps) {
+    const i = text.lastIndexOf(ch, start - 1)
+    if (i + 1 > s) s = i + 1
+  }
+  let e = text.length
+  for (const ch of seps) {
+    const i = text.indexOf(ch, end)
+    if (i >= 0 && i < e) e = i
+  }
+  return { start: s, end: e }
+}
+
+/**
+ * 解析「文本自带的完整显式日期 + 时间词」→ 绝对时刻（保守版，见文件头 ⑪）。
+ *
+ * @param {number} now 迁移运行时刻（秒）。只用于文档/测试一致性——"过去 vs 未来"
+ *   的判定在 mapV4Row 里做（那里同时决定归档还是写 valid_until）。
+ * @returns {{ok:true, at:number, source:'datetime'|'day-end', year,month,day,hour,minute}
+ *          | {ok:false, reason:'no-date'|'multiple-dates'|'date-vague'|'no-time-word'
+ *             |'multiple-clocks'|'ambiguous-time'|'invalid-date'|'no-created-year'}}
+ */
+export function resolveExplicitExpiry (text, created, now = nowSec()) {
+  const t = String(text ?? '')
+  const dates = findExplicitDates(t)
+  if (!dates.length) return { ok: false, reason: 'no-date' }
+  if (dates.length > 1) return { ok: false, reason: 'multiple-dates' }
+  const d = dates[0]
+  if (RE_DATE_VAGUE.test(t)) return { ok: false, reason: 'date-vague' }
+
+  const sb = sentenceBounds(t, d.start, d.end)
+  const sentence = t.slice(sb.start, sb.end)
+  const clocks = findClocksNear(t, d.start, d.end)
+  // 同句、近窗口内一个钟点都没有 → 需要时间词（今天/明天/…或 下午/晚上…）才继续；
+  // 没有时间词的「2026-10-26 改好了」不算时间承诺，不猜。
+  if (!clocks.length && !hasTimeWord(sentence)) return { ok: false, reason: 'no-time-word' }
+  if (clocks.length > 1) return { ok: false, reason: 'multiple-clocks' }
+
+  const year = d.kind === 'ymd' ? d.year : inferYearFromCreated(d.month, d.day, created)
+  if (!year) return { ok: false, reason: 'no-created-year' }
+
+  if (clocks.length === 1) {
+    const c = clocks[0]
+    if (!c.resolved) return { ok: false, reason: 'ambiguous-time' }
+    const dt = buildLocalDate(year, d.month, d.day, c.resolved.hour, c.resolved.minute, 0)
+    if (!dt) return { ok: false, reason: 'invalid-date' }
+    const at = Math.floor(dt.getTime() / 1000) + (c.resolved.dayOffset || 0) * 86400
+    return {
+      ok: true, at, source: 'datetime', year, month: d.month, day: d.day,
+      hour: c.resolved.hour, minute: c.resolved.minute,
+    }
+  }
+  // 只有日期 + 时间词、没有钟点：按「当天结束」算（对过期判定最保守）
+  const dt = buildLocalDate(year, d.month, d.day, 23, 59, 59)
+  if (!dt) return { ok: false, reason: 'invalid-date' }
+  return { ok: true, at: Math.floor(dt.getTime() / 1000), source: 'day-end', year, month: d.month, day: d.day, hour: 23, minute: 59 }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // v4 行 → v5 目标（纯函数，单测直接 import）
 // ════════════════════════════════════════════════════════════════════════════
@@ -298,13 +588,17 @@ function firstFinite (...vals) {
 }
 
 /**
- * 把一行 v4 entries 映射成 v5 的写入计划（见文件头 ①②③④⑤⑥⑦⑨⑩）。
+ * 把一行 v4 entries 映射成 v5 的写入计划（见文件头 ①②③④⑤⑥⑦⑨⑩⑪）。
  *
  * @param {object} row  v4 entries 的一行（sqlite Row → plain object）
+ * @param {object} [opts]
+ * @param {number} [opts.now]          迁移运行时刻（秒；默认当前时间，测试传固定值）
+ * @param {boolean} [opts.expireParse] 是否做显式日期过期解析（默认 true，见 ⑪）
  * @returns {{kind:'memory'|'utterance'|'skip', reason:string, memory?:object, utterance?:object,
- *            cleaned:boolean, shortDownranked:boolean, key?:string}}
+ *            cleaned:boolean, shortDownranked:boolean, key?:string,
+ *            expire?:{action:'expired'|'valid-until'|'unresolved', at?:number, reason?:string, source?:string}}}
  */
-export function mapV4Row (row) {
+export function mapV4Row (row, { now = nowSec(), expireParse = true } = {}) {
   const peer = mapPeer(row.peer)
   const raw = row.text === null || row.text === undefined ? '' : String(row.text)
   const clean = cleanV4Text(raw)
@@ -356,11 +650,31 @@ export function mapV4Row (row) {
   if (shortDownranked) salience = Math.min(salience, 0.1)
 
   const type = mapType(row.kind)
-  const archived = Number(row.retired) === 1
+  let archived = Number(row.retired) === 1
   // ④ 归档原因：done 靠 v4 的文本前缀反推，其它一律 pruned
-  const archivedReason = archived
+  let archivedReason = archived
     ? (text.startsWith('已完成：') ? 'done' : 'pruned')
     : null
+  // ⑪ 显式日期过期（只对 v4 里还没归档的做：已归档的尊重 v4 的原因）：
+  //    at < now → archived(expired)；at >= now → valid_until 留给 dueExpire。
+  let validUntil = null
+  let expire = null
+  if (!archived && expireParse) {
+    const ex = resolveExplicitExpiry(text, created, now)
+    if (ex.ok) {
+      if (ex.at < now) {
+        archived = true
+        archivedReason = 'expired'
+        expire = { action: 'expired', at: ex.at, source: ex.source }
+      } else {
+        validUntil = ex.at
+        expire = { action: 'valid-until', at: ex.at, source: ex.source }
+      }
+    } else if (ex.reason !== 'no-date') {
+      // 有日期但解析不了（区间/歧义/非法）→ 记一笔 unresolved 供人工复核，不猜
+      expire = { action: 'unresolved', reason: ex.reason }
+    }
+  }
 
   return {
     kind: 'memory',
@@ -368,6 +682,7 @@ export function mapV4Row (row) {
     cleaned: clean.changed,
     shortDownranked,
     key: buildKey(type, subject, text),
+    expire,
     memory: {
       type,
       text,
@@ -378,7 +693,7 @@ export function mapV4Row (row) {
       salience,
       state: 'active',     // archived 用 store.archiveMemory() 归档，保证 reason 走白名单
       validFrom: created,
-      validUntil: null,
+      validUntil,
       scope,
       created,
       lastSeen,
@@ -395,6 +710,7 @@ export function parseArgs (argv = []) {
   const out = {
     v4: '', out: '', apply: false, dataDir: '', json: false,
     allowProdRead: false, allowProd: false, samples: 10, help: false,
+    expireParse: true,
   }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -407,6 +723,8 @@ export function parseArgs (argv = []) {
     else if (a === '--allow-prod') out.allowProd = true
     else if (a === '--json') out.json = true
     else if (a === '--samples') out.samples = Math.max(0, Number(argv[++i]) || 0)
+    else if (a === '--no-expire-parse') out.expireParse = false
+    else if (a === '--expire-parse') out.expireParse = true
     else if (a === '-h' || a === '--help') out.help = true
     else throw new Error(`不认识的参数：${a}`)
   }
@@ -518,8 +836,11 @@ function topN (map, n = 10) {
  *
  * @returns {object} report（--json 直接打印它）
  */
-export function migrateV4ToV5 ({ v4Path, outPath, apply = false, dataDir = '', samples = 10, log = () => {} } = {}) {
+export function migrateV4ToV5 ({ v4Path, outPath, apply = false, dataDir = '', samples = 10, log = () => {}, expireParse = true, now = nowSec() } = {}) {
   const t0 = Date.now()
+  // 迁移运行时刻取一次，整个迁移用同一个 now：否则跨秒时会出现「同一批里
+  // 前几条按旧 now 判定过期、后几条按新 now」的不一致（边界附近的条目）。
+  const runAt = Number(now) > 0 ? Number(now) : nowSec()
   const v4Db = openV4ReadOnly(v4Path)
   let v4
   try {
@@ -595,6 +916,15 @@ export function migrateV4ToV5 ({ v4Path, outPath, apply = false, dataDir = '', s
     utterances: { total: 0 },
     skipped: { injection: 0, 'empty-after-clean': 0, 'duplicate-key': 0, 'already-present': 0 },
     cleaned: { changed: 0, shortDownranked: 0, samples: [] },
+    // ⑪ 显式日期过期：dry-run 也给计数+样例（复核用）；--no-expire-parse 时 enabled=false
+    expired: {
+      enabled: Boolean(expireParse),
+      archived: 0,            // 解析出「已过去」→ 直接 archived(expired)
+      validUntilSet: 0,       // 解析出「未来」→ 设 valid_until，留给 dueExpire
+      unresolved: 0,          // 有显式日期但解析不了（区间/歧义/非法）→ 不猜
+      unresolvedByReason: {},
+      samples: [],
+    },
     styleWarnings: styleDbWarnings(dataDir),
     samples: [],
     written: { memories: 0, utterances: 0, archived: 0 },
@@ -604,7 +934,7 @@ export function migrateV4ToV5 ({ v4Path, outPath, apply = false, dataDir = '', s
   const seenUtterances = new Set()
 
   for (const row of v4.rows) {
-    const plan = mapV4Row(row)
+    const plan = mapV4Row(row, { now: runAt, expireParse })
     if (plan.kind === 'skip') {
       inc(report.skipped, plan.reason)
       continue
@@ -643,6 +973,32 @@ export function migrateV4ToV5 ({ v4Path, outPath, apply = false, dataDir = '', s
       continue
     }
     seenKeys.add(plan.key)
+    // ⑪ 过期处理计数（只统计真正会写进库的行：被 dup/already-present 跳过的不算，
+    //    否则「将 expired 条数」会比库里实际 archived 多，复核时对不上）
+    if (plan.expire) {
+      if (plan.expire.action === 'expired') {
+        report.expired.archived += 1
+        if (report.expired.samples.length < 10) {
+          report.expired.samples.push({
+            v4Id: Number(row.id), action: 'expired', at: plan.expire.at,
+            atISO: new Date(plan.expire.at * 1000).toISOString(),
+            source: plan.expire.source, text: m.text.slice(0, 80),
+          })
+        }
+      } else if (plan.expire.action === 'valid-until') {
+        report.expired.validUntilSet += 1
+        if (report.expired.samples.length < 10) {
+          report.expired.samples.push({
+            v4Id: Number(row.id), action: 'valid-until', at: plan.expire.at,
+            atISO: new Date(plan.expire.at * 1000).toISOString(),
+            source: plan.expire.source, text: m.text.slice(0, 80),
+          })
+        }
+      } else if (plan.expire.action === 'unresolved') {
+        report.expired.unresolved += 1
+        inc(report.expired.unresolvedByReason, plan.expire.reason || 'unknown')
+      }
+    }
     report.memories.total += 1
     inc(report.memories.byType, m.type)
     inc(report.memories.byScope, m.scope)
@@ -673,7 +1029,7 @@ export function migrateV4ToV5 ({ v4Path, outPath, apply = false, dataDir = '', s
         confidence: m.confidence,
         salience: m.salience,
         validFrom: m.validFrom,
-        validUntil: null,
+        validUntil: m.validUntil ?? null,
         scope: m.scope,
         created: m.created,
         lastSeen: m.lastSeen,
@@ -728,9 +1084,25 @@ export function formatReport (r) {
   L.push(`迁为 utterances（我说过的话）：${r.utterances.total} 条`)
   L.push(`跳过：${fmtMap(r.skipped)}`)
   L.push(`文本清洗：改动 ${r.cleaned.changed} 行 · 短句降权 ${r.cleaned.shortDownranked} 行`)
+  const ex = r.expired || {}
+  if (ex.enabled === false) {
+    L.push('过期处理：已关闭（--no-expire-parse）—— 显式日期的条目全部保持 active、valid_until 空')
+  } else {
+    L.push(`过期处理（显式日期解析）：已过期→archived(expired) ${ex.archived || 0} 条`
+      + ` · 未来→设 valid_until ${ex.validUntilSet || 0} 条`
+      + ` · 有日期但无法确定 ${ex.unresolved || 0} 条`)
+    if (ex.unresolved) L.push(`  无法确定的原因：${fmtMap(ex.unresolvedByReason)}`)
+  }
   if (r.ftsReindexed !== undefined && r.ftsReindexed !== null) L.push(`FTS 重建：${r.ftsReindexed} 条`)
   if (r.ftsError) L.push(`⚠ FTS 重建失败：${r.ftsError}`)
   for (const w of r.styleWarnings) L.push(`⚠ ${w}`)
+  if (ex.samples && ex.samples.length) {
+    L.push('')
+    L.push('过期处理样例：')
+    for (const s of ex.samples) {
+      L.push(`  #${s.v4Id} ${s.action} at=${s.atISO} (${s.source}) ${s.text.slice(0, 60)}`)
+    }
+  }
   if (r.cleaned.samples.length) {
     L.push('')
     L.push('清洗样例（before → after）：')
@@ -765,9 +1137,13 @@ export function main (argv = process.argv.slice(2)) {
   const args = parseArgs(argv)
   if (args.help || !args.v4 || !args.out) {
     console.log(`用法：node scripts/memory-v4-to-v5.mjs --v4 <mem.db 副本> --out <mem-v5.db> [--apply]
-       [--data-dir <插件数据目录>] [--json] [--samples 10] [--allow-prod-read] [--allow-prod]
+       [--data-dir <插件数据目录>] [--json] [--samples 10] [--no-expire-parse]
+       [--allow-prod-read] [--allow-prod]
 
 默认 dry-run（只读 + 报告，不写文件）；--apply 才写 --out。
+默认开启「显式日期过期解析」（文本自带 YYYY-MM-DD / YYYY年M月D日 / M月D日 且附近
+有时间词 → 过去则 archived(expired)，未来则设 valid_until）；相对时间不猜。
+--no-expire-parse 关闭它（全部保持 active、valid_until 空）。
 安全：默认拒绝直接读写生产路径（~/.dsh、$DSH_HOME、/mnt/llminqq-data）——先 cp 到 /tmp。`)
     return args.help ? 0 : 2
   }
@@ -797,6 +1173,7 @@ export function main (argv = process.argv.slice(2)) {
     apply: args.apply,
     dataDir,
     samples: args.samples,
+    expireParse: args.expireParse,
   })
 
   if (args.json) {
