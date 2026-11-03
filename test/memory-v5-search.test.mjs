@@ -439,6 +439,43 @@ test('buildMemoryBlocks：空库返回空 block（不注入任何标题）', () 
 
 // ── ⑫ 其它契约 ────────────────────────────────────────────────────────────
 
+test('性能回归：886 条库上 rankMemories P99 < 50ms（防止 MMR/候选逻辑退化成 O(n³)）', () => {
+  const { store } = mkStore()
+  const words = ['开会', '冰美式', '考研', '服务器', '周报', '爬山', 'B站', '夜猫子', '开黑', '咖啡']
+  const kinds = ['fact', 'preference', 'episode', 'rule', 'commitment', 'relation']
+  for (let i = 0; i < 886; i++) {
+    addMem(store, {
+      type: kinds[i % kinds.length],
+      text: `${words[i % words.length]}相关的第 ${i} 条记忆：${'内容'.repeat(3 + (i % 5))}`,
+      subject: i % 5 === 0 ? null : QQ,
+      conv: i % 3 === 0 ? PEER_GROUP : PEER_C2C,
+      salience: 0.3 + ((i * 37) % 70) / 100,
+      lastSeen: NOW - (i % 400) * DAY / 4,
+      created: NOW - (i % 400) * DAY / 4,
+    })
+  }
+  const times = []
+  for (let k = 0; k < 60; k++) {
+    const t0 = performance.now()
+    rankMemories({ store, query: `${words[k % words.length]} 相关 记忆`, subject: QQ, conv: PEER_C2C, now: NOW })
+    times.push(performance.now() - t0)
+  }
+  times.sort((a, b) => a - b)
+  const p99 = times[Math.min(times.length - 1, Math.floor(times.length * 0.99))]
+  assert.ok(p99 < 50, `886 条库 rankMemories P99 应 <50ms（§5 目标 <5ms，这里留 CI 余量），实际 ${p99.toFixed(1)}ms`)
+})
+
+test('候选只有一次全库 FTS 扫描：别人的大量同词记忆不会把本 subject 的相关条目挤掉', () => {
+  const { store } = mkStore()
+  // 20 条「别人」的同词记忆（它们会占满 bm25 排名）+ 1 条关于本 subject 的相关记忆
+  for (let i = 0; i < 20; i++) {
+    addMem(store, { text: `别人说的开会安排第 ${i} 条`, subject: '9999999999', conv: PEER_GROUP, salience: 0.6 })
+  }
+  const mine = addMem(store, { text: '他说的开会安排：下周三下午三点', salience: 0.8 })
+  const ranked = rankMemories({ store, query: '开会 安排', subject: QQ, conv: PEER_C2C, now: NOW, contextSince: false, limitCandidates: 40 })
+  assert.ok(ranked.items.some(i => i.id === mine), `本 subject 的相关记忆不应被别人的同词记忆挤掉：${JSON.stringify(ranked.items.map(i => i.text))}`)
+})
+
 test('rankMemories 缺 store 明确报错；searchForPrompt 不传 store 也走同一条错', () => {
   assert.throws(() => rankMemories({ query: '开会' }), /store/)
   assert.throws(() => searchForPrompt({ query: '开会' }), /store/)
