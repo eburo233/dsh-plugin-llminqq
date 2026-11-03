@@ -349,9 +349,9 @@ bili_frames(bvid, at: [30, 90])          ← 定点看某几秒
 **这件事你不用管**，桥内定时任务自动跑（插件版不需要 systemd）：
 
 ```bash
-# 手动触发（路径以实际安装为准）
-python3 "<记忆目录>/run.py" memctl reflect --peer c2c-1000000001   # 单个对端
-python3 "<记忆目录>/run.py" memctl reflect --all                   # 全部
+# 手动触发（记忆脚本在插件包里，不在工作区；路径见附录「记忆代码目录」）
+python3 "<记忆代码目录>/run.py" memctl reflect --peer c2c-1000000001   # 单个对端
+python3 "<记忆代码目录>/run.py" memctl reflect --all                   # 全部
 ```
 
 它用的**不是你的主模型**，是一个独立的小模型，所以不跟你抢额度。
@@ -371,7 +371,7 @@ python3 "<记忆目录>/run.py" memctl reflect --all                   # 全部
 1. **记**：用户交代了「以后要做 / 下次 / 回头 / 答应」的事，当场记一条并钉住
    （钉住 = 不会被 prune 当低价值记忆清掉）：
    ```bash
-   python3 "<记忆目录>/run.py" memctl remember "下周三帮他把服务器迁移到新机器" \
+   python3 "<记忆代码目录>/run.py" memctl remember "下周三帮他把服务器迁移到新机器" \
      --peer c2c-1000000001 --kind procedural --pin
    ```
    一句话写清「做什么 + 对谁 + 什么算完成」，别写成一句情绪话。
@@ -380,8 +380,8 @@ python3 "<记忆目录>/run.py" memctl reflect --all                   # 全部
    就立刻跑 `done`，不要只在回复里说一句「好的」：
    ```bash
    # 关键词选「能唯一指向那件事」的短语；先 --dry-run 看命中，避免误伤
-   python3 "<记忆目录>/run.py" memctl done --match "服务器迁移" --dry-run
-   python3 "<记忆目录>/run.py" memctl done --match "服务器迁移" \
+   python3 "<记忆代码目录>/run.py" memctl done --match "服务器迁移" --dry-run
+   python3 "<记忆代码目录>/run.py" memctl done --match "服务器迁移" \
      --peer c2c-1000000001 --text "已完成：服务器已经迁到新机器"
    ```
    它做两件事：把命中的旧待办**归档**（retired=1，不删，可回溯），
@@ -404,14 +404,12 @@ python3 "<记忆目录>/run.py" memctl reflect --all                   # 全部
 **上面两条命令报错时**（插件版路径/环境可能和脚本版不同）：
 
 - `缺少 LLMINQQ_STATE_DIR` → 命令前加 `LLMINQQ_STATE_DIR="$PWD/memory"`
-  （你的工作区就是 agent 目录，`memory/` 就是默认记忆库所在处）。
+  （默认记忆数据目录就是工作区里的 `memory/`；若改过 `config.memory.stateDir`，
+  用附录里那条命令打印的「记忆数据」实际值）。
 - `拒绝写入生产记忆库` → 命令前加 `MEMCTL_PROD=1`（桥内部调用自己会带；
   手工在 shell 里跑必须显式声明，这是保护真实记忆库不被脚本误写的闸）。
-- 找不到 `run.py` → 插件版的记忆脚本在**插件包里**（`lib/agent/memory/`），
-  不在工作区。先定位一次：
-  ```bash
-  find ~/.dsh -path '*dsh-plugin-llminqq/lib/agent/memory/run.py' 2>/dev/null | head -1
-  ```
+- 找不到 `run.py` → 记忆脚本在**插件包里**、不在工作区，
+  用附录里那条 bridge-config 定位命令打印实际路径（`memory.runner` 就是它）。
 
 ## 12. 调试与验证
 
@@ -440,9 +438,23 @@ for k,v in d['peers'].items():
 
 | 占位符 | 实际值 |
 |---|---|
-| `<工作区>/` | agent 的工作目录（插件数据目录下的 `agent/`） |
-| `<插件数据目录>/` | `~/.dsh/dsh-plugin-llminqq/` |
-| `<记忆目录>/` | `<插件数据目录>/memory/`（memctl.py + run.py 所在处） |
+| `<工作区>/` | agent 的工作目录（默认 `<插件数据目录>/agent/`） |
+| `<插件数据目录>/` | `~/.dsh/dsh-plugin-llminqq/`（DSH 装在别处时按实际位置） |
+| `<记忆代码目录>/` | **插件包**里的 `lib/agent/memory/`：`memctl.py`、`run.py`、`reflection_llm.mjs`（随插件升级、只读，**不在工作区**） |
+| `<记忆数据目录>/` | 默认 `<工作区>/memory/`（即 `<插件数据目录>/agent/memory/`）：`mem.db`、`digest.md`、`style.db`…；可用 `config.memory.stateDir`（桥会转成 `LLMINQQ_STATE_DIR`）覆盖 |
 | `1000000001` | 示例 QQ 号，实际用你对话对方的真实号码 |
 
-**不知道具体路径？** 用 `pwd` 看看你在哪；工作区就是你的 cwd。
+**记忆的「代码」和「数据」是两个目录**（插件版核心约束）：
+脚本在插件包里（升级会换、只读），数据在 `<记忆数据目录>`（卸载插件不会丢）。
+更早版本的数据目录是 `<插件数据目录>/memory/` 和 `~/.dsh/llminqq/`，
+插件启动时会把它们**自动迁移**到现在的 `<记忆数据目录>`（幂等、不删旧文件），不用手动搬。
+
+**不知道实际路径？** 插件启动时会把权威路径写进 `<插件数据目录>/bridge-config.json`，
+直接用这条命令打印出来（`$PWD` 就是你的工作区 = `<插件数据目录>/agent`）：
+
+```bash
+python3 -c "import json;m=json.load(open('$PWD/../bridge-config.json'))['memory'];print('记忆脚本:',m['runner']);print('记忆数据:',m['dir'])"
+```
+
+输出的「记忆脚本」= `<记忆代码目录>/run.py` 的实际路径，「记忆数据」= `<记忆数据目录>`。
+记不住也没关系：每次用之前跑一下这条命令，把路径填进上面的示例即可。
