@@ -114,8 +114,11 @@ test('sanitizeInboundFileName：结果永不含路径分隔符（这是路径穿
   }
 })
 
-// ── ② 正常下载：群文件 ────────────────────────────────────────────────────
-test('群文件：调 get_group_file_url → 下载 → 落暂存区，返回本机路径', async () => {
+// ── ② 正常下载：群文件（真机形状）──────────────────────────────────────────
+// 真机 file 段（容器内 napcat.mjs 实际实现）：
+//   { file: <文件名>, file_id: <fileUuid>, file_size: <number|string>, url?: <str> }
+// 名字在 file（不是 file_name）；packet 后端可用时直接带 url。
+test('群文件：真机 file 段（名字在 file、file_size 字符串、无 url）→ get_group_file_url → 下载', async () => {
   const gw = fakeGateway(async () => ({ url: 'https://example.com/files/report.pdf' }))
   const { messaging } = makeStack({ gateway: gw })
   const f = stubFetch(async url => {
@@ -125,7 +128,7 @@ test('群文件：调 get_group_file_url → 下载 → 落暂存区，返回本
   try {
     const out = await messaging.downloadInboundFiles(
       { id: '2000000001', scope: 'group' },
-      [{ file_id: 'fid-1', file_name: '报告.pdf', file_size: 11, busid: 102 }],
+      [{ segKeys: ['file', 'file_id', 'file_size'], file: '报告.pdf', file_id: 'uuid-1', file_size: '11' }],
     )
     assert.equal(out.length, 1)
     assert.equal(out[0].ok, true, `应下载成功：${JSON.stringify(out[0])}`)
@@ -133,23 +136,62 @@ test('群文件：调 get_group_file_url → 下载 → 落暂存区，返回本
     assert.equal(path.dirname(out[0].path), TMP, '文件必须落在暂存区')
     assert.equal(fs.readFileSync(out[0].path, 'utf8'), 'PDF-CONTENT', '内容不对')
     assert.match(path.basename(out[0].path), /报告\.pdf$/, '文件名没保留')
-    // 群文件接口参数：group_id + file_id + busid（漏 busid 群文件会失败）
+    // 真机 handler 只用 {group_id, file_id}：段里没有 busid 就**不能**传 busid: 0
     assert.equal(gw.calls[0].action, 'get_group_file_url')
+    assert.deepEqual(gw.calls[0].params, { group_id: 2000000001, file_id: 'uuid-1' })
+  } finally {
+    f.restore()
+  }
+})
+
+test('群文件：段里带了 busid 就透传（真机忽略它，但别当它必需）', async () => {
+  const gw = fakeGateway(async () => ({ url: 'https://example.com/b.pdf' }))
+  const { messaging } = makeStack({ gateway: gw })
+  const f = stubFetch(async () => okResponse('B'))
+  try {
+    await messaging.downloadInboundFiles(
+      { id: '2000000001', scope: 'group' },
+      [{ file: 'b.pdf', file_id: 'fid-1', file_size: 1, busid: 102 }],
+    )
     assert.deepEqual(gw.calls[0].params, { group_id: 2000000001, file_id: 'fid-1', busid: 102 })
   } finally {
     f.restore()
   }
 })
 
+test('段里直接带 url（真机 packet 后端）→ 不调任何接口，直接用段 url 下载', async () => {
+  const gw = fakeGateway(async () => { throw new Error('段里有 url 时不该再调接口') })
+  const { messaging, logs } = makeStack({ gateway: gw })
+  const f = stubFetch(async url => {
+    assert.equal(url, 'https://example.com/direct.pdf?rkey=abc')
+    return okResponse('DIRECT', 'application/pdf')
+  })
+  try {
+    const out = await messaging.downloadInboundFiles(
+      { id: '10001', scope: 'c2c' },
+      [{
+        segKeys: ['file', 'file_id', 'file_size', 'url'],
+        file: '直接.pdf', file_id: 'uuid-2', file_size: '6',
+        url: 'https://example.com/direct.pdf?rkey=abc',
+      }],
+    )
+    assert.equal(out[0].ok, true, `应直接用段 url：${JSON.stringify(out[0])}`)
+    assert.equal(gw.calls.length, 0, '段里有 url 就不该调 gateway（省一次 API、少一个失败点）')
+    assert.ok(logs.some(l => /via event/.test(l)), '日志要记下 url 来源，排查时才知道走的是哪条路')
+  } finally {
+    f.restore()
+  }
+})
+
 // ── ③ 正常下载：私聊文件 ──────────────────────────────────────────────────
-test('私聊文件：调 get_private_file_url（参数是 user_id，不是 group_id）', async () => {
+test('私聊文件：真机形状 → get_private_file_url（参数是 user_id，不是 group_id）', async () => {
   const gw = fakeGateway(async () => ({ url: 'https://example.com/a.zip' }))
   const { messaging } = makeStack({ gateway: gw })
   const f = stubFetch(async () => okResponse('ZIP', 'application/zip'))
   try {
     const out = await messaging.downloadInboundFiles(
       { id: '10001', scope: 'c2c' },
-      [{ file_id: 'fid-2', file_name: 'a.zip', file_size: 3 }],
+      [{ file: 'a.zip', file_id: 'fid-2', file_size: '3' }],
     )
     assert.equal(out[0].ok, true)
     assert.equal(gw.calls[0].action, 'get_private_file_url')
@@ -167,7 +209,7 @@ test('事件里给的大小超上限：不下载、返回原因、不调 gateway
   try {
     const out = await messaging.downloadInboundFiles(
       { id: '2000000001', scope: 'group' },
-      [{ file_id: 'big', file_name: 'big.iso', file_size: 2048 }],
+      [{ file: 'big.iso', file_id: 'big', file_size: '2048' }],
     )
     assert.equal(out[0].ok, false)
     assert.match(out[0].reason, /超过大小上限/)
@@ -187,7 +229,7 @@ test('事件没给大小但响应体超上限：边读边计数挡住，降级�
   try {
     const out = await messaging.downloadInboundFiles(
       { id: '2000000001', scope: 'group' },
-      [{ file_id: 'big2', file_name: 'big.bin' }],
+      [{ file: 'big.bin', file_id: 'big2' }],
     )
     assert.equal(out[0].ok, false)
     assert.match(out[0].reason, /文件过大/)
@@ -251,17 +293,61 @@ test('HTTP 500：不抛错，返回原因（占位文本由 flattenMessage 保�
   }
 })
 
-test('取 url 的接口失败 → 回退用消息段里的 url', async () => {
-  const gw = fakeGateway(async () => { throw new Error('onebot get_group_file_url 失败: retcode=100') })
+test('取 url 接口失败 → get_file 兜底成功，并补上名字/大小（真机兜底返回形状）', async () => {
+  const gw = fakeGateway(async action => {
+    if (action === 'get_group_file_url') throw new Error('onebot get_group_file_url 失败: retcode=100')
+    // 真机 get_file 返回 {file, url, file_size, file_name}
+    return { file: 'fid-3', url: 'https://example.com/fallback.txt', file_size: '4', file_name: '兜底.txt' }
+  })
   const { messaging, logs } = makeStack({ gateway: gw })
-  const f = stubFetch(async () => okResponse('FALLBACK', 'text/plain'))
+  const f = stubFetch(async () => okResponse('OK', 'text/plain'))
   try {
     const out = await messaging.downloadInboundFiles(
       { id: '2000000001', scope: 'group' },
-      [{ file_id: 'f', file_name: 'a.txt', url: 'https://example.com/direct.txt' }],
+      [{ segKeys: ['file_id', 'file_size'], file_id: 'fid-3', file_size: 0 }],
     )
-    assert.equal(out[0].ok, true, `应回退成功：${JSON.stringify(out[0])}`)
+    assert.equal(out[0].ok, true, `应兜底成功：${JSON.stringify(out[0])}`)
+    assert.equal(out[0].name, '兜底.txt', '段里没名字时要用 get_file 返回的 file_name 补上')
+    assert.deepEqual(gw.calls.map(c => c.action), ['get_group_file_url', 'get_file'])
+    assert.deepEqual(gw.calls[1].params, { file: 'fid-3' })
     assert.ok(logs.some(l => /取 url 失败/.test(l)), '失败要留日志（否则线上没法排查）')
+  } finally {
+    f.restore()
+  }
+})
+
+test('所有接口都失败 → 降级原因 + 日志带段字段名（不打印 url 全文）', async () => {
+  const gw = fakeGateway(async () => { throw new Error('timeout') })
+  const { messaging, logs } = makeStack({ gateway: gw })
+  const f = stubFetch(async () => okResponse('x'))
+  try {
+    const out = await messaging.downloadInboundFiles(
+      { id: '2000000001', scope: 'group' },
+      [{ segKeys: ['file', 'file_id', 'file_size', 'url'], file: 'a.bin', file_id: 'fid-x', file_size: 1, url: '' }],
+    )
+    assert.equal(out[0].ok, false)
+    assert.match(out[0].reason, /拿不到下载地址/)
+    const shapeLine = logs.find(l => /段字段=\[file,file_id,file_size,url\]/.test(l))
+    assert.ok(shapeLine, `失败日志必须带段形状，才能分清字段对不上还是网络问题：\n${logs.join('\n')}`)
+    assert.ok(!/https?:\/\//.test(shapeLine), '日志里不该出现下载 URL')
+    assert.equal(f.count(), 0, '连地址都没有就不该发下载请求')
+  } finally {
+    f.restore()
+  }
+})
+
+test('下载失败：日志带段字段名，且不打印带 rkey 的 url 全文', async () => {
+  const secret = 'https://example.com/x?rkey=SECRET-VALUE'
+  const { messaging, logs } = makeStack()   // 段里直接给 url，不调 gateway
+  const f = stubFetch(async () => { throw new Error('network down') })
+  try {
+    const out = await messaging.downloadInboundFiles(
+      { id: '2000000001', scope: 'group' },
+      [{ segKeys: ['file', 'file_id', 'file_size', 'url'], file: 'a.bin', file_id: 'fid-x', file_size: 1, url: secret }],
+    )
+    assert.equal(out[0].ok, false)
+    assert.ok(logs.some(l => /段字段=\[file,file_id,file_size,url\]/.test(l)), '失败日志必须带段形状')
+    assert.ok(!logs.some(l => l.includes('SECRET-VALUE')), '日志不能打印下载 URL（带 rkey 的凭证）')
   } finally {
     f.restore()
   }
@@ -283,7 +369,7 @@ test('单条消息最多处理 5 个文件，多出来的给原因', async () =>
   const { messaging } = makeStack({ gateway: gw })
   const f = stubFetch(async () => okResponse('x'))
   try {
-    const files = Array.from({ length: 7 }, (_, i) => ({ file_id: `f${i}`, file_name: `f${i}.bin`, file_size: 1 }))
+    const files = Array.from({ length: 7 }, (_, i) => ({ file: `f${i}.bin`, file_id: `f${i}`, file_size: 1 }))
     const out = await messaging.downloadInboundFiles({ id: '2000000001', scope: 'group' }, files)
     assert.equal(out.filter(r => r.ok).length, 5, '只该下载 5 个')
     assert.equal(gw.calls.length, 5)
@@ -311,7 +397,7 @@ test('文件名穿越：落盘仍在暂存区，文件名已净化', async () =>
   try {
     const out = await messaging.downloadInboundFiles(
       { id: '2000000001', scope: 'group' },
-      [{ file_id: 'f', file_name: '../../../../tmp/evil.sh', file_size: 9 }],
+      [{ file: '../../../../tmp/evil.sh', file_id: 'f', file_size: '9' }],
     )
     assert.equal(out[0].ok, true)
     assert.equal(path.dirname(out[0].path), TMP, '路径穿越了！')
@@ -338,4 +424,20 @@ test('index.js：上下文注入【对方发来了文件】+ 本机路径 + 阅�
   assert.match(SRC, /文件下载失败：/, '失败原因必须进上下文')
   assert.match(SRC, /read_image/)
   assert.match(SRC, /不要把文件内容原样贴出去/)
+})
+
+test('index.js：群在线文件/文件夹 → 只占位、不走下载，上下文说明拿不到内容', () => {
+  // 真机 onlinefile 段（群在线文件/文件夹）没有 url，进 files 只会白调一轮接口再失败
+  assert.match(SRC, /seg\.type === 'onlinefile'/, 'flattenMessage 没接 onlinefile 段')
+  assert.match(SRC, /const onlineFiles = \[\]/, '没有单独收集 onlinefile 元数据')
+  assert.match(SRC, /onlineFiles\.push\(\{/, 'onlinefile 没进 onlineFiles')
+  assert.match(SRC, /segKeys: Object\.keys\(d\)\.slice\(0, 12\)/, '文件段要记原始字段名，失败日志才看得出字段对不上')
+  // 上下文：拿不到内容 + 让人怎么传
+  assert.match(SRC, /【他发的是群在线文件\/文件夹，桥拿不到内容】/)
+  assert.match(SRC, /没有下载地址/)
+  assert.match(SRC, /私聊发给你/)
+  assert.match(SRC, /截图/)
+  // 忙时排队/合并轮透传（否则合并轮里这段说明会丢）
+  assert.match(SRC, /onlineFiles: flat\.onlineFiles \?\? \[\]/, '入队时没带 onlineFiles')
+  assert.match(SRC, /onlineFiles: allOnlineFiles/, '合并轮 _mergedExtras 没带 onlineFiles')
 })

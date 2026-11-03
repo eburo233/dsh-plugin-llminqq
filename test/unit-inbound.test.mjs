@@ -80,6 +80,32 @@ const placeholderCases = [
     want: '[文件] receipt.png (1 KB)',
   },
   {
+    // 真机形状（容器内 napcat.mjs）：名字在 file，file_size 是字符串，packet 后端还会带 url
+    name: '文件（真机形状）：名字在 file + file_size 字符串 + url',
+    seg: {
+      type: 'file',
+      data: { file: '真机.pdf', file_id: 'uuid-1', file_size: '2048', url: 'https://example.com/f?rkey=x' },
+    },
+    want: '[文件] 真机.pdf (2 KB)',
+  },
+  {
+    // 群在线文件/文件夹是独立段（onlinefile），**没有 url**
+    name: '群在线文件（真机 onlinefile 段）',
+    seg: {
+      type: 'onlinefile',
+      data: { msgId: '1', elementId: '2', fileName: '群资料.zip', fileSize: '2048', isDir: false },
+    },
+    want: '[群在线文件] 群资料.zip (2 KB)',
+  },
+  {
+    name: '群在线文件夹（isDir=true）',
+    seg: {
+      type: 'onlinefile',
+      data: { msgId: '1', elementId: '2', fileName: '课件', fileSize: 0, isDir: true },
+    },
+    want: '[群在线文件夹] 课件',
+  },
+  {
     name: '文件：拿不到名字 → 明确说未知，而不是空',
     seg: { type: 'file', data: { size: 10 } },
     want: '[文件] (未知文件名) (10 B)',
@@ -130,6 +156,8 @@ test('flattenMessage：文件只给占位；元数据单独收集，不塞进正
     file_size: 999,
     busid: undefined,
     url: 'http://192.168.1.9:3000/get_file?file_id=abc',
+    // 原始段字段名（只名字不取值）：真机字段对不上时失败日志靠它定位
+    segKeys: ['name', 'size', 'url', 'file_id'],
   }])
 })
 
@@ -142,12 +170,49 @@ test('flattenMessage：多个文件段都收集，字段齐全（file_id/file_na
   assert.equal(flat.files.length, 2)
   assert.deepEqual(flat.files[0], {
     file_id: 'g1', file_name: 'a.pdf', file_size: 123, busid: 102, url: '',
+    segKeys: ['file_id', 'file', 'file_size', 'busid'],
   })
   assert.deepEqual(flat.files[1], {
     file_id: 'g2', file_name: 'b.pptx', file_size: 456, busid: 102, url: '',
+    segKeys: ['file_id', 'name', 'size', 'busid'],
   })
   // 文字消息没有文件段 → files 为空数组（不是 undefined）
   assert.deepEqual(flattenMessage([{ type: 'text', data: { text: 'hi' } }]).files, [])
+})
+
+test('flattenMessage：真机 file 段（file/file_id/file_size/url）→ 元数据可直接喂下载', () => {
+  const flat = flattenMessage([{
+    type: 'file',
+    data: { file: '报.pdf', file_id: 'uuid-1', file_size: '2048', url: 'https://example.com/f?rkey=x' },
+  }])
+  assert.equal(flat.text, '[文件] 报.pdf (2 KB)')
+  assert.ok(!flat.text.includes('http'), '占位里不该出现带 rkey 的下载链接')
+  assert.deepEqual(flat.files, [{
+    file_id: 'uuid-1',
+    file_name: '报.pdf',
+    file_size: 2048,
+    busid: undefined,
+    url: 'https://example.com/f?rkey=x',
+    segKeys: ['file', 'file_id', 'file_size', 'url'],
+  }])
+})
+
+test('flattenMessage：onlinefile 段只占位/收元数据，绝不进 files（没有 url，不能走下载）', () => {
+  const flat = flattenMessage([{
+    type: 'onlinefile',
+    data: { msgId: '1', elementId: '2', fileName: '群资料.zip', fileSize: '2048', isDir: false },
+  }])
+  assert.equal(flat.text, '[群在线文件] 群资料.zip (2 KB)')
+  assert.deepEqual(flat.files, [], '群在线文件没有下载地址，进 files 只会白调接口再失败')
+  assert.deepEqual(flat.onlineFiles, [{ name: '群资料.zip', size: 2048, isDir: false }])
+  assert.deepEqual(flat.placeholders, ['[群在线文件] 群资料.zip (2 KB)'])
+
+  const folder = flattenMessage([{
+    type: 'onlinefile',
+    data: { msgId: '3', elementId: '4', fileName: '课件', fileSize: 0, isDir: true },
+  }])
+  assert.equal(folder.text, '[群在线文件夹] 课件')
+  assert.deepEqual(folder.onlineFiles, [{ name: '课件', size: 0, isDir: true }])
 })
 
 // ── ② 不再被「空消息判定」丢掉 ──────────────────────────────────────────────
