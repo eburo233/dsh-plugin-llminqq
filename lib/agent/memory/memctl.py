@@ -24,6 +24,7 @@ v2 按论文的检索公式（Generative Agents, arXiv:2304.03442 §4.1）：
   python3 memory/memctl.py digest                    # 重生成 digest.md（分三层）
   python3 memory/memctl.py recall --peer c2c-1000000001 --query "开会" --top 8
   python3 memory/memctl.py remember "内容" --peer c2c-1000000001 --kind semantic --pin
+  python3 memory/memctl.py done --match "关键词"      # 待办完成：归档旧条目 + 留「已完成：…」结论
   python3 memory/memctl.py consolidate               # 情节→语义提炼
   python3 memory/memctl.py stats                     # 库里有什么
   python3 memory/memctl.py prune                     # 归档低价值记忆
@@ -1071,6 +1072,136 @@ def prune(conn, cutoff=0.15):
     return n
 
 
+# ── 待办完成（done）──────────────────────────────────────────────────────────
+# 为什么是「归档 + 结论」而不是加一个 status 列：
+#   · entries 的 retired 本来就是「这条不再参与检索/摘要/反思」的开关，
+#     recall / digest / reflect / prune / buildTopicHints 全都已经按 retired=0 过滤。
+#     「一件待办完成了」= 「它不该再被当成未了结的事」—— 语义完全对得上。
+#   · 加 status 列意味着每个读路径都要多过滤一次，**漏一个就复发**，而且漏的地方
+#     不会报错（正是这次要修的问题类型：旧待办一直挂在摘要/话题线索里）。
+#   · 代价：retired 分不清「完成」和「低价值被 prune 归档」。目前这两者行为一致；
+#     要回溯区分时，结论条目的固定前缀（已完成：）就是标记，不用重扫历史。
+#   · 只归档不写结论还不够：模型只会发现「那条没了」，不知道「这事已经完成」，
+#     下次聊到仍可能从头再问。结论（kind=semantic + pinned）让它有据可说，
+#     且 pinned 不会被 prune 清掉。
+DONE_PREFIX = "已完成："
+DONE_KIND = "semantic"
+# 钉住本身会把重要性抬到至少 0.8；显式给 0.8 是让结论的 importance 可预期
+# （≈中高），digest 里排在「极重要」的约定之后、普通事实之前。
+DONE_IMPORTANCE = 0.8
+
+
+def _like_escape(s):
+    """转义 LIKE 通配符。
+
+    关键词里可能出现 % 或 _（「100%」「a_b」），不转义的话
+    `--match "100%"` 会把整库都匹配掉。反斜杠一起转义（配合 ESCAPE '\\'）。
+    """
+    return (s or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _done_conclusion_text(row, text=None, match=None):
+    """给一件已完成的待办拟结论句。
+
+    前缀固定成「已完成：」，有两个用处：
+      ① 人/模型在 digest 里一眼看出「已了结」，不会当成未了结的事再问；
+      ② done 自己靠这个前缀**排除结论条目**，否则重复执行时
+         「已完成：<原待办>」也会被 --match 命中，再归档再生成
+         「已完成：已完成：…」—— 幂等就废了（见下面 done 的 SQL 过滤）。
+
+    结论文本按这个优先级选：
+      · --text 显式给的最准，直接用（没带前缀就补上）；
+      · 有 --match 时用**关键词**（「已完成：服务器迁移」）——
+        故意不搬原句：原句常带「下周三/记得/帮我」这类过期指令，
+        钉成 semantic 后模型会把它当**新指令**执行（比如又去提醒一遍）；
+      · 只有 --id 时没有关键词可用，才退到原句（截 60 字），
+        这种情况建议调用方用 --text 补一句准确措辞。
+    """
+    if text:
+        t = text.strip()
+        return t if t.startswith(DONE_PREFIX) else DONE_PREFIX + t
+    kw = (match or "").strip()
+    if kw:
+        return DONE_PREFIX + kw
+    src = re.sub(r"\s+", " ", (row["text"] or "")).strip()
+    if len(src) > 60:
+        src = src[:60] + "…"
+    return DONE_PREFIX + src
+
+
+def done(conn, match=None, ids=None, peer=None, text=None, dry_run=False):
+    """把待办标成「已完成」：归档旧条目 + 补一条钉住的结论记忆。
+
+    用法：
+      done --match "服务器迁移"                # 全库按关键词找（子串，大小写不敏感）
+      done --match "服务器迁移" --peer c2c-1000000001   # 只归档该会话的
+      done --id 42 --id 43                     # 按 id（可多个）
+      done --match "服务器迁移" --dry-run      # 只看命中，不写库
+
+    匹配到**多条**时按 peer 分组：每组归档该 peer 命中的全部条目，并各写一条结论。
+    这样同一件事跨私聊/群聊都有记录时，两边的摘要都说得清「已经做完了」。
+
+    结论文本默认是「已完成：<关键词>」，想更准确就 --text 自己写
+    （见 _done_conclusion_text 为什么**不搬原句**：原句带着过期指令）。
+
+    幂等（重点）：第二次执行同样的 --match 时，原条目已 retired=0→1 不再命中，
+    结论条目又因「已完成：」前缀被排除 → 命中 0 条，一个字都不写。
+    另：结论走 remember() 的 (peer, fp) 去重，即使旧条目又被 ingest 回来
+    （remember 对已 archived 的行只强化、不复活 retired），也不会出现重复结论。
+
+    返回 dict：{rows, archived, conclusions: [{peer, text, new, id}]}
+      rows      命中的活跃条目（main 用来打印，便于核对有没有误伤）
+      archived  实际归档条数（dry-run 恒为 0）
+    """
+    ids = [int(i) for i in (ids or [])]
+    if not ids and not match:
+        raise ValueError("done 需要 --match 关键词 或 --id")
+    where = "retired=0"
+    params = []
+    if ids:
+        where += " AND id IN (%s)" % ",".join("?" * len(ids))
+        params.extend(ids)
+    if match:
+        where += " AND text LIKE ? ESCAPE '\\'"
+        params.append("%" + _like_escape(match) + "%")
+    if peer:
+        where += " AND peer=?"
+        params.append(peer)
+    # ⚠️ 这行是幂等的关键：结论句里带着关键词（默认就是「已完成：<关键词>」），
+    #    不排除的话第二次 done 会把结论自己也归档，再套娃生成「已完成：已完成：…」。
+    where += " AND text NOT LIKE ?"
+    params.append(DONE_PREFIX + "%")
+    rows = conn.execute(
+        "SELECT * FROM entries WHERE " + where +
+        " ORDER BY pinned DESC, importance DESC, id ASC", params
+    ).fetchall()
+    out = {"rows": rows, "archived": 0, "conclusions": []}
+    if not rows:
+        return out
+    by_peer = {}
+    for r in rows:
+        by_peer.setdefault(r["peer"], []).append(r)
+    for p, group in by_peer.items():
+        concl = _done_conclusion_text(group[0], text, match=match)
+        prev = conn.execute(
+            "SELECT id FROM entries WHERE peer=? AND fp=?", (p, fp(concl))
+        ).fetchone()
+        if dry_run:
+            out["conclusions"].append(
+                {"peer": p, "text": concl, "new": prev is None, "id": None})
+            continue
+        for r in group:
+            conn.execute("UPDATE entries SET retired=1 WHERE id=?", (r["id"],))
+        out["archived"] += len(group)
+        rid = remember(conn, p, concl, kind=DONE_KIND, pin=True,
+                       importance=DONE_IMPORTANCE)
+        out["conclusions"].append(
+            {"peer": p, "text": concl, "new": prev is None, "id": rid})
+    if not dry_run:
+        conn.commit()
+    return out
+
+
 def consolidate(conn, min_importance=0.45):
     """情节 → 语义的提炼（论文 §4.2 Reflection 的简化版）。
 
@@ -1395,7 +1526,12 @@ def reflect_all(conn, hours=24, n_min=2, n_max=5, use_llm=True, timeout=90,
 
 
 def digest(conn):
-    """生成 digest.md：按三层 + 重要性排序，不是按时间堆砌。"""
+    """生成 digest.md：按三层 + 重要性排序，不是按时间堆砌。
+
+    只投影 retired=0 的条目 —— 这也是「已完成」的展示口径：
+    被 done 归档的旧待办**不出现**（否则模型会一直把已了结的事当未了结），
+    取而代之的是结论条目（固定前缀「已完成：」，见上面的 done）。
+    """
     peers = [r["peer"] for r in conn.execute(
         "SELECT DISTINCT peer FROM entries WHERE retired=0 ORDER BY peer")]
     lines = [
@@ -1405,7 +1541,8 @@ def digest(conn):
         "",
         "> 分三层：**程序记忆**（约定/规矩，几乎不衰减）→ **语义记忆**（稳定事实）",
         "> → **情节记忆**（具体对话，衰减快）。同层内按综合分排序。",
-        "> ★ = 钉住或极重要；· = 一般。",
+        "> ★ = 钉住或极重要；· = 一般；✅ = **已完成**（别再当未了结的事问后续）。",
+        "> 已归档（retired）的条目不再出现；待办用 `memctl done --match 关键词` 了结。",
         "",
     ]
     LAYERS = [
@@ -1426,7 +1563,14 @@ def digest(conn):
                 continue
             lines.append(f"**{title}**")
             for r in rows[:8]:
-                mark = "★" if (r["pinned"] or r["importance"] >= 0.85) else "·"
+                # 结论条目用 ✅ 而不是 ★：它确实钉住了，但含义是「已了结」，
+                # 和「重要约定」必须一眼分开 —— 否则模型会把完成的待办重新当线索。
+                if (r["text"] or "").startswith(DONE_PREFIX):
+                    mark = "✅"
+                elif r["pinned"] or r["importance"] >= 0.85:
+                    mark = "★"
+                else:
+                    mark = "·"
                 lines.append(f"- {mark} {r['text'][:150]}")
             lines.append("")
     with open(DIGEST, "w", encoding="utf-8") as f:
@@ -1510,6 +1654,14 @@ def main():
     p = sub.add_parser("prune", help="归档低分记忆")
     p.add_argument("--cutoff", type=float, default=0.15)
 
+    p = sub.add_parser("done", help="待办完成：归档旧条目 + 补一条「已完成：…」结论")
+    p.add_argument("--match", default=None, help="按文本关键词找（子串匹配，大小写不敏感）")
+    p.add_argument("--id", dest="ids", type=int, action="append",
+                   help="按条目 id（可重复传；和 --match 同时给时取交集）")
+    p.add_argument("--peer", default=None, help="只处理这个 peer（如 c2c-1000000001）")
+    p.add_argument("--text", default=None, help="自定义结论措辞（默认「已完成：<关键词>」）")
+    p.add_argument("--dry-run", action="store_true", help="只打印命中，不写库")
+
     sub.add_parser("consolidate", help="情节→语义提炼（粗糙拼接，不调模型）")
 
     p = sub.add_parser("reflect", help="定期反思：调模型把情节真正提炼成语义记忆")
@@ -1569,6 +1721,24 @@ def main():
         print(f"已写入 {digest(conn)}")
     elif a.cmd == "prune":
         print(f"归档 {prune(conn, a.cutoff)} 条")
+    elif a.cmd == "done":
+        if not a.match and not a.ids:
+            ap.error("done 需要 --match 关键词 或 --id（可先加 --dry-run 看命中）")
+        st = done(conn, match=a.match, ids=a.ids, peer=a.peer,
+                  text=a.text, dry_run=a.dry_run)
+        for r in st["rows"]:
+            print(f"  - #{r['id']} [{r['peer']}] {r['text'][:70]}")
+        if not st["rows"]:
+            print("没有匹配到未归档的待办（可能已经 done 过，或关键词不对）")
+            return 0
+        for c in st["conclusions"]:
+            print(f"  + 结论 [{c['peer']}] {c['text']}"
+                  f"{'' if c['new'] else '（已存在，只强化）'}")
+        # dry-run 时 archived 恒为 0，但用户想看的是「将要归档几条」，所以用命中数。
+        archived = len(st["rows"]) if a.dry_run else st["archived"]
+        print(f"{'[dry-run] ' if a.dry_run else ''}"
+              f"归档 {archived} 条待办 · 结论 {len(st['conclusions'])} 条")
+        return 0
     elif a.cmd == "consolidate":
         print(f"生成 {consolidate(conn)} 条语义记忆")
     elif a.cmd == "reflect":
