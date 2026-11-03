@@ -30,6 +30,24 @@
 - 第三方插件 `dsh-expression` 的 `memeRoot` 指向同一份图库（Web 面板与 QQ 共用），
   `qq-meme` skill 的学习结果也落在这里。
 - AGENTS.md 表情包章节改成「按 caption/keywords 找含义」，并写明学习走 `qq_meme.py learn`。
+- **入站非图片消息不再被丢掉**：`file / voice / video / mface / contact /
+  location / dice / rps / onlinefile / 未知段` 都生成人类可读占位（`[文件] 名字 (大小)`、
+  `[语音] 5s`、`[群在线文件] ...`），带这些段的消息不再命中「空消息，忽略」被整条丢弃；
+  上下文明确告诉模型「你只能看到占位描述，看不到文件/语音内容」。
+- **入站文件真机下载**：按 NapCat 真机段形状实现（文件名在 `data.file`、段内可能直接带
+  `url`）。下载顺序：段内 url → `get_group_file_url` / `get_private_file_url` →
+  `get_file` 兜底 → 降级原因。落暂存区，走 `safeFetchBuffer`（SSRF/私网/重定向复检），
+  单文件 20MB / 单条 5 个 / 30s 超时，失败只降级不炸轮次；群在线文件（`onlinefile`）
+  无 url，只占位并说明「拿不到内容，让他私聊传或截图」。
+- **设置页「入站文件」卡片**：开关 / 单文件上限 / 单条数量 / 超时，经 `bridgeConfig()`
+  透传到桥（此前只有桥侧默认值，设置页改了不生效 = 假配置）。
+- **QQ 语音转文字（可选，默认关）**：语音段 url 下到暂存区 → faster-whisper（CPU int8，
+  默认 `small` + `zh`）→ 注入【对方发来一条语音】+ 转写文本；同一 `file_id` 去重、
+  整条消息 30s 总预算、超时/失败降级为「没转写成功」。首次开启下载 ~480MB 模型，
+  可用 tiny/base/medium，funasr 作为可选引擎（import 失败自动回退）。
+- **待办完成后可更新**：新增 `memctl done --match/关键词 | --id`：归档旧待办（`retired=1`）
+  并留一条「已完成：…」结论；`digest.md` 用 ✅ 渲染已了结事项，主动搭话的话题线索
+  跳过 `已完成：` 条目。
 
 ### Changed
 
@@ -49,6 +67,20 @@
 - **主动路径也扣精力**：接话/主动搭话/戳一戳（`dispatchOutbound`）发送后扣一次；
   入站路径的扣减从 `handleInbound` 挪到 `deliverReply` 真正发出之后，
   按**实际发出的正文**长度算，不会重复扣、也不会在静默时白扣。
+- **主动搭话 / 接话补上【当前时间】**：与入站回复共用 `currentTimeLine()`
+  （`当前时间：2026-11-03 12:35 周一（下午）`）—— 之前两条主动路径拿不到任何时间信息，
+  容易说错「你昨天……」这类时间锚。
+- **`chunkText` 改为边界感知（不再句中腰斩）**：优先在 `，、,。. 空格 换行` 处切；
+  limit 内没有切点就往后找、全文没有切点才硬切；`[AT:] / [SEND_FILE:] / [VOICE:]`
+  控制标记不被劈开。用户实测「像个人」被切成「像个 / 人」的根因是生产
+  `maxReplyChars=50` 处硬切（现已由用户调到 120，代码侧不再硬切正常句子）。
+
+### Fixed
+
+- **GSV 语音参考音色不生效**：GSV 的 `api.py` 对 `refer_wav_path / prompt_text / prompt_language` 是**整组回退** —— 任意一项为空就全部改用启动参数 `-dr/-dt`。桥在参考文本没填时传 `prompt_text: null`，于是设置页选的音频被启动参数里写死的 `reference/ref.wav` 顶掉（「设置页换了声音、QQ 里没变」的根因）。修复：`scripts/start-gsv.mjs` 按设置页参数启动并同步 ref.wav；`messaging.js` 在 promptText 为空时告警而不是静默失败。
+- **NapCat 重启后卡二维码**：`napcat-docker` 的 entrypoint 只有收到 `-q <号>` 才会用本地凭证登录，否则一律扫码 → 容器一重启机器人就失联。新增 `napcat.account` 配置 → compose `ACCOUNT` env（纯数字才写入，防注入）。
+- **NapCat 日志重启就丢**：`fileLog` 写在容器内 `/app/napcat/logs`，但该目录从未挂到宿主机，容器重建即清空。新增 `data/logs:/app/napcat/logs` 挂载 + docker json-file 日志轮转（20m × 3）。
+- **AGENTS.md 记忆目录说明过期**：改为区分「记忆代码目录」（插件包 `lib/agent/memory/`）与「记忆数据目录」（`<数据目录>/agent/memory/`），并给出一条读 `bridge-config.json` 的定位命令。
 
 ## [0.5.4] - 2026-10-31
 
