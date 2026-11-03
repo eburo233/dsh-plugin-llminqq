@@ -8,6 +8,30 @@
 
 ## [未发布]
 
+### Added（记忆 v5 · Step 3：迁移 + 盲评）
+
+- **v4→v5 历史迁移脚本**（`scripts/memory-v4-to-v5.mjs`）：默认 dry-run、v4 只读、生产路径默认拒绝、
+  幂等可重跑。映射：procedural→rule / semantic→fact / episodic→episode；pinned→salience 0.9；
+  `retired=1`→archived（「已完成：」→done，否则 pruned）；scope 按来源显式定
+  （私聊→dm_only、群→public，不因 v4 visibility 全 NULL 就当 public）；is_self 的 273 条进
+  `utterances`（「我说过什么」原文层）而不是 memories；同一批里 162 组重复被合并；
+  注入残留整条跳过；连「v4 截断切掉闭合 `]`」的半个控制标记也有兜底清洗。
+  生产只读快照试跑：`1055 = 612 memories(active 605/archived 7) + 266 utterances + 163 去重 + 8 注入 + 6 空壳`，
+  第二次 `--apply` written=0。
+- **显式日期过期归档**（保守版）：只认文本里自带完整日期（`YYYY-MM-DD`/`YYYY年M月D日`/`M月D日`
+  + created 年推断）且同句 48 字内有时间词的情况；歧义/区间/非法日期一律不猜。
+  试跑新增 archived(expired) 2 条（含「明天(2026-10-26)下午三点开会」）、未来事件设 `valid_until` 1 条、
+  按设计不猜 4 条；`--no-expire-parse` 可回退。
+- **distill supersede 对齐迁移 key**：迁移条目 key 是 sha1、distill 是 `type:subject:topic`，
+  精确匹配不上。新增「同 type+同 subject 相似度」回退（`max(Jaccard, containment)`，阈值 0.5），
+  并加 topic 冲突闸防并列事实误合并、只归档一条、可捞回。迁移副本端到端验证：
+  迁移来的「安全底裤」旧结论被新提炼结论取代（`supersededFromMigratedKey=1`、`brokenChain=0`）。
+- **v4/v5 注入 A/B 盲评工具**（`scripts/memory-ab.mjs`）：只读、生产路径默认拒绝、跑完 sha256 自证；
+  v4 侧走线上真实 `memoryRecallBlock` 口径（注释锚点 + vm 沙箱），v5 侧 `rankMemories`；
+  输出打乱顺序的两栏盲评 markdown（不泄引擎名）+ `--json` 明细 + `--reveal` 揭盲。
+  30 条真实查询盲评（独立判官）：v5 噪音 4/30 vs v4 6/30、相关 19 vs 18、
+  重复注入 13 vs 30、完整注入字数 240 vs 668、P99 5.7ms vs 103ms。
+
 ### Added（记忆 v5 · Step 2：提炼 + 检索 + 读路径切换）
 
 - **提炼 worker**（`lib/agent/memory-v5/distill.mjs` + `distill-prompt.mjs`）：
