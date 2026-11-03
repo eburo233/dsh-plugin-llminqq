@@ -133,6 +133,49 @@ test('defaults: 关键默认值稳定（改默认值必须是有意识的行为�
   assert.equal(typeof d.onebot.wsUrl, 'string')
 })
 
+// ── 入站文件（2026-11-03）：对方发来的文件要不要下载 ───────────────────────
+//
+// 为什么这组默认值要单独立一条测试：这 4 个键是「设置页 → config.media →
+// bridgeConfig → 桥」这条链路的起点。起点写错（比如忘了加键、或者把 20MB 写成
+// 20 字节），后面所有层都跟着错，而且**表现是静默的** —— 桥只会走自己的默认值，
+// 用户看到的是「设置页改了不生效」，最难查。
+test('defaults.media: 入站文件 4 项（开 / 20MB / 5 个 / 30s）', () => {
+  const m = M.defaults().media
+  assert.equal(m.inboundFileEnabled, true,
+    '默认必须是开 —— 用户 2026-11-03 已明确同意「文件直接下载给模型读」')
+  assert.equal(m.maxInboundFileBytes, 20 * 1024 * 1024, '单文件默认上限 20MB')
+  assert.equal(m.maxInboundFiles, 5, '单条最多 5 个（防一次发 50 个拖垮桥）')
+  assert.equal(m.inboundFileTimeoutMs, 30000, '默认超时 30s')
+  // 和后端 clamp 区间一致性：默认值必须落在 lib/index.js INBOUND_FILE_LIMITS 里，
+  // 否则「默认值自己会被 clamp 改掉」—— 改一个数字要同时想清楚两边。
+  assert.ok(m.maxInboundFileBytes >= 1 * 1024 * 1024 && m.maxInboundFileBytes <= 100 * 1024 * 1024)
+  assert.ok(m.maxInboundFiles >= 1 && m.maxInboundFiles <= 10)
+  assert.ok(m.inboundFileTimeoutMs >= 5000 && m.inboundFileTimeoutMs <= 120000)
+})
+
+test('readConfig: 老配置（还没有入站文件键）→ 默认值补齐，不崩', { skip: skipDisk }, () => {
+  resetDir()
+  // 模拟升级前存下来的配置：media 段只有旧的三个键
+  writeConfigFile({ media: { enabled: true, maxFileBytes: 1048576 } })
+  const cfg = M.readConfig()
+  assert.equal(cfg.media.inboundFileEnabled, true)
+  assert.equal(cfg.media.maxInboundFileBytes, 20 * 1024 * 1024)
+  assert.equal(cfg.media.maxInboundFiles, 5)
+  assert.equal(cfg.media.inboundFileTimeoutMs, 30000)
+  assert.equal(cfg.media.maxFileBytes, 1048576, '老键不能被新键挤掉')
+})
+
+test('saveConfig: 只改一个入站文件键时，同段其余键保留', { skip: skipDisk }, () => {
+  resetDir()
+  M.saveConfig({ media: { inboundFileEnabled: false } })
+  M.saveConfig({ media: { maxInboundFiles: 2 } })
+  const cfg = M.readConfig()
+  assert.equal(cfg.media.inboundFileEnabled, false, '第二次保存把开关丢了')
+  assert.equal(cfg.media.maxInboundFiles, 2)
+  assert.equal(cfg.media.maxInboundFileBytes, 20 * 1024 * 1024, '没提到的同段键必须留在磁盘上')
+  assert.equal(cfg.media.maxFileBytes, 10485760)
+})
+
 test('路径常量: 全部落在 dataDir() 下', { skip: skipDisk }, () => {
   resetDir()
   assert.equal(M.dataDir(), EXPECTED_DIR)

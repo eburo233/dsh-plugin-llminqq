@@ -1483,6 +1483,10 @@ window.__ModuleLoader__.load({
       const p = cfg.policy || {}
       const f = cfg.features || {}
       const tts = cfg.tts || {}
+      // 入站文件参数长在 media 段（和 stagingDir / maxFileBytes 同一节）。
+      // 老配置里没有这 4 个键 → 这里给的是和 lib/store.js defaults 一致的默认值，
+      // 保证设置页打开时不显示空白（空白会让用户以为坏了，其实只是没配过）。
+      const media = cfg.media || {}
       // 🔴 2026-10-31 修：语音卡片的 API Key 输入要用 data.secrets 判断「已设置」，
       //   之前这个组件没接 data → render 时 ReferenceError: secrets is not defined
       //   → 整个「行为」Tab 白屏（React 抛错后不再渲染子树）。
@@ -1496,6 +1500,10 @@ window.__ModuleLoader__.load({
 
       const listToText = a => Array.isArray(a) ? a.join('\n') : ''
       const textToList = t => String(t).split(/[\s,，]+/).map(x => x.trim()).filter(Boolean)
+      // 入站文件的三个数字都用它收口：输入框的 min/max 只是浏览器的提示，
+      // 用户能手打 0 或 999 进去；这里先夹一次，config.json 里就不会留下
+      // 桥要读的脏值（插件侧 bridgeConfig 还有第二道 clamp，双保险）。
+      const clampInt = (v, lo, hi) => Math.min(hi, Math.max(lo, Math.round(Number(v) || 0)))
 
       return h(React.Fragment, null,
         h('div', { className: 'card' },
@@ -1642,6 +1650,54 @@ window.__ModuleLoader__.load({
             on: f.learning === true,
             onChange: v => saveConfig({ features: { learning: v } }),
           }),
+        ),
+
+        // ── 入站文件：别人发来的文件，要不要下载给模型读 ──────────────────
+        // 为什么这张卡必须存在：桥侧早就实现了「真的下载 + 交给模型 read」，
+        // 但参数一直没被 bridgeConfig 透传 —— 用户改了也不生效（假配置）。
+        // 现在链路口径是：这张卡 → config.media.* → lib/index.js bridgeConfig()
+        // → bridge-config.json → lib/bridge/messaging.js 读它。
+        // 放在「行为」页而不是「高级」页：它和「戳一戳/语音」是一类东西
+        // （收进来的消息怎么处理），普通用户会来找。
+        h('div', { className: 'card' },
+          h('div', { className: 'card-title' }, '入站文件',
+            h('span', { className: 'muted', style: { marginLeft: 'auto', fontWeight: 400 } },
+              '对方发来的文件')),
+          h(SwitchRow, {
+            label: '允许接收并下载文件',
+            desc: '开启后会把群文件 / 私聊文件下到暂存区，让模型能读内容；关闭只留一行占位',
+            on: media.inboundFileEnabled !== false,
+            onChange: v => saveConfig({ media: { inboundFileEnabled: v } }),
+          }),
+          // 关掉开关时把数字输入藏起来：关着还能改上限会让人分不清「到底哪层生效」
+          media.inboundFileEnabled !== false ? h(React.Fragment, null,
+            h('div', { className: 'grid2' },
+              h(Field, { label: '单文件上限（MB）', sub: '超过的不下载，只在上下文里标一句「太大」' },
+                h(NumberInput, {
+                  // 配置里存的是**字节**，页面按 MB 显示（用户不该去数 20971520）。
+                  value: Math.round((media.maxInboundFileBytes ?? 20971520) / 1048576),
+                  min: 1, max: 100,
+                  onCommit: v => saveConfig({ media: { maxInboundFileBytes: clampInt(v, 1, 100) * 1048576 } }),
+                })),
+              h(Field, { label: '单条最多几个', sub: '一次发一堆文件时只处理前几个，剩下的只标名字' },
+                h(NumberInput, {
+                  value: media.maxInboundFiles ?? 5, min: 1, max: 10,
+                  onCommit: v => saveConfig({ media: { maxInboundFiles: clampInt(v, 1, 10) } }),
+                })),
+            ),
+            h(Field, { label: '下载超时（秒）',
+              sub: '取下载地址 + 下载合计超过这个时间就放弃，不拖住整轮回复' },
+              h(NumberInput, {
+                value: Math.round((media.inboundFileTimeoutMs ?? 30000) / 1000),
+                min: 5, max: 120,
+                onCommit: v => saveConfig({ media: { inboundFileTimeoutMs: clampInt(v, 5, 120) * 1000 } }),
+              })),
+          ) : null,
+          // 桥只在启动时读一次 bridge-config.json（见 lib/index.js 里那条注释），
+          // 所以这几个值必须重启桥才生效。常见情况是保存后桥会自动重启（800ms
+          // 防抖），但桥没在跑 / 自动重启失败时要告诉用户手动去「运行」页点重启，
+          // 否则他会以为没保存成功，反复点。
+          h('div', { className: 'hint' }, '保存后桥会自动重启一下才生效；没自动重启就去「运行」页点「重启桥」。'),
         ),
 
         // ── 语音（TTS）────────────────────────────────────────────────────
