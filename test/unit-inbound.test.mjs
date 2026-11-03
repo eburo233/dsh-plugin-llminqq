@@ -111,6 +111,23 @@ const placeholderCases = [
     want: '[文件] (未知文件名) (10 B)',
   },
   { name: '语音：带时长', seg: { type: 'record', data: { duration: 5 } }, want: '[语音] 5s' },
+  {
+    // 真机 NapCat 发的是 voice（不是文档里的 record），且常常没有 duration
+    name: '语音（真机 voice 段，带 url/path/file_size）',
+    seg: {
+      type: 'voice',
+      data: {
+        file: '7a.amr', path: '/app/napcat/7a.amr',
+        url: 'https://example.com/7a.amr?rkey=x', file_size: '1234',
+      },
+    },
+    want: '[语音]',
+  },
+  {
+    name: '语音（真机 voice 段带 duration）',
+    seg: { type: 'voice', data: { file: 'b.silk', duration: '4' } },
+    want: '[语音] 4s',
+  },
   { name: '语音：时长为字符串', seg: { type: 'record', data: { duration: '3' } }, want: '[语音] 3s' },
   { name: '语音：没有时长只说语音，不编时长', seg: { type: 'record', data: {} }, want: '[语音]' },
   { name: '视频', seg: { type: 'video', data: {} }, want: '[视频]' },
@@ -213,6 +230,29 @@ test('flattenMessage：onlinefile 段只占位/收元数据，绝不进 files（
   }])
   assert.equal(folder.text, '[群在线文件夹] 课件')
   assert.deepEqual(folder.onlineFiles, [{ name: '课件', size: 0, isDir: true }])
+})
+
+test('flattenMessage：真机 voice 段收元数据（转写要用），正文只有 [语音] 占位', () => {
+  const flat = flattenMessage([{
+    type: 'voice',
+    data: {
+      file: '7a.amr', path: '/app/napcat/7a.amr',
+      url: 'https://example.com/7a.amr?rkey=x', file_size: '2048',
+    },
+  }])
+  assert.equal(flat.text, '[语音]')
+  assert.ok(!flat.text.includes('http'), '占位里不该出现带 rkey 的音频地址')
+  assert.deepEqual(flat.voices, [{
+    file_id: '',
+    file: '7a.amr',
+    path: '/app/napcat/7a.amr',
+    url: 'https://example.com/7a.amr?rkey=x',
+    file_size: 2048,
+    duration: 0,
+    segKeys: ['file', 'path', 'url', 'file_size'],
+  }])
+  // 文字消息没有语音段 → voices 为空数组（不是 undefined）
+  assert.deepEqual(flattenMessage([{ type: 'text', data: { text: 'hi' } }]).voices, [])
 })
 
 // ── ② 不再被「空消息判定」丢掉 ──────────────────────────────────────────────
@@ -320,6 +360,17 @@ test('上下文注入只在真有占位时发生（纯文字消息不能多出�
   // 用 flat.placeholders 判定，而不是「有 segTypes」之类 —— 图片/文字/卡片都不该触发
   assert.match(SRC, /const nonTextPlaceholders = \[\.\.\.\(flat\.placeholders \?\? \[\]\)/)
   assert.match(SRC, /if \(nonTextPlaceholders\.length\) \{/)
+})
+
+test('语音转写：上下文注入 + 排队透传（task-10，按真机 voice 段）', () => {
+  // 成功/失败都必须写进上下文，否则模型会假装听过、或把 [语音] 占位当正文
+  assert.match(SRC, /【对方发来一条语音】/, '缺「对方发来一条语音」上下文')
+  assert.match(SRC, /转写可能有错/, '要提示转写可能有错（同音字/口音）')
+  assert.match(SRC, /没转写成功/, '失败要明说没转写成功，别让模型假装听过')
+  assert.match(SRC, /transcribeInboundVoices/, 'handleInbound 没接转写')
+  // 转写结果在忙时排队/合并轮里要透传（音频临时文件已删，合并轮不能重转）
+  assert.match(SRC, /voiceTranscripts,/, '入队时没带 voiceTranscripts')
+  assert.match(SRC, /voiceTranscripts: allVoiceTranscripts/, '合并轮 _mergedExtras 没带 voiceTranscripts')
 })
 
 test('忙时排队/合并轮也要把占位带过去（否则那条文件消息的说明会丢）', () => {

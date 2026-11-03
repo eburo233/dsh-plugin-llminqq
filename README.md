@@ -118,6 +118,7 @@ NapCat 负责登录 QQ 和收发消息，插件把消息交给配置好的模型
 | `logs/bridge.out`、`logs/bridge.log` | 桥的输出与自己的日志 | 设置页「运行」页读 `bridge.out` 末尾 |
 | `agent/persona/persona.md` | 人格文件 | 每轮重读，改完不用重启 |
 | `agent/memory/` | 记忆与语料：`mem.db`、`digest.md`、风格样本、`lexicon.json`、`corpus/`、`log/`、`scheduler.json` | 默认记忆位置，可用 `memory.stateDir` 改 |
+| `agent/asr-models/` | 语音转文字用的 whisper 模型缓存（HF_HOME） | 开着语音转写才会出现；删掉 = 下次重新下载 |
 | `state/` | 桥运行态（会话映射等） | 删了会丢会话续接 |
 | `.qq-media/`、`qr.png`、`compose.yaml`、`napcat/` | 图片暂存、二维码、容器编排与数据卷 | 删 `napcat/` 要重新扫码 |
 
@@ -125,6 +126,30 @@ NapCat 负责登录 QQ 和收发消息，插件把消息交给配置好的模型
 `~/.dsh/llminqq/`，插件加载时会自动**复制**迁移（不删旧目录、可重复执行）。
 换盘改 `config.json` 的 `memory.stateDir`。
 **备份**：记忆页「导出」把记忆库和语料打包成 zip；写入正忙时直接打包可能拿到不一致的库，要绝对稳就先停桥再导出（整目录拷贝同理）。备份含聊天内容，别随手发人。
+
+## 语音转文字（可选，默认关）
+
+QQ 语音消息本身只有 `[语音] 5s` 占位，模型不知道对方说了什么。开启后，桥会先
+把语音下到暂存区，再调本机 **faster-whisper**（CPU + int8，默认 `small` 模型、
+中文）转成文字，然后把文字和「转写可能有错，不确定就再问」一起塞进上下文；
+失败/超时（默认 30 秒，可用设置页改）就只标一句「没转写成功」，**不会拖住正常回复**。
+
+打开方式：设置页 →「行为」→「语音转文字」。默认关，因为首次使用有成本：
+
+| 项目 | 成本 |
+|---|---|
+| 依赖 | `pip install faster-whisper`（装进桥用的那个 python；Windows 上通常 `python`，Linux/macOS `python3`） |
+| 模型 | 首次运行自动从 HuggingFace 镜像下载，之后本地缓存：tiny ≈75MB / base ≈145MB / **small ≈480MB（默认）** / medium ≈1.5GB |
+| 速度 | CPU int8 上一条 10 秒语音：tiny/base 约 1–3 秒，small 约 3–8 秒，medium 约 10–25 秒（4 核以上现代 CPU 的粗略值） |
+
+细节：
+
+- 模型缓存在 `<数据目录>/agent/asr-models/`（HF_HOME），删掉就下次重下；不会写进插件包目录，卸载插件也不会把模型留在包里。
+- 默认走 `hf-mirror.com` 镜像（国内直连 HuggingFace 基本拉不动）；想换可以设环境变量 `HF_ENDPOINT`。
+- QQ 语音常见 Amr/Silk 编码，解码靠 faster-whisper 自带的 PyAV/ffmpeg。个别格式（尤其 Silk）解不出来时就是「没转写成功」——不会报错刷屏，失败原因会写进桥日志。
+- 语音段的下载地址优先用消息段里自带的 url（走同一套 SSRF/大小限制）；只有 url 缺失时才试段里的本机路径 —— 那是 NapCat **容器内**路径，桥在宿主机上通常读不到，会明确降级成「没转写成功」。
+- 同一段语音（按 file_id）在内存里只会转写一次；桥重启后缓存丢失，会重转（语音很少，可接受）。
+- 高级配置（一般不用动）在 `config.json` 的 `media.voiceTranscribe`：`engine`（`faster-whisper`/`funasr`）、`pythonBin`、`script`、`timeoutMs`。
 
 ## 架构
 
