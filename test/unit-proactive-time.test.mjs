@@ -147,3 +147,12 @@ test('入站回复也用同一行（三条路径一个时间口径）', () => {
   assert.match(SRC, /timeSceneHint\(hourNow\(\), weekdayNow\(\)\)/,
     '时间场景（时段结论）不能丢 —— 只给一行时间还是会让模型瞎推')
 })
+
+// ── ⑤ 话题线索：跳过「已完成：」条目 ─────────────────────────────────────
+test('buildTopicHints：跳过「已完成：」记忆条目（做完的事不能再当话题）', () => {
+  // 2026-11-03：memory-digest 的 task-5 让待办完成后留一条「已完成：…」结论记忆；
+  // 主动搭话的话题线索如果把它捡起来，就会问「上次那事后来咋样了」—— 而它已经做完了。
+  const body = fnSource('buildTopicHints')
+  assert.match(body, /if \(text\.startsWith\('已完成：'\)\) continue/,
+    '话题线索没跳过「已完成：」条目（会拿做完的事当未了结去问后续）')
+})
