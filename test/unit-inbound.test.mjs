@@ -109,7 +109,7 @@ for (const c of placeholderCases) {
   })
 }
 
-test('flattenMessage：文件只给占位，不下载、不把 url/file_id 塞进正文', () => {
+test('flattenMessage：文件只给占位；元数据单独收集，不塞进正文', () => {
   // 明确锁住「不要自作主张下载」：即便 OneBot 给了 url/file_id，
   // 正文里也只出现名字/大小（模型想知道内容只能问人）。
   const flat = flattenMessage([{
@@ -123,6 +123,31 @@ test('flattenMessage：文件只给占位，不下载、不把 url/file_id 塞�
   assert.equal(flat.text, '[文件] 合同.docx (999 B)')
   assert.ok(!flat.text.includes('http'), '占位里不该出现下载链接')
   assert.ok(!flat.text.includes('file_id'), '占位里不该出现 file_id')
+  // 下载需要的元数据单独放 flat.files（task-6），正文/占位保持干净
+  assert.deepEqual(flat.files, [{
+    file_id: 'abc',
+    file_name: '合同.docx',
+    file_size: 999,
+    busid: undefined,
+    url: 'http://192.168.1.9:3000/get_file?file_id=abc',
+  }])
+})
+
+test('flattenMessage：多个文件段都收集，字段齐全（file_id/file_name/file_size/busid）', () => {
+  const flat = flattenMessage([
+    { type: 'file', data: { file_id: 'g1', file: 'a.pdf', file_size: '123', busid: 102 } },
+    { type: 'file', data: { file_id: 'g2', name: 'b.pptx', size: 456, busid: 102 } },
+    { type: 'text', data: { text: '两个都看看' } },
+  ])
+  assert.equal(flat.files.length, 2)
+  assert.deepEqual(flat.files[0], {
+    file_id: 'g1', file_name: 'a.pdf', file_size: 123, busid: 102, url: '',
+  })
+  assert.deepEqual(flat.files[1], {
+    file_id: 'g2', file_name: 'b.pptx', file_size: 456, busid: 102, url: '',
+  })
+  // 文字消息没有文件段 → files 为空数组（不是 undefined）
+  assert.deepEqual(flattenMessage([{ type: 'text', data: { text: 'hi' } }]).files, [])
 })
 
 // ── ② 不再被「空消息判定」丢掉 ──────────────────────────────────────────────
@@ -215,13 +240,14 @@ test('多个非文字段：placeholders 全记录（上下文逐条列出）', (
   assert.equal(flat.text, '[文件] a.pdf (1 B)[语音] 2s[视频]')
 })
 
-// ── ④ 提示词必须说清「只能看到占位」────────────────────────────────────────
+// ── ④ 提示词必须说清「只能看到占位 / 文件另给路径」────────────────────────
 // 这部分是 prompt 文案，没法在这里跑一轮真实 LLM，只能锁住源码里有这句话 ——
 // 和 unit-time-context 的做法一致（防止有人删掉上下文还让单测全绿）。
-test('上下文必须明确告诉模型：只能看到占位描述、看不到文件内容', () => {
+// 2026-11-03（task-6）改成「文件会下载、但不解析内容」，所以断言也跟着改。
+test('上下文必须明确告诉模型：只能看到占位描述、桥不解析文件内容', () => {
   assert.match(SRC, /你只能看到占位描述/, '缺「只能看到占位描述」这句，模型会假装看过文件')
-  assert.match(SRC, /看不到文件/, '必须明确说看不到文件内容')
-  assert.match(SRC, /没有下载\/解析/, '必须说明桥没有取内容（不是取失败了）')
+  assert.match(SRC, /不解析文件内容/, '必须说明桥不解析内容（不是看过了）')
+  assert.match(SRC, /【对方发来了文件】/, '下载成功的文件必须在上下文里给出【对方发来了文件】+ 本地路径')
   assert.match(SRC, /别假装看过文件内容/, '要明确禁止编造文件内容')
 })
 
@@ -236,4 +262,7 @@ test('忙时排队/合并轮也要把占位带过去（否则那条文件消息�
   // 合并轮是虚拟 text 段，所以要把 placeholders 单独透传到 _mergedExtras。
   assert.match(SRC, /placeholders: flat\.placeholders \?\? \[\]/, '入队时没带 placeholders')
   assert.match(SRC, /placeholders: allPlaceholders/, '合并轮 _mergedExtras 没带 placeholders')
+  // 已下载的文件路径同理：合并轮不能再下（链接可能过期），必须透传
+  assert.match(SRC, /inboundFiles,/, '入队时没带 inboundFiles')
+  assert.match(SRC, /inboundFiles: allInboundFiles/, '合并轮 _mergedExtras 没带 inboundFiles')
 })
