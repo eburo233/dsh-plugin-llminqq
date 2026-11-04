@@ -8,6 +8,18 @@
 
 ## [未发布]
 
+### Fixed（语音转写全链路修复，2026-11-04）
+
+- **QQ 语音转写上线以来从未成功过**（每条都「转写超时（30s），已放弃」），复盘是三层叠加，
+  详见 [docs/VOICE-ASR-POSTMORTEM-2026-11-04.md](docs/VOICE-ASR-POSTMORTEM-2026-11-04.md)：
+  ① whisper-small（484MB）在 30s 预算下永远下不完——桥超时 SIGKILL、下次从头再下，死循环；
+  已清 `.incomplete` 残留并完成预下载（`agent/asr-models/hub/`）。
+  ② asr-venv 里 `av==19.0.2` 与 faster-whisper 1.2.1 不兼容
+  （`av.open(metadata_errors=…)` 参数已删，一解码就炸），降到 `av==14.0.1`。
+  ③ **QQ 语音 `.amr` 实际是 silk v3**（头 `\x02#!SILK_V3`），ffmpeg/whisper 整条解不了；
+  `transcribe.py` 新增 silk 嗅探 + `pysilk`（pip 名 `silk-python`）转临时 wav，
+  非 silk 文件路径不变，临时文件用完即删。真机 3 条语音全部转成功，单条含模型加载 4.3s。
+
 ### Added（记忆 v5 · Step 3：迁移 + 盲评）
 
 - **v4→v5 历史迁移脚本**（`scripts/memory-v4-to-v5.mjs`）：默认 dry-run、v4 只读、生产路径默认拒绝、

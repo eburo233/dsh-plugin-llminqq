@@ -40,6 +40,72 @@ HuggingFace 新存储（Xet）国内镜像不代理，不关会 401（legacy 脚
 import argparse
 import os
 import sys
+import tempfile
+
+
+def _looks_like_silk(data):
+    """QQ 语音的真实格式：文件头（可能有 1 字节 \x02 前缀）是 #!SILK_V3。
+
+    扩展名一律叫 .amr，但那不是 AMR —— ffmpeg/whisper 直接解会
+    「Invalid data found when processing input」。2026-11-04 实测：
+    模型和依赖全修好后卡在这，三层问题的最后一层。
+    """
+    body = data[1:] if data[:1] == b'\x02' else data
+    return body[:9] == b'#!SILK_V3'
+
+
+def _silk_to_wav(src):
+    """把 QQ silk 语音解成临时 wav，返回新路径（失败返回 None，调用方用原文件）。
+
+    解码用 pysilk（pip install silk-python，导入名是 pysilk；wheel 自带
+    预编译后端，pip 能直接装）。pysilk.decode 收文件对象、吐 s16le PCM，
+    采样率按 silk 惯例拿 24k（faster-whisper 内部反正重采样到 16k）。
+    """
+    try:
+        data = open(src, 'rb').read()
+    except Exception as e:
+        print('[asr] 读音频失败：%s' % e, file=sys.stderr)
+        return None
+    if not _looks_like_silk(data):
+        return None
+    try:
+        import io
+        import wave
+        import pysilk
+    except Exception as e:
+        print('[asr] QQ 语音是 silk 格式但解不了（缺 pysilk？）：%s' % e, file=sys.stderr)
+        print('[asr] 装它：<pythonBin> -m pip install silk-python', file=sys.stderr)
+        return None
+    try:
+        out = io.BytesIO()
+        pysilk.decode(io.BytesIO(data), out, 24000)
+        pcm = out.getvalue()
+    except Exception as e:
+        # 带 \x02 前缀解不动的话，去掉头再试一次（各家封装行为不一致）
+        try:
+            out = io.BytesIO()
+            body = data[1:] if data[:1] == b'\x02' else data
+            pysilk.decode(io.BytesIO(body), out, 24000)
+            pcm = out.getvalue()
+        except Exception as e2:
+            print('[asr] silk 解码失败：%s / %s' % (e, e2), file=sys.stderr)
+            return None
+    if not pcm:
+        print('[asr] silk 解码为空', file=sys.stderr)
+        return None
+    try:
+        fd, wav = tempfile.mkstemp(prefix='asr-', suffix='.wav')
+        os.close(fd)
+        with wave.open(wav, 'wb') as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(24000)
+            w.writeframes(pcm)
+        print('[asr] QQ silk 语音已解码为 wav（%.1fs）' % (len(pcm) / 2 / 24000), file=sys.stderr)
+        return wav
+    except Exception as e:
+        print('[asr] 写临时 wav 失败：%s' % e, file=sys.stderr)
+        return None
 
 
 def _utf8_stdio():
@@ -133,26 +199,39 @@ def main():
 
     _setup_hf(args.hf_home)
 
+    # QQ 语音的 .amr 其实是 silk —— 先嗅探，是就转成临时 wav 再转写。
+    tmp_wav = _silk_to_wav(src)
+    if tmp_wav:
+        src = tmp_wav
+
     try:
-        if args.engine == 'funasr':
-            text, code, used = _run_funasr(src, args.model, args.lang)
-            if used:
-                if code != 0:
-                    return code
-                print(text)
-                return 0
-            # funasr 不可用 → 落到下面的 faster-whisper
-        text, code = _run_faster_whisper(
-            src, args.model, args.lang, args.device, args.compute_type)
-        if code != 0:
-            return code
-        print(text)
-        return 0
-    except Exception as e:
-        # 模型下载失败 / 音频解码失败 / 显存/内存不足 都走这里：stderr 给原因，
-        # 调用方降级成「没转写成功」，绝不把整轮回复拖死。
-        print('[asr] 转写失败：%s' % e, file=sys.stderr)
-        return 1
+        try:
+            if args.engine == 'funasr':
+                text, code, used = _run_funasr(src, args.model, args.lang)
+                if used:
+                    if code != 0:
+                        return code
+                    print(text)
+                    return 0
+                # funasr 不可用 → 落到下面的 faster-whisper
+            text, code = _run_faster_whisper(
+                src, args.model, args.lang, args.device, args.compute_type)
+            if code != 0:
+                return code
+            print(text)
+            return 0
+        except Exception as e:
+            # 模型下载失败 / 音频解码失败 / 显存/内存不足 都走这里：stderr 给原因，
+            # 调用方降级成「没转写成功」，绝不把整轮回复拖死。
+            print('[asr] 转写失败：%s' % e, file=sys.stderr)
+            return 1
+    finally:
+        # 桥转完会删自己下的音频；我们造的临时 wav 也得自己删
+        if tmp_wav:
+            try:
+                os.unlink(tmp_wav)
+            except OSError:
+                pass
 
 
 if __name__ == '__main__':
