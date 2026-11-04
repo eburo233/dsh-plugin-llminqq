@@ -10,6 +10,17 @@
 
 ### Fixed（语音转写全链路修复，2026-11-04）
 
+- **第④层：语音「转出来是空」——桥选错了音源**。段里的 `url` 是 QQ 多媒体 CDN 的
+  **低码率重转码 AMR**（实测 5.6kbps、1126B，有声音但音质差），whisper+VAD 常整段掐掉
+  →「转写结果为空」；NapCat 落盘的原件（silk v3，3136B）音质正常、转写成功。
+  段里的 `path` 又是容器视角（`/app/...`），宿主机 existsSync 必然失败 → 永远走 url。
+  `messaging.js` 改为**原件优先**：按段的 `file`（basename）到
+  `<dataDir>/napcat/data/qq/*/nt_data/Ptt/*/Ori/` 找原件（NapCat 落盘比桥拿事件晚
+  ~100ms，带 ≤1s 重试），找到 `via=orig` 直接转；找不到照旧走 url 下载。
+  新增配置 `media.voiceTranscribe.napcatDataDir`（默认反推自 stagingDir，NapCat
+  数据不在插件目录时显式覆盖）。真机 08:35 那条端到端验证：`via=orig`→「今天天气怎么样」。
+  回归测试 +3（orig 命中零下载 / 目录不存在秒退走 url / basename 防路径逃逸），
+  ASR 全套 44/44 过。**需重启桥**（JS 是进程启动时加载的）。
 - **QQ 语音转写上线以来从未成功过**（每条都「转写超时（30s），已放弃」），复盘是三层叠加，
   详见 [docs/VOICE-ASR-POSTMORTEM-2026-11-04.md](docs/VOICE-ASR-POSTMORTEM-2026-11-04.md)：
   ① whisper-small（484MB）在 30s 预算下永远下不完——桥超时 SIGKILL、下次从头再下，死循环；

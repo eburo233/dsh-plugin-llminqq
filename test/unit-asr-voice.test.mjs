@@ -239,6 +239,56 @@ test('既没有 url 也没有 path → 失败原因明确', async () => {
   assert.match(out[0].reason, /既没有 url 也没有本机路径/)
 })
 
+// ── ③.5 原件优先（2026-11-04 复盘第④层）：url 是 CDN 低码率转码版，本地原件音质正常 ──
+pythonTest('挂载盘有原件（NapCat 晚 150ms 落盘也等得到）→ via=orig、零下载', async () => {
+  resetCalls()
+  const napDir = path.join(TMP, 'napcat-orig')
+  const oriDir = path.join(napDir, 'acct1', 'nt_data', 'Ptt', '2026-11', 'Ori')
+  fs.mkdirSync(oriDir, { recursive: true })
+  const { messaging } = makeStack({ napcatDataDir: napDir })
+  const f = stubFetch(async () => okAudio())
+  try {
+    const drop = (async () => {        // 模拟 NapCat 落盘比桥拿事件晚 ~100ms
+      await new Promise(r => setTimeout(r, 150))
+      fs.writeFileSync(path.join(oriDir, 'bae585.amr'), 'SILK')
+    })()
+    const out = await messaging.transcribeInboundVoices([
+      { file_id: 'v-orig', file: 'bae585.amr', url: 'https://multimedia.nt.qq.com.cn/download?x', duration: 2 },
+    ])
+    await drop
+    assert.equal(out[0].ok, true, `应转成功：${JSON.stringify(out[0])}`)
+    assert.equal(out[0].via, 'orig', '有原件就该用原件')
+    assert.equal(f.count(), 0, '用原件时一次下载都不该发')
+    assert.ok((calls()[0] || '').includes(path.join(oriDir, 'bae585.amr')), 'python 应拿到原件路径')
+  } finally { f.restore() }
+})
+
+test('napcatDataDir 不存在 → 秒退不空等，照旧走 url 下载', async () => {
+  resetCalls()
+  const { messaging } = makeStack({ napcatDataDir: path.join(TMP, 'no-such-napcat') })
+  const f = stubFetch(async () => okAudio())
+  try {
+    const t0 = Date.now()
+    const out = await messaging.transcribeInboundVoices([
+      { file_id: 'v-url', file: 'a1.amr', url: 'https://example.com/a1.amr', duration: 2 },
+    ])
+    assert.equal(out[0].via, 'url')
+    assert.equal(f.count(), 1)
+    assert.ok(Date.now() - t0 < 5000, '找原件不该拖慢（目录没有就立刻走 url）')
+  } finally { f.restore() }
+})
+
+test('找原件按 basename：文件名带路径分量也不逃逸出挂载盘', async () => {
+  const napDir = path.join(TMP, 'napcat-escape')
+  fs.mkdirSync(napDir, { recursive: true })
+  const { messaging } = makeStack({ napcatDataDir: napDir })
+  const cfg = messaging.voiceTranscribeCfg()
+  const out = await messaging.transcribeVoice(
+    { file: '../../../../etc/passwd', url: '' }, { cfg, budgetMs: 600 })
+  assert.equal(out.ok, false)          // 没 url、也没找到原件 → 明确降级
+  assert.match(out.reason, /既没有 url 也没有本机路径/)
+})
+
 // ── ④ python 失败 / 超时 / 空输出：全部降级，不抛错 ─────────────────────────
 pythonTest('python 退出码非 0（缺依赖/模型下载失败）→ 降级，原因取 stderr', async () => {
   resetCalls()
