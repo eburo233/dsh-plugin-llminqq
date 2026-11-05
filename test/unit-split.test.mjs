@@ -112,12 +112,13 @@ test('！？不作切点：感叹/疑问不能被拆散（2026-11-02 用户要�
   assert.deepEqual(splitAtBoundary(q, 6), [q], '只有感叹号的句子不该被拆')
 })
 
-test('无 [SPLIT] 时出站拆句也走切点规则（不再退回按 。！？ 拆的老逻辑）', () => {
-  const i = SRC.indexOf('function splitReplyForSend')
-  assert.ok(i > 0)
-  const body = SRC.slice(i, i + 1800)
-  assert.doesNotMatch(body, /splitLongSentence/, '没标 [SPLIT] 的老路径不该再按 。！？ 拆')
-  assert.match(body, /splitAtBoundary\(/, '两种路径都必须走 splitAtBoundary')
+test('出站拆条走 common.splitOutboundParts（不再有按 。！？ 拆的老路径）', () => {
+  const i = SRC.indexOf('function splitForSend')
+  assert.ok(i > 0, '定位不到 splitForSend')
+  const body = SRC.slice(i, i + 1200)
+  assert.match(body, /splitOutboundParts\(text, \{ threshold, maxParts \}\)/,
+    'splitForSend 必须调 common 的纯函数（换行/[SPLIT]/阈值兜底/5 条上限都在那边）')
+  assert.doesNotMatch(body, /splitLongSentence/, '老的按 。！？ 拆的路径应该已经删干净')
 })
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -153,13 +154,14 @@ test('标记在首尾/连续出现时不产生空段', () => {
   assert.deepEqual(r.parts, ['你好', '世界'])
 })
 
-test('桥真的在出站前用了 [SPLIT] 拆分（不能只定义了函数）', () => {
-  // 源码断言：helper 定义 + deliverReply 真调用 + 提示词里真有使用说明，
+test('桥真的在出站前用了 [SPLIT]/换行拆分（三条路径都要接上）', () => {
+  // 源码断言：纯函数调用 + deliverReply + dispatchOutbound 都接上 + 提示词有使用说明。
   // 三处缺一不可（少一处就是「功能写了但没接上」）。
-  assert.match(SRC, /function splitReplyForSend \(text\)/, '缺 splitReplyForSend')
-  assert.match(SRC, /splitBySplitMarker\(text\)/, 'splitReplyForSend 没调用 splitBySplitMarker')
-  assert.match(SRC, /const parts = splitReplyForSend\(cappedPlain\)/, 'deliverReply 没接上拆句函数')
-  assert.match(SRC, /\[SPLIT\] 只能写在逗号\/句号\/空格\/换行旁边/, '提示词里没有 [SPLIT] 的使用约束')
+  assert.match(SRC, /function splitForSend \(text, tag = '正常回复'\)/, '缺 splitForSend')
+  assert.match(SRC, /splitOutboundParts\(text, \{ threshold, maxParts \}\)/, 'splitForSend 没调纯函数')
+  assert.match(SRC, /splitForSend\(cappedPlain, '正常回复'\)/, 'deliverReply 没接上拆条')
+  assert.match(SRC, /splitForSend\(textForSend, tag\)/, 'dispatchOutbound（主动/接话）没接上拆条')
+  assert.match(SRC, /空格不算分条/, '提示词里没有说明「空格不算分条」')
 })
 
 // ══════════════════════════════════════════════════════════════════════════

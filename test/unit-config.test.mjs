@@ -36,6 +36,7 @@ const CFG = await import(pathToFileURL(path.join(ROOT, 'lib', 'bridge', 'config.
 const {
   normalizePolicy, loadConfig,
   DEFAULT_COOLDOWN_MS_PER_PEER, MAX_COOLDOWN_MS_PER_PEER,
+  normalizeMaxReplyChars, DEFAULT_MAX_REPLY_CHARS,
 } = CFG
 
 const cooldownOf = policy => normalizePolicy({ policy }).policy.cooldownMsPerPeer
@@ -247,8 +248,8 @@ test('源码级：bridgeConfig 的 media 段确实 spread 了 inboundFileMedia(c
 // ③ 出站分条（task-24）：把 affection.splitChars / splitMaxParts 透传给桥
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// 桥侧读 `config.affection?.splitChars ?? 30` / `splitMaxParts ?? 3`
-// （lib/bridge/index.js splitReplyForSend、lib/bridge/state.js splitLongSentence）。
+// 桥侧读 `config.affection?.splitChars ?? 30` / `splitMaxParts ?? 5`
+// （lib/bridge/index.js 的 splitForSend → common.splitOutboundParts；splitLongSentence 已删）。
 // 插件侧以前**既没有 store 默认值、也不透传** → 设置页无法改，只能手改
 // bridge-config.json。这一段锁住「默认值 + clamp + 透传」三件事。
 //
@@ -316,4 +317,33 @@ test('源码级：bridgeConfig 里有 affection 段并调用了 affectionConfig(
   const body = src.slice(start, start + 6000)
   assert.match(body, /affection: affectionConfig\(cfg\)/,
     'bridgeConfig 没有透传 affection —— 桥只会吃写死的 30/3，设置页改了不生效')
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ⑤ policy.maxReplyChars 归一化（2026-11-05 审计 P0-1）
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 背景（严重）：maxReplyChars 会直接传给 chunkText(text, max)。配成 0 / 空串 /
+// 负数 / 非数字时，chunkText 的 while 永远成立又切不出正数 → **死循环**：
+// 桥不报错、不退出，只是再也发不出消息（线程卡在 while 里），线上极难排查。
+//
+// 两道防线（都必须有）：
+//   ① 配置归一化：非法值回落默认 1500（这里）；
+//   ② chunkText 内部 max<=0 兜底（test/unit-outbound-split.test.mjs 锁着）。
+test('policy.maxReplyChars: 缺省/非法回落默认，合法值保留', () => {
+  assert.equal(DEFAULT_MAX_REPLY_CHARS, 1500)
+  assert.equal(normalizePolicy({}).policy.maxReplyChars, 1500)
+  assert.equal(normalizePolicy({ policy: {} }).policy.maxReplyChars, 1500)
+  // 0 / 空串 / 负数 / 非数字 —— 全都会让 chunkText 死循环，必须回落
+  for (const bad of [0, '0', '', '   ', -1, '-5', 'abc', null, NaN, Infinity, -Infinity, {}, []]) {
+    assert.equal(normalizeMaxReplyChars(bad), 1500, `非法值 ${String(bad)} 没回落默认`)
+    assert.equal(normalizePolicy({ policy: { maxReplyChars: bad } }).policy.maxReplyChars, 1500)
+  }
+  // 合法值原样保留（生产配置就是 120）
+  assert.equal(normalizeMaxReplyChars(120), 120)
+  assert.equal(normalizeMaxReplyChars('120'), 120)
+  assert.equal(normalizePolicy({ policy: { maxReplyChars: 120 } }).policy.maxReplyChars, 120)
+  // 小数向下取整，至少 1（0.4 → 1，别变回 0 再死循环）
+  assert.equal(normalizeMaxReplyChars(120.9), 120)
+  assert.equal(normalizeMaxReplyChars(0.4), 1)
 })

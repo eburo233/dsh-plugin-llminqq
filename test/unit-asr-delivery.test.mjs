@@ -21,6 +21,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// 2026-11-05：拆句重构后，stripPeriod / splitOutboundParts 都在 common.js（纯函数层），
+// state.js 里的 splitLongSentence 已删 —— 这几条断句断言跟着搬到新函数上。
+import { splitOutboundParts, stripPeriod } from '../lib/bridge/common.js'
+
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(HERE, '..')
 const SRC = fs.readFileSync(path.join(ROOT, 'lib', 'bridge', 'index.js'), 'utf8')
@@ -154,38 +158,33 @@ test('MCP 转写完成时要把结果写到待送达目录', () => {
 //
 // 这不是审美问题 —— 真人 QQ 聊天确实几乎不打「。」，一条回复里带句号
 // 会立刻透出「这是生成文本」的味道。
+//
+// 2026-11-05 重构：splitLongSentence 删除，拆条 = common.splitOutboundParts
+// （换行/[SPLIT] 强制拆 + 标点兜底 + 每轮最多 5 条）。以下断言跟着新函数走。
 
-const STATE_SRC = fs.readFileSync(path.join(ROOT, 'lib', 'bridge', 'state.js'), 'utf8')
-
-test('断句要能拆成多条（原来上限 2，用户要求多发几条 → 3）', () => {
-  assert.match(STATE_SRC, /splitMaxParts \?\? 3/,
-    '默认上限应该是 3 —— 用户明确要求「多发几条」')
+test('分条默认每轮最多 5 条（2026-11-05 用户定稿，从 3 提到 5）', () => {
+  // 8 行换行（=8 个强制断点）→ 前 4 条各自独立，尾部并成第 5 条
+  const lines = Array.from({ length: 8 }, (_, i) => `第${i + 1}句`)
+  const { parts } = splitOutboundParts(lines.join('\n'))
+  assert.equal(parts.length, 5, '默认上限应该是 5 条（刷屏比超长烦）')
 })
 
-test('切分仍靠句号（否则中文长句根本切不动）', () => {
-  // 之前的错误做法是「先去句号再切」→ 48 字长句变成 1 条，正好和需求相反
-  const i = STATE_SRC.indexOf('const parts = s.match(')
-  assert.ok(i > 0, '定位不到切分正则')
-  const seg = STATE_SRC.slice(i, i + 120)
-  assert.match(seg, /。/, '切分正则里必须包含中文句号 —— 否则长句切不开')
+test('超阈值的长句仍按标点兜底拆（不然一坨发出去）', () => {
+  const { parts } = splitOutboundParts('A'.repeat(20) + '，' + 'B'.repeat(20), { threshold: 10 })
+  assert.deepEqual(parts, ['A'.repeat(20) + '，', 'B'.repeat(20)],
+    '超过 splitChars 的段必须按标点再拆，且不能劈词')
 })
 
 test('发出去的每一段都要去掉句号，但保留 ！？', () => {
-  assert.match(STATE_SRC, /function stripPeriod/,
-    '缺 stripPeriod —— 句号会原样发出去（聊天工具里没人这么说话）')
-  const body = STATE_SRC.slice(STATE_SRC.indexOf('function stripPeriod'), STATE_SRC.indexOf('function splitLongSentence'))
-  assert.match(body, /replace\(\/。\/g, ''\)/, '要删掉中文句号')
-  // 关键：不能连 ！？ 一起删（那会让语气变平）
-  assert.doesNotMatch(body, /replace\(\/\[。！？\]\/g/,
-    '不能把 ！？ 也删掉 —— 真人会打问号和感叹号')
-  assert.match(body, /！？!?/, '要保留问号/感叹号')
+  assert.equal(stripPeriod('好的。'), '好的', '中文句号要删掉 —— 聊天工具里没人打句号')
+  assert.equal(stripPeriod('真的？'), '真的？', '问号要保留（去掉语气就变平了）')
+  assert.equal(stripPeriod('牛！'), '牛！', '感叹号要保留')
+  assert.doesNotMatch(stripPeriod('你在吗？？？'), /[？？？]{2}/, '连排问号压成一个')
 })
 
-test('英文句点只删行尾（别把 3.14 / BV 号拆坏）', () => {
-  const body = STATE_SRC.slice(STATE_SRC.indexOf('function stripPeriod'), STATE_SRC.indexOf('function splitLongSentence'))
-  // 简单判据：stripPeriod 里必须出现行尾锚定（/gm 或 $）
-  assert.ok(body.includes('gm') || body.includes('$'),
-    '英文句点必须限定在行尾 —— 中间的点（3.14、域名）不能动')
+test('英文句点只删行尾（别把 3.14 / 域名拆坏）', () => {
+  assert.equal(stripPeriod('3.14 和 example.com 都不动'), '3.14 和 example.com 都不动')
+  assert.equal(stripPeriod('句号在末尾.'), '句号在末尾', '行尾英文句点可以删')
 })
 
 test('已 sent 的标记要能扛住「桥重启」（文件系统持久）', () => {
