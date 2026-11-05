@@ -336,6 +336,19 @@ test('v5DistillCfg：intervalMin 默认 10、夹 1–120 分钟', () => {
   assert.equal(makeEngine({ config: { memory: { v5: { distill: { intervalMin: 'abc' } } } } }).v5DistillCfg().intervalMin, 10)
 })
 
+// distill 也必须认旧形状（和 engine 同一个理由，见 v5Cfg 的长注释）。
+// 这两个键漏了后果都不小：enabled 漏了 → 用户关不掉、后台一直烧模型额度；
+// intervalMin 漏了 → 设的间隔被静默换成 10 分钟。
+test('v5DistillCfg：旧形状摊平的 memory.distill 也要认（关得掉、间隔生效）', () => {
+  const legacyOff = { memory: { engine: 'v5', distill: { enabled: false, intervalMin: 3 } } }
+  const c1 = makeEngine({ config: legacyOff }).v5DistillCfg()
+  assert.equal(c1.enabled, false, '旧形状下 distill.enabled=false 必须真的关得掉')
+  assert.equal(c1.intervalMin, 3, '旧形状下 intervalMin 必须生效')
+
+  const legacyOn = { memory: { engine: 'v5', distill: { intervalMin: 7 } } }
+  assert.equal(makeEngine({ config: legacyOn }).v5DistillCfg().intervalMin, 7)
+})
+
 test('v5DistillTick：调 distillOnce({store, configPath})，一次只跑一轮', async () => {
   const store = freshStore()
   let release
