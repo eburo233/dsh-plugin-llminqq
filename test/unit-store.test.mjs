@@ -333,3 +333,34 @@ test('randomToken: 十六进制、长度 = 2*bytes、两次不重复', () => {
   assert.match(M.randomToken(8), /^[0-9a-f]{16}$/)
   assert.notEqual(M.randomToken(16), M.randomToken(16))
 })
+
+// ── 出站分条（task-24）：默认值 + 老配置补齐 ────────────────────────────────
+//
+// 为什么默认值是 30 / 5：桥侧的老代码写死 `splitChars ?? 30`、
+// `splitMaxParts ?? 3`，而用户 2026-11-05 定稿「每轮最多 5 条」。
+// 插件侧不给默认值的话，设置页读到 undefined、bridgeConfig 也透传不了 ——
+// 用户改了也不生效（假配置）。这条锁住「新用户/老配置都拿到 30/5」。
+test('defaults.affection: 分条默认 30 / 5（用户 2026-11-05 定稿）', () => {
+  const a = M.defaults().affection
+  assert.ok(a, 'defaults 里没有 affection 段 —— bridgeConfig 也就没法透传')
+  assert.equal(a.splitChars, 30, '单段阈值默认 30 字')
+  assert.equal(a.splitMaxParts, 5, '每轮最多 5 条（用户定稿；桥侧写死的旧默认是 3）')
+})
+
+test('readConfig: 老配置（没有 affection 段）→ 默认值补齐', { skip: skipDisk }, () => {
+  resetDir()
+  writeConfigFile({ policy: { maxReplyChars: 800 } })
+  const cfg = M.readConfig()
+  assert.equal(cfg.affection.splitChars, 30)
+  assert.equal(cfg.affection.splitMaxParts, 5)
+  assert.equal(cfg.policy.maxReplyChars, 800, '老键不能被新段挤掉')
+})
+
+test('saveConfig: 只改一个分条键时同段另一个键保留', { skip: skipDisk }, () => {
+  resetDir()
+  M.saveConfig({ affection: { splitChars: 40 } })
+  M.saveConfig({ affection: { splitMaxParts: 4 } })
+  const cfg = M.readConfig()
+  assert.equal(cfg.affection.splitChars, 40, '第二次保存把第一次的键丢了')
+  assert.equal(cfg.affection.splitMaxParts, 4)
+})
