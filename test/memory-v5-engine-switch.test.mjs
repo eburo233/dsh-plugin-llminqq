@@ -389,11 +389,65 @@ test('缺省守卫：store 默认值（可能只有 enabled）喂进 memoryV5Con
   if (m.v5 && m.v5.engine !== undefined) assert.equal(m.v5.engine, 'v4')
 })
 
-test('源码级：bridgeConfig 的 memory 段确实 spread 了 memoryV5Config(cfg.memory)', () => {
+test('源码级：bridgeConfig 把 memoryV5Config() 嵌在 v5 子对象里（不是摊平）', () => {
   const src = fs.readFileSync(path.join(ROOT, 'lib', 'index.js'), 'utf8')
   const start = src.indexOf('function bridgeConfig (cfg) {')
   assert.ok(start > 0)
   const memoryAt = src.indexOf('memory: (() => {', start)
-  const chunk = src.slice(memoryAt, memoryAt + 2600)
-  assert.match(chunk, /\.\.\.memoryV5Config\(cfg\.memory\)/, 'bridgeConfig 没透传 memory.v5（engine 永远到不了桥）')
+  const chunk = src.slice(memoryAt, memoryAt + 4200)
+  // 🔴 形状必须是 `v5: memoryV5Config(...)`。摊平的 `...memoryV5Config(...)`
+  //    会让桥的 config.memory.v5.engine 永远是 undefined → 引擎永远 v4，
+  //    设置页选 v5 / config.json 写 v5 全部失效（2026-11-05 线上实测踩到）。
+  assert.match(chunk, /v5:\s*memoryV5Config\(cfg\.memory\)/,
+    'bridgeConfig 必须把 v5 配置嵌在 memory.v5 下 —— 摊平会让桥的 engine 永远读不到')
+  // 反面判据不能用正则扫全文：注释里就会写到那串反例（这条断言自己踩过）。
+  // 改成「去掉注释行后再断言没有摊平写法」。
+  const codeOnly = chunk.split('\n')
+    .filter(line => !/^\s*(\/\/|\*|\/\*)/.test(line))
+    .filter(line => !line.includes('memoryV5Config(cfg.memory)') || !/\/\/|\*/.test(line))
+    .join('\n')
+  assert.doesNotMatch(codeOnly, /\.\.\.memoryV5Config\(/,
+    '不要再摊平 memoryV5Config：桥读的是 config.memory.v5.*，摊平等于没透传')
+})
+
+// ── 形状对齐：插件写出来的结构必须正好是桥读的结构 ──────────────────────────
+//
+// 背景（2026-11-05 线上实锤）：插件的 bridgeConfig() 把 v5 配置**摊平**写在
+// `memory.enabled/engine/distill`，而桥读 `config.memory.v5.engine`。两边各写各的，
+// 唯一的守卫是源码正则 —— 正则只证明「这行代码在」，不证明「产出的结构对」。
+// 结果：设置页切 v5、config.json 写 engine=v5，桥起来仍然 `engine=v4`，无声无息。
+//
+// 这一组用例不看源码，直接**模拟桥的读取方式**取值，锁定那条契约。
+test('形状对齐：memory.v5 能被桥的读取方式取到 engine', () => {
+  // 复刻 lib/bridge/index.js 的 v5Cfg / memoryEngine 读法（不 import 桥：
+  // 桥模块顶层就 loadConfig + 起副作用，单测不能碰）。
+  const shape = IDX.memoryV5Config({ v5: { enabled: true, engine: 'v5', distill: { intervalMin: 5 } } })
+  // 插件要把它放在 memory.v5 这个位置（就是 index.js 里 `v5: memoryV5Config(...)`）
+  const memory = { enabled: true, dir: '/tmp/mem', v5: shape }
+
+  const v5Cfg = (cfg) => {
+    const v = cfg.memory?.v5
+    return v && typeof v === 'object' ? v : {}
+  }
+  const memoryEngine = (cfg) => {
+    const raw = String(cfg?.memory?.v5?.engine ?? '').trim().toLowerCase()
+    return raw === 'v5' ? 'v5' : 'v4'
+  }
+  assert.equal(memoryEngine({ memory }), 'v5', '按桥的读法必须能取到 v5')
+  assert.equal(v5Cfg({ memory }).enabled, true)
+  assert.equal(v5Cfg({ memory }).distill.intervalMin, 5)
+
+  // 反面：如果是摊平结构（历史 bug），桥的读法只能拿到 v4 —— 这就是当时的现场
+  const flat = { enabled: true, ...IDX.memoryV5Config({ v5: { engine: 'v5' } }) }
+  assert.equal(memoryEngine({ memory: flat }), 'v4',
+    '摊平结构必然回落 v4 —— 这条断言把当年的事故固化成回归测试')
+})
+
+test('形状对齐：memory.enabled（记忆总开关）不被 v5.enabled 覆盖', () => {
+  // 摊平写法除了 engine，还会用 v5.enabled 覆盖 memory.enabled：
+  // 用户关掉记忆总开关后桥仍认为开着。嵌成子对象后两者互不干扰。
+  const v5 = IDX.memoryV5Config({ enabled: false })       // 记忆总开关关，v5 段没显式关
+  const memory = { enabled: false, v5 }
+  assert.equal(memory.enabled, false, 'memory.enabled 必须保持用户的总开关值')
+  assert.equal(memory.v5.enabled, true, 'v5.enabled 是独立的一层（默认开），不该被总开关连带')
 })

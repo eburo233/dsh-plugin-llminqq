@@ -253,10 +253,13 @@ test('源码级：bridgeConfig 的 memory 段透传了 v5.enabled（不是只有
   assert.ok(start > 0, '定位不到 bridgeConfig')
   const memAt = src.indexOf('memory: (() => {', start)
   assert.ok(memAt > start, 'bridgeConfig 里找不到 memory 段')
-  const seg = src.slice(memAt, memAt + 3000)
-  // task-18 起 v5 段抽成了 memoryV5Config()（多出 engine/distill，单测直接验纯函数），
-  // 所以这里断言「bridgeConfig 确实 spread 了它」+「helper 里保留默认语义」。
-  assert.match(seg, /\.\.\.memoryV5Config\(cfg\.memory\)/, 'memory 段没透传 v5 —— 桥只能吃默认值，设置页关不掉')
+  const seg = src.slice(memAt, memAt + 4200)
+  // task-18 起 v5 段抽成了 memoryV5Config()（多出 engine/distill，单测直接验纯函数）。
+  // 🔴 2026-11-05：这条以前断言的是 `...memoryV5Config(cfg.memory)`（摊平），
+  //    而那正是线上 bug —— 桥读 config.memory.v5.*，摊平等于没透传。
+  //    现在锁「嵌在 v5 子对象里」（行为断言见 memory-v5-engine-switch.test.mjs）。
+  assert.match(seg, /v5:\s*memoryV5Config\(cfg\.memory\)/,
+    'memory 段没把 v5 嵌在 memory.v5 下 —— 桥吃不到，engine 永远 v4')
   const helperAt = src.indexOf('function memoryV5Config')
   assert.ok(helperAt > 0, 'memoryV5Config helper 不见了')
   const helperSeg = src.slice(helperAt, helperAt + 2000)
