@@ -242,3 +242,78 @@ test('源码级：bridgeConfig 的 media 段确实 spread 了 inboundFileMedia(c
   assert.match(block, /\.\.\.inboundFileMedia\(cfg\.media\)/,
     'bridgeConfig 的 media 段没有透传入站文件 4 项 —— 桥会收到 undefined，设置页又变成假配置')
 })
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ③ 出站分条（task-24）：把 affection.splitChars / splitMaxParts 透传给桥
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 桥侧读 `config.affection?.splitChars ?? 30` / `splitMaxParts ?? 3`
+// （lib/bridge/index.js splitReplyForSend、lib/bridge/state.js splitLongSentence）。
+// 插件侧以前**既没有 store 默认值、也不透传** → 设置页无法改，只能手改
+// bridge-config.json。这一段锁住「默认值 + clamp + 透传」三件事。
+//
+// 用户 2026-11-05 定稿：换行/[SPLIT] 强制分条、每轮最多 5 条。
+
+const AFFECTION_DEFAULTS = { splitChars: 30, splitMaxParts: 5 }
+
+test('affectionConfig: 缺省（老配置没有 affection 段）→ 30 / 5', () => {
+  assert.deepEqual(IDX.affectionConfig(), AFFECTION_DEFAULTS)
+  assert.deepEqual(IDX.affectionConfig({}), AFFECTION_DEFAULTS)
+  assert.deepEqual(IDX.affectionConfig({ affection: {} }), AFFECTION_DEFAULTS)
+})
+
+test('affectionConfig: 合法值原样透传（「设置页改了能到桥」就靠这条）', () => {
+  assert.deepEqual(
+    IDX.affectionConfig({ affection: { splitChars: 45, splitMaxParts: 3 } }),
+    { splitChars: 45, splitMaxParts: 3 })
+  // 字符串数字（.env 展开 / 手改 JSON 常见）
+  assert.deepEqual(
+    IDX.affectionConfig({ affection: { splitChars: '60', splitMaxParts: '4' } }),
+    { splitChars: 60, splitMaxParts: 4 })
+  // 小数四舍五入到整数（桥拿它比字数，浮点没必要）
+  assert.deepEqual(
+    IDX.affectionConfig({ affection: { splitChars: 44.6, splitMaxParts: 3.2 } }),
+    { splitChars: 45, splitMaxParts: 3 })
+})
+
+test('affectionConfig: 非法值回落默认（负数 / 0 / 非数字 / NaN / Infinity）', () => {
+  for (const bad of [-5, 0, '-3', 'abc', '', null, NaN, Infinity, -Infinity, {}, []]) {
+    assert.deepEqual(
+      IDX.affectionConfig({ affection: { splitChars: bad, splitMaxParts: bad } }),
+      AFFECTION_DEFAULTS, `非法值 ${String(bad)} 没有回落默认`)
+  }
+})
+
+test('affectionConfig: 越界值夹到边界（保留用户意图，不丢回默认）', () => {
+  assert.deepEqual(
+    IDX.affectionConfig({ affection: { splitChars: 999, splitMaxParts: 99 } }),
+    { splitChars: 200, splitMaxParts: 10 }, '填 999 的意图是「尽量别拆」，夹成 200 比丢回 30 更贴近意图')
+  assert.deepEqual(
+    IDX.affectionConfig({ affection: { splitChars: 3, splitMaxParts: 1 } }),
+    { splitChars: 10, splitMaxParts: 2 })
+})
+
+test('AFFECTION_LIMITS 区间和设置页输入框一致（10–200 / 2–10）', () => {
+  const L = IDX.AFFECTION_LIMITS
+  assert.deepEqual({ ...L.splitChars }, { min: 10, max: 200, def: 30 })
+  assert.deepEqual({ ...L.splitMaxParts }, { min: 2, max: 10, def: 5 })
+})
+
+test('漂移守卫：store 默认值喂进 affectionConfig 后必须一字不变', () => {
+  const a = STORE.defaults().affection
+  assert.deepEqual(IDX.affectionConfig(STORE.defaults()), {
+    splitChars: a.splitChars, splitMaxParts: a.splitMaxParts,
+  })
+  assert.deepEqual(IDX.affectionConfig(STORE.defaults()), AFFECTION_DEFAULTS,
+    'store.js 的默认值和这里的期望值不一致 —— 要么改默认值，要么改这条断言（别只改一处）')
+})
+
+test('源码级：bridgeConfig 里有 affection 段并调用了 affectionConfig(cfg)', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'lib', 'index.js'), 'utf8')
+  const start = src.indexOf('function bridgeConfig (cfg) {')
+  assert.ok(start > 0, '定位不到 bridgeConfig')
+  // 窗口给足 6000：这段注释很长，窗口太小会截断在表达式中间（这个测试自己踩过）
+  const body = src.slice(start, start + 6000)
+  assert.match(body, /affection: affectionConfig\(cfg\)/,
+    'bridgeConfig 没有透传 affection —— 桥只会吃写死的 30/3，设置页改了不生效')
+})

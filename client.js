@@ -1487,6 +1487,9 @@ window.__ModuleLoader__.load({
       // 老配置里没有这 4 个键 → 这里给的是和 lib/store.js defaults 一致的默认值，
       // 保证设置页打开时不显示空白（空白会让用户以为坏了，其实只是没配过）。
       const media = cfg.media || {}
+      // 出站分条（2026-11-05 task-24）：bridge 读 config.affection.splitChars /
+      // splitMaxParts，插件侧 store 默认 30 / 5。老配置没有这个段 → 用默认值显示。
+      const aff = cfg.affection || {}
       // 🔴 2026-10-31 修：语音卡片的 API Key 输入要用 data.secrets 判断「已设置」，
       //   之前这个组件没接 data → render 时 ReferenceError: secrets is not defined
       //   → 整个「行为」Tab 白屏（React 抛错后不再渲染子树）。
@@ -1698,6 +1701,39 @@ window.__ModuleLoader__.load({
           // 防抖），但桥没在跑 / 自动重启失败时要告诉用户手动去「运行」页点重启，
           // 否则他会以为没保存成功，反复点。
           h('div', { className: 'hint' }, '保存后桥会自动重启一下才生效；没自动重启就去「运行」页点「重启桥」。'),
+        ),
+
+        // ── 分条：一轮回复拆成几条发（2026-11-05 task-24）─────────────────
+        // 为什么这张卡必须存在：桥侧的拆条参数读的是 config.affection.*，
+        // 而插件侧以前**根本没有这个段**，也不透传 → 用户只能在
+        // bridge-config.json 里手改，设置页没有入口（假配置的另一种形态）。
+        // 链路：这张卡 → config.affection.* → lib/index.js bridgeConfig()
+        // → bridge-config.json → lib/bridge/index.js splitReplyForSend。
+        //
+        // 文案必须写清规则（用户 2026-11-05 定稿），否则改完看起来「没生效」：
+        //   换行 / [SPLIT] 是**强制**分条（不受阈值影响）；空格不算分条；
+        //   超出条数上限时多出来的并进最后一条。
+        h('div', { className: 'card' },
+          h('div', { className: 'card-title' }, '分条',
+            h('span', { className: 'muted', style: { marginLeft: 'auto', fontWeight: 400 } },
+              '一轮回复拆成几条发')),
+          h('div', { className: 'hint' },
+            '换行和 [SPLIT] 出现就一定分条；空格不算分条（不会从空格处劈开一句话）；'
+            + '超过「每轮最多几条」时，多出来的并进最后一条。'),
+          h('div', { className: 'grid2' },
+            h(Field, { label: '单段阈值（字）', sub: '单段超过这个字数才按标点再拆；换行/[SPLIT] 不受它限制' },
+              h(NumberInput, {
+                value: aff.splitChars ?? 30, min: 10, max: 200,
+                onCommit: v => saveConfig({ affection: { splitChars: clampInt(v, 10, 200) } }),
+              })),
+            h(Field, { label: '每轮最多几条', sub: '含换行/[SPLIT] 拆出来的；超出部分并进最后一条' },
+              h(NumberInput, {
+                value: aff.splitMaxParts ?? 5, min: 2, max: 10,
+                onCommit: v => saveConfig({ affection: { splitMaxParts: clampInt(v, 2, 10) } }),
+              })),
+          ),
+          h('div', { className: 'hint' },
+            '改完要重启桥才生效（「运行」页 →「重启桥」；保存后桥通常也会自动重启一下）。'),
         ),
 
         // ── 语音转文字（ASR）──────────────────────────────────────────────
