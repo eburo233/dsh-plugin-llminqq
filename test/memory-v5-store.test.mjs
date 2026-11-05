@@ -113,6 +113,52 @@ test('WAL 真的生效：写入后库旁边有 -wal 文件', () => {
   } finally { s.cleanup() }
 })
 
+// ── ①b WAL checkpoint：只拷 .db 不再是空库（交接文档 §7 的坑）──────────────
+//
+// 现场教训：WAL 攒到阈值前不会合并回 .db，于是「只拷 mem-v5.db」的副本查出来是 0 条
+// （迁移演练时 570 条事件的库、副本查询为空，就是这么来的 —— 那份 -wal 有 4MB）。
+// v5 正式上线后加了周期性 checkpoint，这一组锁住「收了之后副本真的是全的」。
+test('checkpoint：WAL 收进主库，副本（只拷 .db）也能查到全部数据', () => {
+  const s = mkStore()
+  try {
+    for (let i = 0; i < 20; i++) {
+      s.appendEvent({ conv: 'c2c:1', msgId: `ck${i}`, speaker: '1', text: `第${i}条` })
+    }
+    const walBefore = s.walSize()
+    assert.ok(walBefore > 0, '写入后 WAL 应该非空（否则这条用例没意义）')
+
+    const r = s.checkpoint()
+    assert.equal(r.ok, true, `checkpoint 应该成功：${JSON.stringify(r)}`)
+    assert.ok(s.walSize() <= walBefore, 'checkpoint 后 WAL 不该变大')
+
+    // 关键：只拷 .db（不带 -wal/-shm），能查到全部 20 条
+    const copy = path.join(TMP_HOME, 'db', 'copy-after-checkpoint.db')
+    fs.copyFileSync(s.dbPath, copy)
+    const s2 = openV5({ dbPath: copy, log: () => {} })
+    try {
+      assert.equal(s2.stats().events, 20,
+        '只拷 .db 的副本必须能查到全部事件 —— 这正是没 checkpoint 时会「看起来是空的」')
+    } finally { s2.close() }
+  } finally { s.cleanup() }
+})
+
+test('checkpoint：可重复调用、空库也不抛错', () => {
+  const s = mkStore()
+  try {
+    for (let i = 0; i < 3; i++) {
+      const r = s.checkpoint()
+      assert.equal(typeof r.ok, 'boolean')
+    }
+  } finally { s.cleanup() }
+})
+
+test('walSize：返回有限数字而不是抛错', () => {
+  const s = mkStore()
+  try {
+    assert.ok(Number.isFinite(s.walSize()), 'walSize 必须返回数字')
+  } finally { s.cleanup() }
+})
+
 // ── ② events：幂等 + 全文不截断 ────────────────────────────────────────────
 
 test('appendEvent：同 (conv,msg_id) 重放幂等，返回已有 id；不同 conv 不冲突', () => {
