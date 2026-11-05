@@ -108,6 +108,8 @@ function makeEngine ({
     return {
       memoryEngine, v5ReadEnabled, acpContextStartSec, v5MemoryRecallBlock, memoryBlockForTurn,
       v5DistillCfg, v5DistillTick, startV5DistillLoop,
+      // v5Cfg / v5Enabled 也暴露出来：形状兼容的用例要直接验「桥从什么位置读配置」
+      v5Cfg, v5Enabled,
     }
   `
   const factory = new Function(
@@ -157,6 +159,39 @@ test('v5ReadEnabled：engine=v5 但 memory.v5.enabled=false → 整段跳过', (
   assert.equal(e.memoryEngine(), 'v5')
   assert.equal(e.v5ReadEnabled(), false)
   assert.equal(makeEngine({ config: CONFIG_V5 }).v5ReadEnabled(), true)
+})
+
+// ── ①b 形状兼容：旧插件摊平写的 memory.engine / memory.distill 也要认 ────────
+//
+// 现场（2026-11-05）：插件把 v5 配置摊平写在 memory 顶层，桥读 memory.v5.*，
+// 于是 engine 永远 v4。插件侧已改成嵌 v5 子对象，但**桥也认旧形状**，因为
+// 宿主进程可能比桥代码旧（宿主先起、桥后起），旧宿主每次重启桥都会把配置
+// 写回摊平 —— 桥侧多认一种形状才能切断这个死循环。
+test('形状兼容：摊平的 memory.engine="v5" 也能切到 v5（旧宿主写出来的样子）', () => {
+  const legacy = { memory: { enabled: true, engine: 'v5', distill: { intervalMin: 10 } } }
+  const e = makeEngine({ config: legacy })
+  assert.equal(e.memoryEngine(), 'v5', '旧形状摊平的 engine 必须被认（否则旧宿主永远开不起 v5）')
+  // distill 段也要能兜到（startV5DistillLoop 读的就是 v5Cfg().distill）
+  assert.deepEqual(e.v5Cfg().distill, { intervalMin: 10 })
+})
+
+test('形状兼容：嵌套优先于摊平（正解不被旧字段污染）', () => {
+  const both = { memory: { engine: 'v4', v5: { engine: 'v5' } } }
+  assert.equal(makeEngine({ config: both }).memoryEngine(), 'v5',
+    '有 memory.v5 时必须以它为准，不能因为顶层还留着旧 engine 就回落')
+  const both2 = { memory: { engine: 'v5', v5: { engine: 'v4' } } }
+  assert.equal(makeEngine({ config: both2 }).memoryEngine(), 'v4', '显式嵌套 v4 就是 v4')
+})
+
+test('形状兼容：摊平的 memory.enabled 不当成 v5 开关（那是记忆总开关）', () => {
+  // 用户关掉记忆总开关 → memory.enabled=false。这时 v5 双写的开关语义不同，
+  // 不能被它连带关掉；反过来「记忆开着」也不该被当成 v5 显式开启。
+  const e = makeEngine({ config: { memory: { enabled: false, engine: 'v5' } } })
+  assert.notEqual(e.v5Cfg().enabled, false,
+    'v5Cfg 不该把顶层 memory.enabled 当成 v5.enabled —— 语义不同，混用会误关双写')
+  // 嵌套的 v5.enabled=false 才真关
+  const f = makeEngine({ config: { memory: { enabled: true, v5: { enabled: false, engine: 'v5' } } } })
+  assert.equal(f.v5ReadEnabled(), false, '嵌套 v5.enabled=false 必须真的关掉读路径')
 })
 
 // ── ② engine=v4：原路径零变化，不 import v5 模块 ──────────────────────────
