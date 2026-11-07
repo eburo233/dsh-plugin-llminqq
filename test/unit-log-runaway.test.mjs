@@ -272,3 +272,76 @@ test('短句拆分后每段都有自己的打字延迟（不是只有第一条�
   assert.match(block, /replyDelayMs\(parts\[\[?i/, '延迟没用该段的文本算 —— 补发的那条会秒出')
   assert.match(block, /第 \$\{i \+ 1\}\/\$\{parts\.length\} 段/, '日志要能看出是第几段，便于排查')
 })
+
+// ── ⑨ EPIPE 是**异步**的：try/catch 拦不住，必须挂 stream 的 error 事件 ──────
+//
+// 现场（2026-11-07 复查）：熔断代码早就在（try/catch + stdoutBroken），
+// 但线上 6 天仍累积 6580 次 `未捕获异常: Error: write EPIPE`，每条约 8 行堆栈。
+//
+// 根因：写 pipe 是**异步**的。console.log 立刻返回，EPIPE 从 stream 的 'error'
+// 事件冒出来 → 直接变 uncaughtException → crashGuard 写 ERROR（又一次写 stdout）
+// → 再 EPIPE。try/catch 根本等不到这个错误，所以 stdoutBroken 永远是 false。
+//
+// 上面 ④ 那条「逻辑等价性」用例是用**同步 throw** 模拟的 —— 它证明不了异步路径，
+// 这正是「测试绿着、线上坏着」的又一例。这里补两条锁住真正的止血点。
+
+test('必须给 process.stdout 挂 error 监听（异步 EPIPE 只能从这里接）', () => {
+  assert.match(SRC, /process\.stdout\.on\(\s*['"]error['"]/,
+    '没有 stdout.on("error") —— 异步 EPIPE 会变成 uncaughtException，熔断标志永远设不上')
+  // 监听里必须真的去熔断（调 markStdoutBroken 或直接置 stdoutBroken）
+  const at = SRC.search(/process\.stdout\.on\(\s*['"]error['"]/)
+  const block = SRC.slice(at, at + 300)
+  assert.match(block, /markStdoutBroken|stdoutBroken\s*=\s*true/,
+    'stdout error 监听里没有熔断动作 —— 挂了等于没挂')
+})
+
+test('异步 EPIPE 行为：error 事件之后必须永久停写，不再尝试 console.log', () => {
+  // 按源码语义拼一个沙箱：stdout 是 EventEmitter，写入时**不抛**（异步语义），
+  // 只让 'error' 事件来触发熔断。
+  const harness = `
+    // 手写一个最小 emitter（测试文件是 ESM，这里不 require node:events）
+    function miniEmitter () {
+      const handlers = []
+      return { on: (ev, fn) => { if (ev === 'error') handlers.push(fn); return this },
+               emit: (ev, payload) => { if (ev === 'error') for (const fn of handlers) fn(payload) } }
+    }
+    const stdout = miniEmitter()
+    stdout.writable = true
+    stdout.destroyed = false
+    let stdoutBroken = false, stdoutSkipCount = 0, attempts = 0
+    const stderrLines = []
+    function markStdoutBroken (err) {
+      if (stdoutBroken) return
+      stdoutBroken = true
+      stderrLines.push(String(err && err.code || err && err.message))
+    }
+    function writeStdout (line) {
+      if (stdoutBroken) { stdoutSkipCount++; return }
+      if (stdout.writable === false || stdout.destroyed === true) {
+        stdoutBroken = true; stdoutSkipCount++; return
+      }
+      try { attempts++ } catch (err) { markStdoutBroken(err) }
+    }
+    stdout.on('error', err => markStdoutBroken(err))
+    // 先正常写 3 行
+    for (let i = 0; i < 3; i++) writeStdout('ok' + i)
+    const beforeBroken = { attempts, broken: stdoutBroken }
+    // 模拟管道断开：异步 error 事件（**不是**抛异常）
+    const pipeErr = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' })
+    stdout.writable = false
+    stdout.emit('error', pipeErr)
+    const afterError = { attempts, broken: stdoutBroken, stderr: stderrLines.slice() }
+    // 之后再写 1000 行，一次都不该再碰 stdout
+    for (let i = 0; i < 1000; i++) writeStdout('spam' + i)
+    return JSON.stringify({ beforeBroken, afterError, attempts, stdoutSkipCount })
+  `
+  const j = JSON.parse(new Function(harness)())
+  assert.equal(j.beforeBroken.attempts, 3, 'EPIPE 之前应正常写了 3 行')
+  assert.equal(j.beforeBroken.broken, false, 'EPIPE 之前不该熔断')
+  assert.equal(j.afterError.broken, true,
+    'error 事件之后 stdoutBroken 必须为 true —— 否则就是线上那 6580 次死循环')
+  assert.equal(j.afterError.attempts, 3, 'error 事件本身不该增加写入尝试')
+  assert.equal(j.attempts, 3, `error 之后又写了 ${j.attempts - 3} 次 stdout —— 熔断没生效`)
+  assert.equal(j.stdoutSkipCount, 1000, '被丢弃的行要计数（不能无声无息丢日志）')
+  assert.deepEqual(j.afterError.stderr, ['EPIPE'], '熔断时应往 stderr 说明一次原因')
+})
