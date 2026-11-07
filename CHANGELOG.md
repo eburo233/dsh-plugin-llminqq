@@ -8,6 +8,40 @@
 
 ## [未发布]
 
+### Fixed（QQ 被踢后「离线期间收到的消息不会响应」：桥补读，2026-11-07）
+
+现场：`14:37:50` NapCat 登录成功并立刻把离线消息推给 WS 客户端，但桥还在退避重连，
+`14:38:20` 才连上 —— 中间那条「让你大开眼界！」在 bridge.log 里连一行入站都没有，
+用户看到的就是「账号下线后收到的消息不会响应，桥不会读」。
+
+- **新增 `lib/bridge/offline.js` 离线补读**：连上之后 ① 等 `get_login_info` 真返回 user_id
+  ② `get_recent_contact` 拿最近会话 ③ 对「最后一条消息比水位新」的会话取
+  `get_friend_msg_history` / `get_group_msg_history` ④ 把水位之后的非自己消息按时间
+  重新注入入站流水线。回放走 `gateway.injectEvent()`，和实时帧共用 message_id 去重窗口，
+  「实时推一遍 + 补读又拿一遍」不会变成两轮回复。
+- **水位持久化**：`state.offline.lastSeenTs`，每条真实入站都刷新并落盘；旧状态文件用
+  `peers[*].proactive.lastUserMsgAt` 推。上限：12 小时 / 单次 30 条 / 单会话 10 条。
+- **入站 prompt 标注**：补读回来的消息带 `_offlineReplay` 标记，prompt 里写明原消息时间，
+  模型可以自然地说「刚看到 / 刚才号掉线了」，而不是装成刚刚收到。
+- **`OneBotGateway` 新增 `onConnect` 回调与 `injectEvent()`**：前者在 open 与 lifecycle
+  connect 之间去重后触发一次；后者供补读注入并参与去重。
+
+### Fixed（GSV 语音「时快时慢」：不是 speed 的锅，默认 top_k 收紧，2026-11-07）
+
+实测（本机 GSV v2 / CPU，同参考音频同文本）：
+- `speed` 参数存在且完全生效（0.8/1.0/1.2/1.5 时长比 1.254/1.000/0.842/0.675 ≈ 1/speed），
+  桥一直发 `speed=1.0` —— 「时快时慢」不是语速参数没传。
+- 时长 = AR 语义 token 数 × 40ms + 0.3s；同一句 15 字，`top_k=15` 时吐 53~75 token
+  （2.42~3.30s，max/min 1.36）= 听感抽奖；`top_k=5` → 52~66 token（CV 9.4%→6.5%）。
+- 反直觉：`temperature=0.6/top_p=0.6` 不会更稳（CV 11.4%），而且 `top_p<1` 会把 EOS
+  挤出候选 → 长句出现 36~60s「前几秒正常说话 + 后面近静音」的退化样本。
+
+改动：
+- 桥侧 gsv 默认 `top_k` 15→5（`messaging.js`），`config.tts.gsv.topK/topP` 可覆盖；
+  `lib/index.js` 透传 + `lib/store.js` 默认值补齐。`top_p` 保持 1.0。
+- 新增 `lib/bridge/wav.js`：合成后体检时长/尾部静音；坏样本自动重试一次（择优保留），
+  仍有多余尾静音就裁掉，避免用户听到几十秒静音。
+
 ### Added（好感度：模型可见 + 模型可提议，2026-11-06）
 
 用户重新明确了原始需求：**模型能看到好感度、并据此影响说话语气与距离感；模型在被夸/被贬
