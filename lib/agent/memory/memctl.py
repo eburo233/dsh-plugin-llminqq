@@ -1356,6 +1356,60 @@ def _done_conclusion_text(row, text=None, match=None):
     return DONE_PREFIX + src
 
 
+# ── v5 镜像：engine=v5 时 memctl done 只动 v4 的洞（2026-11-07）──────────────
+#
+# 背景：AGENTS.md §11 明确教机器人「待办完成就跑 memctl done --match …」。
+# 但 `done` 只改 v4 的 mem.db；engine=v5 之后**读路径根本不看 v4** ——
+# 于是 v5 里的 commitment 记忆永远 state='active'，机器人会一直以为自己还欠着事，
+# 而它明明已经执行过 done、也收到了成功输出。又一个「切换引擎后静默失效的旧工作流」。
+#
+# 只做**归档**（state → archived, reason='done'），不往 v5 插新条目：
+# 插入必须走 node 侧的 store（要同步维护 mem_fts 索引），Python 直接 INSERT
+# 会造出一条搜不到的记忆 —— 比不插更糟。「已完成」这个结论由 distill 从对话里学。
+#
+# 全部吞错：v5 是附加路径，绝不能因为它把 v4 的 done 弄失败（v4 仍是回滚目标）。
+def _v5_archive_done(match=None, peer=None, dry_run=False):
+    """把 v5 里命中的 active 记忆归档成 done。返回 {'db','hit','archived'} 或 None。
+
+    只支持 --match：v5 的 id 空间和 v4 完全不同（--id 传的是 v4 条目 id），
+    拿 v4 的 id 去改 v5 的表只会误伤，宁可不做。
+    """
+    if not match:
+        return None
+    try:
+        v5_path = os.path.join(os.path.dirname(DB), "mem-v5.db")
+        if not os.path.isfile(v5_path):
+            return None
+        conv = None
+        if peer:
+            # v4 peer 形如 c2c-3022464706 / group-1017567471；v5 conv 用冒号分隔
+            conv = str(peer).replace("-", ":", 1)
+        conn5 = sqlite3.connect(f"file:{v5_path}?mode=rw", uri=True, timeout=5.0)
+        try:
+            conn5.execute("PRAGMA busy_timeout=3000")
+            where = ("state='active' AND text LIKE ? ESCAPE '\\'"
+                     " AND text NOT LIKE ?")
+            params = ["%" + _like_escape(match) + "%", DONE_PREFIX + "%"]
+            if conv:
+                where += " AND conv=?"
+                params.append(conv)
+            hit = conn5.execute(
+                "SELECT COUNT(*) FROM memories WHERE " + where, params).fetchone()[0]
+            archived = 0
+            if not dry_run and hit:
+                cur = conn5.execute(
+                    "UPDATE memories SET state='archived', archived_reason='done'"
+                    " WHERE " + where, params)
+                archived = cur.rowcount or 0
+                conn5.commit()
+            return {"db": v5_path, "hit": int(hit), "archived": int(archived)}
+        finally:
+            conn5.close()
+    except Exception as e:  # noqa: BLE001 —— v5 是附加路径，失败绝不能影响 v4
+        sys.stderr.write(f"[memctl] v5 镜像跳过（{type(e).__name__}: {e}）\n")
+        return None
+
+
 def done(conn, match=None, ids=None, peer=None, text=None, dry_run=False):
     """把待办标成「已完成」：归档旧条目 + 补一条钉住的结论记忆。
 
@@ -1404,6 +1458,10 @@ def done(conn, match=None, ids=None, peer=None, text=None, dry_run=False):
     ).fetchall()
     out = {"rows": rows, "archived": 0, "conclusions": []}
     if not rows:
+        # ⚠️ 这里**不能**直接 return：v4 没命中不代表 v5 没命中
+        #   （v4 是流水账、v5 是提炼过的结论，两边内容不保证一致）。
+        #   engine=v5 时真正被读的是 v5，漏掉这一步就等于「done 了但没生效」。
+        out["v5"] = _v5_archive_done(match=match, peer=peer, dry_run=dry_run)
         return out
     by_peer = {}
     for r in rows:
@@ -1426,6 +1484,8 @@ def done(conn, match=None, ids=None, peer=None, text=None, dry_run=False):
             {"peer": p, "text": concl, "new": prev is None, "id": rid})
     if not dry_run:
         conn.commit()
+    # v5 镜像：把 v5 里同主题的 active 记忆也归档成 done（engine=v5 时 v4 那份没人读）
+    out["v5"] = _v5_archive_done(match=match, peer=peer, dry_run=dry_run)
     return out
 
 
@@ -2250,7 +2310,17 @@ def main():
         for r in st["rows"]:
             print(f"  - #{r['id']} [{r['peer']}] {r['text'][:70]}")
         if not st["rows"]:
+            # ⚠️ 不能在这里 return：v4 没命中不代表 v5 没命中。
+            #   engine=v5 时真正被读的是 v5 库，而两边内容不保证一致
+            #   （v4 是流水账、v5 是提炼过的结论）。提前返回会让「v5 已归档」
+            #   这件事不打印出来，用户以为没做事。
             print("没有匹配到未归档的待办（可能已经 done 过，或关键词不对）")
+            v5e = st.get("v5")
+            if v5e and (v5e["hit"] or v5e["archived"]):
+                verb = "将归档" if a.dry_run else "已归档"
+                print(f"{'[dry-run] ' if a.dry_run else ''}v5 镜像：{verb} "
+                      f"{v5e['hit'] if a.dry_run else v5e['archived']} 条"
+                      f"（{os.path.basename(v5e['db'])}，engine=v5 读的就是它）")
             return 0
         for c in st["conclusions"]:
             print(f"  + 结论 [{c['peer']}] {c['text']}"
@@ -2259,6 +2329,13 @@ def main():
         archived = len(st["rows"]) if a.dry_run else st["archived"]
         print(f"{'[dry-run] ' if a.dry_run else ''}"
               f"归档 {archived} 条待办 · 结论 {len(st['conclusions'])} 条")
+        # v5 侧（engine=v5 时真正被读的那份）。没说这一行的话，
+        # 用户会以为「done 成功了」，而 v5 里那条待办还挂着 —— 正是这个 bug。
+        v5 = st.get("v5")
+        if v5 and (v5["hit"] or v5["archived"]):
+            verb = "将归档" if a.dry_run else "已归档"
+            print(f"{'[dry-run] ' if a.dry_run else ''}v5 镜像：{verb} {v5['hit'] if a.dry_run else v5['archived']} 条"
+                  f"（{os.path.basename(v5['db'])}，engine=v5 读的就是它）")
         return 0
     elif a.cmd == "unpin":
         if not a.match and not a.ids:
