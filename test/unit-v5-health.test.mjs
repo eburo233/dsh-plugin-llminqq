@@ -149,3 +149,17 @@ test('进程检查只认「node + 以 lib/bridge/index.js 结尾的参数」', (
   assert.match(src, /lib\[\\\\\/\]bridge\[\\\\\/\]index\\\.js\$/, '脚本参数必须**以** lib/bridge/index.js **结尾**，不能是「包含」')
   assert.doesNotMatch(src, /pgrep'\s*,\s*\['-c'\]/, '不要用 pgrep -c 计数（它按命令行子串匹配）')
 })
+
+// 死信作业要分「还挡着进度」和「历史残留」
+// 现场困扰：3 个死信作业的 watermark 早已被后续成功作业越过（1178/1538/1558
+// vs 当前 2122），事件其实都处理过了 —— 但健康检查每次都报「3 个死信」，
+// 变成永远不会消失的假警报。人不该被训练成忽略警告。
+test('死信分类：watermark 已过的历史死信不该报警', () => {
+  const src = fs.readFileSync(SCRIPT, 'utf8')
+  assert.match(src, /staleDead/, '要有「历史死信」分类')
+  assert.match(src, /liveDead/, '要有「仍在挡进度」分类')
+  assert.match(src, /json_extract\(payload,'\$\.watermark'\)/, '要读作业 payload 里的 watermark 才能判断')
+  // 历史死信走 ok，仍挡进度才 warn
+  const staleBlock = src.slice(src.indexOf('else if (staleDead.length > 0)'), src.indexOf('else if (staleDead.length > 0)') + 200)
+  assert.match(staleBlock, /add\('ok'/, '历史死信应报 ok 而不是 warn')
+})

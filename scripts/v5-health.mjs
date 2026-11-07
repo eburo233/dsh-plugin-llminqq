@@ -146,11 +146,23 @@ if (exists(v5Db)) {
     else add('warn', 'distill 水位', `${wm} / ${ev}（积压 ${backlog}）`,
       '积压大说明 distill 跑得慢或失败。看 jobs 表的 dead 作业和 v5_meta 的 last_error')
 
-    const dead = Number(querySqlite(v5Db, "select count(*) from jobs where state='dead';") || 0)
+    // 死信作业要分两种：**还能挡住进度的** vs **过期记账残留**。
+    // 判据：作业 payload 里的 watermark 若已远小于当前水位，说明它那批事件
+    // 早被后续成功作业处理过了 —— 没有数据丢失，只是 jobs 表里清不掉的记录。
+    // 不做这个区分的话，健康检查会永远报「3 个死信」（实测就是这么烦人）。
+    const deadRows = (querySqlite(v5Db,
+      "select id||'|'||coalesce(json_extract(payload,'$.watermark'),0) from jobs where state='dead';") || '')
+      .split('\n').filter(Boolean).map(l => { const [id, wm] = l.split('|'); return { id, wm: Number(wm) || 0 } })
     const lastErr = querySqlite(v5Db, "select v from v5_meta where k='distill:last_error';") || ''
-    if (dead > 0 || lastErr) {
-      add('warn', 'distill 错误', `${dead} 个死信作业${lastErr ? '；' + lastErr.slice(0, 60) : ''}`,
+    const staleDead = deadRows.filter(d => d.wm < wm)
+    const liveDead = deadRows.filter(d => d.wm >= wm)
+    if (liveDead.length > 0) {
+      add('warn', 'distill 错误', `${liveDead.length} 个死信作业仍挡在进度前面（${liveDead.map(d => '#' + d.id).join(',')}）`,
         '常见原因：模型超时（把 memory.reflection 指向快模型，见 --fix）或路由不可用')
+    } else if (staleDead.length > 0) {
+      add('ok', 'distill 错误', `${staleDead.length} 个历史死信（watermark 已过，不影响数据；可忽略）`)
+    } else if (lastErr) {
+      add('warn', 'distill 错误', lastErr.slice(0, 80), '看 v5_meta 的 distill:last_error')
     } else add('ok', 'distill 错误', '无')
 
     const integ = querySqlite(v5Db, 'pragma integrity_check;')
