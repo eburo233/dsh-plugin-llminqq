@@ -99,12 +99,25 @@ if (reflOk) {
 }
 
 // ── 2) 进程：必须恰好一个桥 ─────────────────────────────────────────────────
+// ⚠️ 不能用 `pgrep -f bridge/index.js` 的结果直接当桥进程数：
+//   任何**命令行里提到这个字符串**的进程都会被抓进来（shell 包装、
+//   正在跑 `v5-health.mjs` 的父 shell、编辑器、我自己的排查命令……）。
+//   第一版就是这么误报「2 个桥」的（实际只有 1 个，ps 一看就知道）。
+//   判据收紧成：/proc/<pid>/cmdline 拆成 argv 后，
+//     ① argv[0] 的 basename 必须是 node（或 node 的路径）
+//     ② **某个 argv 以 lib/bridge/index.js 结尾**（不是「包含」）
 let bridgePids = []
 try {
   const out = execFileSync('pgrep', ['-f', 'bridge/index.js'], { encoding: 'utf8' })
   bridgePids = out.split('\n').map(s => s.trim()).filter(Boolean).filter(pid => {
-    // 排除 pgrep 自己 / shell 包装
-    try { return /bridge[\/\\]index\.js/.test(fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ')) } catch { return true }
+    let argv
+    try {
+      argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean)
+    } catch { return false }   // 读不到 /proc（非 Linux）就保守不计
+    if (!argv.length) return false
+    if (!/(^|[\\/])node(\.exe)?$/i.test(argv[0])) return false
+    // 只看「参数里那个脚本路径」，不接受它在别的参数里被顺口提到
+    return argv.slice(1).some(a => /(^|[\\/])lib[\\/]bridge[\\/]index\.js$/.test(a))
   })
 } catch { /* pgrep 无匹配（退出码 1）就是 0 个 */ }
 if (bridgePids.length === 1) add('ok', '桥进程', `1 个（pid=${bridgePids[0]}）`)

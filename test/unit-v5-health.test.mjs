@@ -138,3 +138,14 @@ test('v4 库缺失要报 bad（回滚能力没了，必须显眼）', () => {
   assert.ok(v4, '没有 v4 库检查项')
   assert.equal(v4.level, 'bad', 'v4 库是回滚唯一依据，缺了必须报严重')
 })
+
+// 回归：进程检查不能被「命令行里提到 bridge/index.js 的进程」骗到
+// 第一版用 `pgrep -f bridge/index.js` 直接数，结果把 shell 包装/父 shell 也算成桥，
+// 报「2 个桥」（实际只有 1 个）—— 这种假严重比漏报更耗人：会让人去杀正确的进程。
+test('进程检查只认「node + 以 lib/bridge/index.js 结尾的参数」', () => {
+  const src = fs.readFileSync(SCRIPT, 'utf8')
+  assert.match(src, /pgrep/, '还是用 pgrep 找候选（没问题）')
+  assert.match(src, /basename|node\(\\\.exe\)\?\$|node/, '要有 argv[0] 是 node 的判定')
+  assert.match(src, /lib\[\\\\\/\]bridge\[\\\\\/\]index\\\.js\$/, '脚本参数必须**以** lib/bridge/index.js **结尾**，不能是「包含」')
+  assert.doesNotMatch(src, /pgrep'\s*,\s*\['-c'\]/, '不要用 pgrep -c 计数（它按命令行子串匹配）')
+})
