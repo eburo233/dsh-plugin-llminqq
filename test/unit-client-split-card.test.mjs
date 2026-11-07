@@ -61,10 +61,15 @@ test('卡片用现有组件，保存走 saveConfig，且字段名就是 affectio
   assert.match(block, /h\(Field,/, '字段没用现有 Field 组件')
   assert.match(block, /h\(NumberInput,/, '数字输入没用现有 NumberInput 组件')
   // 字段名错了 = 桥收不到（这是这张卡存在的全部意义）
-  assert.match(block, /saveConfig\(\{ affection: \{ splitChars: clampInt\(v, 10, 200\) \} \}\)/,
-    '单段阈值没有保存到 affection.splitChars（或没夹区间）')
-  assert.match(block, /saveConfig\(\{ affection: \{ splitMaxParts: clampInt\(v, 2, 10\) \} \}\)/,
-    '每轮最多几条没有保存到 affection.splitMaxParts（或没夹区间）')
+  // 🔴 2026-11-06（P1-2 收尾）：改成**双写** —— `split:{...}`（正解）+ `affection:{...}`
+  //   （兼容旧桥/旧插件；也是老配置能被读到的依赖）。所以这里断言两条链路都在，
+  //   而不是只认 affection 段名（那正是「撞名」问题的源头）。
+  assert.match(block, /clampInt\(v, 10, 200\)/, '单段阈值没夹区间（10–200）')
+  assert.match(block, /split: \{ splitChars: n \}/, '单段阈值没写新 split 段')
+  assert.match(block, /affection: \{ splitChars: n \}/, '单段阈值没写 affection 段（兼容旧版本）')
+  assert.match(block, /clampInt\(v, 2, 10\)/, '每轮最多几条没夹区间（2–10）')
+  assert.match(block, /split: \{ splitMaxParts: n \}/, '每轮最多几条没写新 split 段')
+  assert.match(block, /affection: \{ splitMaxParts: n \}/, '每轮最多几条没写 affection 段（兼容旧版本）')
   // 只读数据来源是 cfg，不许自己发请求
   assert.doesNotMatch(block, /\bapi\(|\bpost\(|fetch\(/, '卡片自己发请求了 —— 应该走 saveConfig')
   // 当前值从 cfg.affection 读（`const aff = cfg.affection || {}` 在 BehaviorTab 顶部，

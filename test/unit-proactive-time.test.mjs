@@ -126,15 +126,20 @@ test('proactiveSpeak 的 prompt 顶部有【当前时间】', () => {
   // lines 数组的第一项就是 currentTimeLine()（前面允许有注释行）
   assert.match(body, /const lines = \[\s*(?:\/\/[^\n]*\n\s*)*currentTimeLine\(\)/,
     'proactiveSpeak 的 prompt 第一项不是 currentTimeLine()')
-  // 「摘要已存在，别动」：memDigest 注入要保留
-  assert.match(body, /【你的记忆摘要】/, '别把记忆摘要弄丢了')
+  // 记忆块注入要保留。2026-11-06 改口径：不再是「整份 digest 截 3000 字」的
+  // 【你的记忆摘要】，而是 memoryBlockForActive（v5 检索 / v4 只退本人那一节）。
+  assert.match(body, /memoryBlockForActive\(/, '主动搭话的记忆块要走 memoryBlockForActive()')
+  // 只断言「不是真实调用」—— 注释里提到旧写法是允许的（那是历史说明）。
+  assert.doesNotMatch(body, /=\s*readMemoryDigest\(\)/, '不允许再退回「整份 digest 截 3000 字」（会带别人的会话）')
 })
 
 test('chatFollowSpeak 的 prompt 顶部有【当前时间】', () => {
   const body = fnSource('chatFollowSpeak')
   assert.match(body, /const lines = \[\s*(?:\/\/[^\n]*\n\s*)*currentTimeLine\(\)/,
     'chatFollowSpeak 的 prompt 第一项不是 currentTimeLine()')
-  assert.match(body, /【你的记忆摘要】/, '别把记忆摘要弄丢了')
+  assert.match(body, /memoryBlockForActive\(/, '接话的记忆块要走 memoryBlockForActive()')
+  // 只断言「不是真实调用」—— 注释里提到旧写法是允许的（那是历史说明）。
+  assert.doesNotMatch(body, /=\s*readMemoryDigest\(\)/, '不允许再退回「整份 digest 截 3000 字」（会带别人的会话）')
 })
 
 test('入站回复也用同一行（三条路径一个时间口径）', () => {

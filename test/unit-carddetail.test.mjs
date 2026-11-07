@@ -115,10 +115,13 @@ test('carddetail: 合法短链（302 → BV → API）能展开出详情', async
       log: () => {},
     })
     assert.equal(out.length, 1)
-    assert.match(out[0], /^\[视频详情\] 《测试视频》/)
+    // 2026-11-06（P0-4）：标签改成「桥自动抓取，不是他说的话」，并且不再带简介
+    // （简介是最容易被模型拿去做「内容总结」的字段，正是「总去分析视频」的来源之一）。
+    assert.match(out[0], /^\[桥自动抓取的视频信息，不是他说的话\] 《测试视频》/)
     assert.match(out[0], /UP主/)
     assert.match(out[0], /2:05/)
     assert.match(out[0], /播放 1\.2万/)
+    assert.doesNotMatch(out[0], /简介/, '简介不该再进上下文（会引导模型做内容总结）')
     assert.equal(requested.length, 3, '短链 → 真地址 → API 共三次请求')
   })
 })

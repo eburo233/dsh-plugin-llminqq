@@ -26,6 +26,8 @@ dsh-plugin-llminqq-*.zip
 # 之前没忽略，导致 `git status` 里一堆噪音，而 `git add -A` 会把用户隐私提交上去。
 .qq-media/
 qq-agent/.qq-media/
+# B 站音频/克隆样本等运行期媒体产物（几 MB，属本机数据不入库）
+bili_audio/
 qq-agent/.bridge/
 qq-agent/memory/
 

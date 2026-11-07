@@ -337,14 +337,19 @@ test('漂移守卫：store 默认值喂进 affectionConfig 后必须一字不变
     'store.js 的默认值和这里的期望值不一致 —— 要么改默认值，要么改这条断言（别只改一处）')
 })
 
-test('源码级：bridgeConfig 里有 affection 段并调用了 affectionConfig(cfg)', () => {
+test('源码级：bridgeConfig 里有 split 段 + affection 两段（分条迁移 2026-11-06）', () => {
   const src = fs.readFileSync(path.join(ROOT, 'lib', 'index.js'), 'utf8')
   const start = src.indexOf('function bridgeConfig (cfg) {')
   assert.ok(start > 0, '定位不到 bridgeConfig')
   // 窗口给足 6000：这段注释很长，窗口太小会截断在表达式中间（这个测试自己踩过）
-  const body = src.slice(start, start + 6000)
-  assert.match(body, /affection: affectionConfig\(cfg\)/,
-    'bridgeConfig 没有透传 affection —— 桥只会吃写死的 30/3，设置页改了不生效')
+  const body = src.slice(start, start + 8000)
+  // ① 新段：出站分条有自己的 `split` 段（桥侧正在改成「新段优先、旧段兜底」）
+  assert.match(body, /split: splitConfig\(cfg\)/,
+    'bridgeConfig 没有产出 split 段 —— 分条参数的正式入口断了')
+  // ② 旧路径不破：affection 段里仍然产出 splitChars/splitMaxParts（桥侧旧读取还在读），
+  //    同时叠加真正的好感度参数。两段必须**并集**，不能只有其中一半。
+  assert.match(body, /affection: \{ \.\.\.splitConfig\(cfg\), \.\.\.affectionParams\(cfg\) \}/,
+    'bridgeConfig 的 affection 段结构变了 —— 要么丢了分条兼容键，要么没透传好感度参数')
 })
 
 // ═══════════════════════════════════════════════════════════════════════════

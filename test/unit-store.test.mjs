@@ -364,3 +364,171 @@ test('saveConfig: 只改一个分条键时同段另一个键保留', { skip: ski
   assert.equal(cfg.affection.splitChars, 40, '第二次保存把第一次的键丢了')
   assert.equal(cfg.affection.splitMaxParts, 4)
 })
+
+// ── 好感度参数（2026-11-06 task-1 / P1-2）：设置页必须能改桥的关系参数 ────────
+//
+// 背景：桥侧 lib/bridge/state.js 的 AFFECTION_DEFAULTS 把 enabled/start/
+// modelScoring/... 全写死，而插件侧 bridgeConfig 的 affection 段以前只有
+// splitChars/splitMaxParts（那是分条，不是关系）→ 用户在设置页根本没有入口。
+// 这一段锁住「store 默认值和桥对齐」这一环；bridgeConfig 的行为断言在
+// test/unit-affection-config.test.mjs（那个文件能 import lib/index.js）。
+//
+// 为什么默认值要写成字面量：和 state.js 的 AFFECTION_DEFAULTS 对齐是**约定**，
+// 谁悄悄改一处就应该有一条测试失败，而不是两边自动漂移。
+test('defaults.affection: 好感度参数默认值和桥的 AFFECTION_DEFAULTS 对齐', () => {
+  const a = M.defaults().affection
+  assert.ok(a, 'defaults 里没有 affection 段')
+  assert.equal(a.enabled, true, '好感度默认开（桥侧 AFFECTION_DEFAULTS.enabled=true）')
+  assert.equal(a.start, 30, '起始 30（桥侧 start=30）')
+  assert.equal(a.modelScoring, true, '模型自评通道默认开（桥侧 modelScoring=true）')
+  assert.equal(a.modelMaxPerRound, 2, '单轮上限 2（桥侧 modelMaxPerRound=2）')
+  assert.equal(a.dailyGainCap, 10, '日涨分上限 10（桥侧 dailyGainCap=10）')
+  assert.equal(a.decayFloor, 20, '衰减地板 20（桥侧 decayFloor=20）')
+  assert.deepEqual({ ...a.tiers }, { l1: 25, l2: 50, l3: 70, l4: 85, hate: 10 },
+    '档位分界线必须和桥一致（不一致 = 设置页显示的分档和桥真的分档不同）')
+})
+
+test('defaults.split: 分条的正式段默认 30 / 5（和 affection 里的历史键一致）', () => {
+  const s = M.defaults().split
+  assert.ok(s, 'defaults 里没有 split 段 —— bridgeConfig 就没法产出新段')
+  assert.equal(s.splitChars, 30)
+  assert.equal(s.splitMaxParts, 5)
+  // 两处默认值必须一致：设置页「分条」卡还写 affection.*，而桥侧会读 split.*。
+  // 不一致的直接后果是「设置页显示 30、桥拿到 45」这种最难查的假配置。
+  const a = M.defaults().affection
+  assert.equal(s.splitChars, a.splitChars, 'split 和 affection 的 splitChars 默认值不一致')
+  assert.equal(s.splitMaxParts, a.splitMaxParts, 'split 和 affection 的 splitMaxParts 默认值不一致')
+})
+
+test('readConfig: 老配置（没有 affection 新参数 / 没有 split 段）→ 默认值补齐', { skip: skipDisk }, () => {
+  resetDir()
+  // 模拟升级前存下来的配置：affection 段只有分条那两个历史键
+  writeConfigFile({ affection: { splitChars: 45, splitMaxParts: 4 } })
+  const cfg = M.readConfig()
+  // 用户改过的老键不能被默认值盖掉
+  assert.equal(cfg.affection.splitChars, 45, '老配置里用户改过的 splitChars 被默认值覆盖了')
+  assert.equal(cfg.affection.splitMaxParts, 4)
+  // 新键必须补齐（否则设置页显示空白、bridgeConfig 透传 undefined）
+  assert.equal(cfg.affection.enabled, true)
+  assert.equal(cfg.affection.start, 30)
+  assert.equal(cfg.affection.modelScoring, true)
+  assert.equal(cfg.affection.modelMaxPerRound, 2)
+  assert.equal(cfg.affection.dailyGainCap, 10)
+  assert.equal(cfg.affection.decayFloor, 20)
+  assert.deepEqual({ ...cfg.affection.tiers }, { l1: 25, l2: 50, l3: 70, l4: 85, hate: 10 })
+  // split 段也要补齐（新段对老配置同样是默认值）
+  assert.equal(cfg.split.splitChars, 30)
+  assert.equal(cfg.split.splitMaxParts, 5)
+})
+
+test('saveConfig: 只改一个好感度键时，同段其它键（含分条历史键、tiers）都保留', { skip: skipDisk }, () => {
+  resetDir()
+  M.saveConfig({ affection: { start: 50 } })
+  M.saveConfig({ affection: { tiers: { l1: 30 } } })
+  M.saveConfig({ affection: { modelScoring: false } })
+  const cfg = M.readConfig()
+  assert.equal(cfg.affection.start, 50, '第二次保存把 start 丢了')
+  assert.equal(cfg.affection.modelScoring, false)
+  // tiers 深合并：只改了 l1，其余档位边界必须留着（丢了桥会按默认分档）
+  assert.deepEqual({ ...cfg.affection.tiers }, { l1: 30, l2: 50, l3: 70, l4: 85, hate: 10 },
+    'tiers 没做深合并 —— 只改一个档位会把其它档位冲掉')
+  // 分条的历史键和 split 段不能被「保存好感度参数」顺手抹掉
+  assert.equal(cfg.affection.splitChars, 30)
+  assert.equal(cfg.affection.splitMaxParts, 5)
+  assert.equal(cfg.split.splitChars, 30)
+  assert.equal(cfg.split.splitMaxParts, 5)
+})
+
+// ── bridgeConfig 的行为断言（2026-11-06 task-1 / P1-2）──────────────────────
+//
+// 为什么必须是**行为**断言而不是源码正则：v5 摊平那次事故（memory.v5 写成
+// `...memoryV5Config(cfg.memory)` 摊平到 memory 顶层）源码断言是绿的 ——
+// 正则只证明「这行代码写了」，不证明「产出的结构对」。所以这里真的调一次
+// bridgeConfig()，用 Array/对象取值验结果。
+//
+// 隔离：这个文件顶部已经把 DSH_HOME 引到 os.tmpdir()，且 dataDir() 从安装路径
+// 反推不出来时才会用 DSH_HOME —— 所以这里的 bridgeConfig() 只读不写，绝不会
+// 碰真实 ~/.dsh。它内部会跑一次 pythonProbe（约 100-200ms，缓存后不再跑），
+// 对单测是可接受的成本。
+const IDX = await import(pathToFileURL(path.join(PKG, 'lib', 'index.js')).href)
+
+/** 取 bridgeConfig 产出的对象（没传 config 时用一份最小配置）。 */
+function bcOf (cfg = {}) {
+  return IDX.bridgeConfig({
+    onebot: {}, dsh: {}, policy: {}, media: {}, server: {}, log: {},
+    persona: {}, memory: {}, features: {}, tts: {}, style: {}, learning: {},
+    ...cfg,
+  })
+}
+
+test('bridgeConfig: affection 段真的是行为透传（start/开关/模型自评）', () => {
+  const bc = bcOf({ affection: { start: 50 } })
+  assert.equal(bc.affection.start, 50, '设置页把 start 改到 50，桥却拿不到 —— 又是假配置')
+  assert.equal(bc.affection.enabled, true, '老配置没有 enabled → 默认开')
+  assert.equal(bc.affection.modelScoring, true)
+  assert.equal(bc.affection.modelMaxPerRound, 2)
+  assert.equal(bc.affection.dailyGainCap, 10)
+  assert.equal(bc.affection.decayFloor, 20)
+  assert.deepEqual({ ...bc.affection.tiers }, { l1: 25, l2: 50, l3: 70, l4: 85, hate: 10 },
+    '档位分界线没透传 —— 桥会按自己的默认分档，设置页改的档位不生效')
+
+  const off = bcOf({ affection: { enabled: false, modelScoring: false } })
+  assert.equal(off.affection.enabled, false, '显式关掉好感度，桥必须看到 false')
+  assert.equal(off.affection.modelScoring, false)
+})
+
+test('bridgeConfig: affection 段仍带分条键（桥侧旧读取路径不破）', () => {
+  const bc = bcOf({ affection: { splitChars: 45, splitMaxParts: 3 } })
+  // 桥侧 lib/bridge/index.js 的 splitForSend 至今读 config.affection.splitChars，
+  // 所以哪怕 split 新段已经有了，affection 里这两个键也必须继续存在。
+  assert.equal(bc.affection.splitChars, 45, 'affection 段丢了 splitChars —— 桥的分条读取会回落到硬编码 30')
+  assert.equal(bc.affection.splitMaxParts, 3, 'affection 段丢了 splitMaxParts')
+})
+
+test('bridgeConfig: split 新段存在且与 affection 里的历史键一致（双写期）', () => {
+  const bc = bcOf({ affection: { splitChars: 45, splitMaxParts: 3 } })
+  assert.equal(bc.split.splitChars, 45, 'split 新段没透传 —— 桥侧迁移后拿不到分条参数')
+  assert.equal(bc.split.splitMaxParts, 3)
+  assert.notEqual(bc.split, bc.affection, 'split 段不该和 affection 是同一个对象（否则合并会互踩）')
+
+  // 默认配置：新段 30/5，且和 affection 里的历史键**同值**（双写期必须一致）
+  const d = bcOf()
+  assert.equal(d.split.splitChars, 30)
+  assert.equal(d.split.splitMaxParts, 5)
+  assert.equal(d.affection.splitChars, d.split.splitChars)
+  assert.equal(d.affection.splitMaxParts, d.split.splitMaxParts)
+})
+
+test('bridgeConfig: 用户改用 config.split 段时，新段优先（分条迁移的读取规则）', () => {
+  // 用户开始用新入口：split=45，affection 仍是默认 30 → 必须取 45
+  const bc = bcOf({ split: { splitChars: 45 } })
+  assert.equal(bc.split.splitChars, 45)
+  assert.equal(bc.affection.splitChars, 45, '新段 45 时旧路径也要跟上（双写期桥两边都可能读）')
+
+  // 反过来：用户改的是老入口（affection=45），split 是默认 30 → 必须取 45，
+  // 不能被 split 里那份默认值盖掉（这正是「设置页改了不生效」的经典形态）。
+  const bc2 = bcOf({ affection: { splitChars: 45 } })
+  assert.equal(bc2.split.splitChars, 45, 'affection 改到 45 被 split 的默认 30 盖掉了 —— 设置页假配置')
+})
+
+test('bridgeConfig: 好感度参数越界/非法值被夹回区间（手改 config.json 也拦得住）', () => {
+  const bc = bcOf({
+    affection: {
+      start: 999, modelMaxPerRound: 99, dailyGainCap: 999, decayFloor: -5,
+      tiers: { l1: 130, l2: 'abc' },
+    },
+  })
+  assert.equal(bc.affection.start, 80, 'start 上限 80 没夹住')
+  assert.equal(bc.affection.modelMaxPerRound, 5, 'modelMaxPerRound 上限 5 没夹住')
+  assert.equal(bc.affection.dailyGainCap, 30, 'dailyGainCap 上限 30 没夹住')
+  assert.equal(bc.affection.decayFloor, 0, 'decayFloor 的合法下界是 0（不能把 0 当非法值回落成 20）')
+  assert.equal(bc.affection.tiers.l1, 100, 'tiers 没夹到 0..100')
+  assert.equal(bc.affection.tiers.l2, 50, 'tiers 非数字应回落默认值')
+})
+
+test('bridgeConfig: modelMaxPerRound 保留 0.5 步进（不能四舍五入成整数）', () => {
+  const bc = bcOf({ affection: { modelMaxPerRound: 1.5 } })
+  assert.equal(bc.affection.modelMaxPerRound, 1.5, '0.5 步进被抹成整数了 —— 用户选 1.5 会变成 2')
+  const bc2 = bcOf({ affection: { modelMaxPerRound: 1.3 } })
+  assert.equal(bc2.affection.modelMaxPerRound, 1.5, '非 0.5 整数倍应归到最近的 0.5 档')
+})

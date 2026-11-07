@@ -391,12 +391,14 @@ window.__ModuleLoader__.load({
       })
     }
 
-    function NumberInput ({ value, onCommit, min, max, disabled }) {
+    // 数字输入：可选 step（好感度「单轮上限」要 0.5 步进）。
+    // 默认 step 不传 = 浏览器默认 1，老卡片的调用方式完全不变。
+    function NumberInput ({ value, onCommit, min, max, step, disabled }) {
       const [local, setLocal] = useState(String(value ?? ''))
       const focused = useRef(false)
       useEffect(() => { if (!focused.current) setLocal(String(value ?? '')) }, [value])
       return h('input', {
-        type: 'number', min, max, value: local, disabled,
+        type: 'number', min, max, step, value: local, disabled,
         onFocus: () => { focused.current = true },
         onChange: e => setLocal(e.target.value),
         onBlur: () => {
@@ -1487,8 +1489,9 @@ window.__ModuleLoader__.load({
       // 老配置里没有这 4 个键 → 这里给的是和 lib/store.js defaults 一致的默认值，
       // 保证设置页打开时不显示空白（空白会让用户以为坏了，其实只是没配过）。
       const media = cfg.media || {}
-      // 出站分条（2026-11-05 task-24）：bridge 读 config.affection.splitChars /
-      // splitMaxParts，插件侧 store 默认 30 / 5。老配置没有这个段 → 用默认值显示。
+      // 好感度/分条都长在 cfg.affection（历史原因：分条先占了这个段名，
+      // 后来关系参数也用了它 —— 见下面「分条」「关系（好感度）」两张卡的注释）。
+      // 老配置没有这个段 → 卡片用 ?? 兜到和 store.js defaults 一致的值。
       const aff = cfg.affection || {}
       // 🔴 2026-10-31 修：语音卡片的 API Key 输入要用 data.secrets 判断「已设置」，
       //   之前这个组件没接 data → render 时 ReferenceError: secrets is not defined
@@ -1507,6 +1510,14 @@ window.__ModuleLoader__.load({
       // 用户能手打 0 或 999 进去；这里先夹一次，config.json 里就不会留下
       // 桥要读的脏值（插件侧 bridgeConfig 还有第二道 clamp，双保险）。
       const clampInt = (v, lo, hi) => Math.min(hi, Math.max(lo, Math.round(Number(v) || 0)))
+      // 小数版（好感度「模型单轮涨幅上限」要 0.5 步进，不能四舍五入成整数）。
+      // NaN/空串 → lo（和 clampInt 的 `|| 0` 同一条兜底思路）。
+      const clampFloat = (v, lo, hi, step) => {
+        const n = Number(v)
+        if (!Number.isFinite(n)) return lo
+        const c = Math.min(hi, Math.max(lo, n))
+        return Math.round(c / step) * step
+      }
 
       return h(React.Fragment, null,
         h('div', { className: 'card' },
@@ -1710,6 +1721,13 @@ window.__ModuleLoader__.load({
         // 链路：这张卡 → config.affection.* → lib/index.js bridgeConfig()
         // → bridge-config.json → lib/bridge/index.js splitReplyForSend。
         //
+        // 🔴 2026-11-06 task-1 注意：这两个字段**历史上借用了 affection 段名**
+        // （那时 affection 只是占位；后来「关系参数」真用上了这个段，语义撞车）。
+        // **现在双写**：`split:{...}`（正解）+ `affection:{...}`（兼容旧桥/旧插件版本）。
+        // 为什么必须双写而不是只写新的：store 的默认值现在永远产出 split:{30,5}，
+        // 而桥侧的口径是「非默认值才算显式」——只写 affection 的用户改动会被
+        // split 的默认值盖掉（又是一轮「改了不生效」）。双写之后两条链路都拿到同一个值。
+        //
         // 文案必须写清规则（用户 2026-11-05 定稿），否则改完看起来「没生效」：
         //   换行 / [SPLIT] 是**强制**分条（不受阈值影响）；空格不算分条；
         //   超出条数上限时多出来的并进最后一条。
@@ -1724,14 +1742,80 @@ window.__ModuleLoader__.load({
             h(Field, { label: '单段阈值（字）', sub: '单段超过这个字数才按标点再拆；换行/[SPLIT] 不受它限制' },
               h(NumberInput, {
                 value: aff.splitChars ?? 30, min: 10, max: 200,
-                onCommit: v => saveConfig({ affection: { splitChars: clampInt(v, 10, 200) } }),
+                onCommit: v => {
+                  const n = clampInt(v, 10, 200)
+                  // 双写：split 是正解，affection 兼容旧版本（见上面注释）
+                  saveConfig({ split: { splitChars: n }, affection: { splitChars: n } })
+                },
               })),
             h(Field, { label: '每轮最多几条', sub: '含换行/[SPLIT] 拆出来的；超出部分并进最后一条' },
               h(NumberInput, {
                 value: aff.splitMaxParts ?? 5, min: 2, max: 10,
-                onCommit: v => saveConfig({ affection: { splitMaxParts: clampInt(v, 2, 10) } }),
+                onCommit: v => {
+                  const n = clampInt(v, 2, 10)
+                  saveConfig({ split: { splitMaxParts: n }, affection: { splitMaxParts: n } })
+                },
               })),
           ),
+          h('div', { className: 'hint' },
+            '改完要重启桥才生效（「运行」页 →「重启桥」；保存后桥通常也会自动重启一下）。'),
+        ),
+
+        // ── 关系（好感度）：桥怎么记「你和我」的距离（2026-11-06 task-1 / P1-2）
+        // 为什么这张卡必须存在：桥侧（lib/bridge/state.js 的 AFFECTION_DEFAULTS）
+        // 把 enabled/start/modelScoring/档位分界线全部**写死在代码里**，而
+        // bridgeConfig 的 affection 段以前只有 splitChars/splitMaxParts（那是分条，
+        // 不是关系）→ 用户在设置页根本没有入口，只能改代码。
+        // 链路：这张卡 → config.affection.* → lib/index.js bridgeConfig()
+        //       → bridge-config.json → lib/bridge/state.js affectionCfg()。
+        //
+        // 只暴露「用户真会调」的几项（改默认值必须同时看 lib/index.js 的
+        // AFFECTION_PARAM_LIMITS 和 store.js defaults —— 三处一起改）：
+        //   开/关、起始分、模型自评开关 + 单轮上限、日涨分上限、衰减地板。
+        // praiseGain / insultPenalty / 各冷却时间**故意不暴露**：
+        // 那些是调分经济的手工常数，调坏了关系系统只会让人更困惑。
+        h('div', { className: 'card' },
+          h('div', { className: 'card-title' }, '关系（好感度）',
+            h('span', { className: 'muted', style: { marginLeft: 'auto', fontWeight: 400 } },
+              '桥按聊天记亲疏')),
+          h(SwitchRow, {
+            label: '启用好感度',
+            desc: '关掉后桥完全不记分数、不降分、也不把关系状态注入上下文',
+            on: aff.enabled !== false,
+            onChange: v => saveConfig({ affection: { enabled: v } }),
+          }),
+          aff.enabled !== false ? h(React.Fragment, null,
+            h('div', { className: 'grid2' },
+              h(Field, { label: '起始好感度（10-80）', sub: '新认识的人从多少分开始算；默认 30' },
+                h(NumberInput, {
+                  value: aff.start ?? 30, min: 10, max: 80,
+                  onCommit: v => saveConfig({ affection: { start: clampInt(v, 10, 80) } }),
+                })),
+              h(Field, { label: '每天涨分上限', sub: '防止一句话刷分；默认 10 分/天' },
+                h(NumberInput, {
+                  value: aff.dailyGainCap ?? 10, min: 1, max: 30,
+                  onCommit: v => saveConfig({ affection: { dailyGainCap: clampInt(v, 1, 30) } }),
+                })),
+            ),
+            h('div', { className: 'grid2' },
+              h(Field, { label: '久不联系缓降地板', sub: '再久没聊也不会掉到这个分以下；默认 20' },
+                h(NumberInput, {
+                  value: aff.decayFloor ?? 20, min: 0, max: 40,
+                  onCommit: v => saveConfig({ affection: { decayFloor: clampInt(v, 0, 40) } }),
+                })),
+              h(Field, { label: '模型单轮涨幅上限', sub: '模型只能在 ±这个幅度内提议；分由桥自己算' },
+                h(NumberInput, {
+                  value: aff.modelMaxPerRound ?? 2, min: 0.5, max: 5, step: 0.5,
+                  onCommit: v => saveConfig({ affection: { modelMaxPerRound: clampFloat(v, 0.5, 5, 0.5) } }),
+                })),
+            ),
+          ) : null,
+          h(SwitchRow, {
+            label: '允许模型提议加减分',
+            desc: '开 = 模型可以用 [AFF:±n:理由] 提议涨/降分，分数仍由桥按冷却和上限计算；关 = 只按规则信号记分',
+            on: aff.modelScoring !== false,
+            onChange: v => saveConfig({ affection: { modelScoring: v } }),
+          }),
           h('div', { className: 'hint' },
             '改完要重启桥才生效（「运行」页 →「重启桥」；保存后桥通常也会自动重启一下）。'),
         ),

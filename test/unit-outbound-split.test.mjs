@@ -226,11 +226,12 @@ test('「分条怎么写」块定义一次、三处 prompt 都注入（入站/�
   // 正例 ≥2：用户要求「2 行规则 + 2 个正例」
   assert.ok((style.match(/正例/g) ?? []).length >= 2, '提示块要有两个正例')
   // 三处注入（handleInbound 是 async function，fnSource 也能抠）
-  assert.match(fnSource('handleInbound'), /splitStyleBlock\(\)/, '入站回复 prompt 没注入分条写法')
+  // 2026-11-06：入站 prompt 的主体拆到 handleInboundAllowed（入口只做 allow 判定 + 分流）
+  assert.match(fnSource('handleInboundAllowed'), /splitStyleBlock\(\)/, '入站回复 prompt 没注入分条写法')
   assert.match(fnSource('proactiveSpeak'), /splitStyleBlock\(\)/, '主动搭话 prompt 没注入分条写法')
   assert.match(fnSource('chatFollowSpeak'), /splitStyleBlock\(\)/, '接话 prompt 没注入分条写法')
   // 旧硬约束里那段 SPLIT 文案应该已经挪走（硬约束只留「不能做什么」）
-  assert.doesNotMatch(fnSource('handleInbound'), /\[SPLIT\] 只能写在逗号/, '旧的硬约束 SPLIT 文案还留着')
+  assert.doesNotMatch(fnSource('handleInboundAllowed'), /\[SPLIT\] 只能写在逗号/, '旧的硬约束 SPLIT 文案还留着')
 })
 
 test('AGENTS.md 写了分条写法 + 单条上限改成实际值（P2-5）', () => {

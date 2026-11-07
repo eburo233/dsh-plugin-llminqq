@@ -43,7 +43,10 @@ function findDest () {
     .filter(Boolean)
   const candidates = []
   for (const root of roots) {
-    for (const profile of ['desktop', 'acp']) {
+    // 2026-11-06：本机实际装在 `web` profile（DSH Web GUI 那一套），
+    // 以前只扫 desktop/acp → 脚本在本机永远「找不到安装副本」，
+    // 每次都得手写 --dest。按「desktop → web → acp」顺序试。
+    for (const profile of ['desktop', 'web', 'acp']) {
       candidates.push(path.join(root, 'profiles', profile, 'node_modules', 'dsh-plugin-llminqq'))
     }
   }

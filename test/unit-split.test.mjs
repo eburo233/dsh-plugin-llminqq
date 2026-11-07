@@ -115,7 +115,18 @@ test('！？不作切点：感叹/疑问不能被拆散（2026-11-02 用户要�
 test('出站拆条走 common.splitOutboundParts（不再有按 。！？ 拆的老路径）', () => {
   const i = SRC.indexOf('function splitForSend')
   assert.ok(i > 0, '定位不到 splitForSend')
-  const body = SRC.slice(i, i + 1200)
+  // 按花括号配平抠整个函数（2026-11-06：分条读取加了 split/affection 兼容逻辑，
+  // 固定 1200 字符窗口会截不到调用点 —— 换成正则匹配「第一个配平的右花括号」更稳）
+  const body = (() => {
+    let depth = 0, started = false
+    for (let j = SRC.indexOf('{', i); j < SRC.length; j++) {
+      if (SRC[j] === '{') { depth++; started = true } else if (SRC[j] === '}') {
+        depth--
+        if (started && depth === 0) return SRC.slice(i, j + 1)
+      }
+    }
+    return SRC.slice(i, i + 4000)
+  })()
   assert.match(body, /splitOutboundParts\(text, \{ threshold, maxParts \}\)/,
     'splitForSend 必须调 common 的纯函数（换行/[SPLIT]/阈值兜底/5 条上限都在那边）')
   assert.doesNotMatch(body, /splitLongSentence/, '老的按 。！？ 拆的路径应该已经删干净')
@@ -330,4 +341,16 @@ test('energyHint 的字数上限和 energyCharCap 一致（同一份 energyCaps�
   assert.match(s.energyHint('nobody'), /10 字以内/)
   s.state.energy = { value: 0.5, at: Date.now() }
   assert.ok(!/字以内/.test(s.energyHint('nobody')), '35% 以上不该再给字数上限')
+})
+
+test('分条参数：split 段默认值不能盖掉「只改了 affection 段」的老配置', () => {
+  // 2026-11-06（P1-2 收尾）：store 的默认值现在永远产出 split:{30,5}，
+  // 所以桥侧若按「存在优先」（split.x ?? affection.x），用户把 affection.splitChars
+  // 调成 45 会被 split 的默认 30 盖掉 —— 正是「改了不生效」那类坑。
+  // 口径必须是「非默认值才算显式」。这里锁源码里的 pick 口径。
+  const i = SRC.indexOf('function splitForSend')
+  const body = SRC.slice(i, i + 2600)
+  assert.match(body, /na !== def/, '要按「非默认才算显式」判断，不能只看有没有值')
+  assert.match(body, /pick\(sp\.splitChars, af\.splitChars, 30\)/, '阈值：split 显式 → affection → 默认 30')
+  assert.match(body, /pick\(sp\.splitMaxParts, af\.splitMaxParts, 5\)/, '条数：同上，默认 5')
 })

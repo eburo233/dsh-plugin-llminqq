@@ -278,9 +278,125 @@ RULE_SHAPE = re.compile(
     r"|以后(都|每次)|每次(都|要)|长期)"
 )
 
+# ── 显式日期解析（2026-11-06 task-2）─────────────────────────────────────────
+# 为什么放在 memctl 里而不是再写一套：v5 迁移（scripts/memory-v4-to-v5.mjs）和
+# distill 已经因为「各写一套时间口径」踩过坑（同一个日期两种解读）。这里按
+# **同一组正则、同一条年份推断规则**实现一份 Python 版，口径对齐：
+#   · 完整日期：YYYY-MM-DD / YYYY年M月D日 / M月D日
+#   · M月D日 的年份：用这条记忆的 created 年份；若该日历日早于 created 那天 → 次年
+#     （「10月5日」指的必然是当时最近的那个 10月5日）
+#   · 区间/约数词（之后/大概/左右…）一律不猜（拿它当过期边界会误杀真实约定）
+# 用途只有两个：① is_pin/自动钉住判定里的「绝对日期闸」② digest 的过期降级。
+# ⚠️ 不复用 v5 迁移那份 JS：强边界是「两个进程语言不同」，跨语言共享只能靠
+#    契约（同正则+同规则）；注释里写清了契约，改动时两边一起改。
+RE_DATE_YMD_DASH = re.compile(r"(\d{4})-(\d{1,2})-(\d{1,2})")
+RE_DATE_YMD_CN = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日?")
+RE_DATE_MD = re.compile(r"(\d{1,2})月(\d{1,2})日")
+# 这些词会让「某日期」的语义变成区间/约数（「10月5日之后」「大概10月5日」），
+# 判断过期/钉住时都不猜它们（宁可漏，不可猜）。
+# 注意不放单个「约」：v4 里「约好 2026-10-26 开会」是**确定**的约定。
+RE_DATE_VAGUE = re.compile(r"(之前|以前|之后|以后|前后|左右|大概|大约|预计|截至|截止)")
 
-def is_pin(text):
-    """强记忆点：必须是「讲清楚的一条规矩」才钉住。
+# 规则②的三个要件（相对时间词 + 钟点 + 安排动词）。抽成常量给「钉住判定」和
+# 「kind 归类」共用 —— 两处若各写一份，改了一边忘了另一边就会出「钉住但按
+# 三天半衰期衰减」这种自相矛盾。
+RELATIVE_DAY_WORDS = re.compile(r"(明天|后天|下周|下次|周[一二三四五六日])")
+CLOCK_WORDS = re.compile(r"(\d{1,2}[:：]\d{2}|上午|下午|晚上|点)")
+ARRANGE_WORDS = re.compile(r"(开会|见面|约|安排|记得|别忘|提醒)")
+
+
+def find_explicit_dates(text):
+    """文本里**所有完整显式日期**（YYYY-MM-DD / YYYY年M月D日 / M月D日）。
+
+    返回 [{kind:'ymd'|'md', month, day, year|null}]，按出现位置排序；
+    重叠的匹配只留更具体的（「2026年10月26日」不会被 M月D日 再匹配一次）。
+    口径与 scripts/memory-v4-to-v5.mjs 的 findExplicitDates 一致（见上面契约）。
+    """
+    t = str(text or "")
+    spans = []      # (start, end, dict)
+    for rex, kind in ((RE_DATE_YMD_DASH, "ymd"), (RE_DATE_YMD_CN, "ymd"), (RE_DATE_MD, "md")):
+        for m in rex.finditer(t):
+            start, end = m.start(), m.end()
+            if any(s < end and start < e for s, e, _ in spans):
+                continue
+            if kind == "ymd":
+                spans.append((start, end, {"kind": "ymd", "year": int(m.group(1)),
+                                           "month": int(m.group(2)), "day": int(m.group(3))}))
+            else:
+                spans.append((start, end, {"kind": "md", "year": None,
+                                           "month": int(m.group(1)), "day": int(m.group(2))}))
+    spans.sort(key=lambda x: x[0])
+    return [d for _, _, d in spans]
+
+
+def _infer_year_from_created(month, day, created):
+    """M月D日 → 年份：用 created 那年；若该日历日早于 created 那天 → 次年。"""
+    try:
+        c_ts = float(created)
+    except (TypeError, ValueError):
+        return None
+    if not (c_ts > 0):
+        return None
+    c = datetime.fromtimestamp(c_ts, timezone.utc).astimezone()
+    try:
+        candidate = datetime(c.year, month, day).date()
+        created_day = datetime(c.year, c.month, c.day).date()
+    except ValueError:
+        return None
+    return c.year + 1 if candidate < created_day else c.year
+
+
+def _date_boundary_ts(text, created, now=None):
+    """文本自带的显式日期 → 「这一天的结束」时刻（秒）；不猜/无日期 → None。
+
+    为什么取**当天结束**而不是 0 点：对「过期」判定这是最保守的做法 ——
+    「今天三点开会」在当天 23:59 之前都不算过期（不会把今天的事提前判死）。
+    多条日期时取**最晚**那条（只要还有一条没过去就不过期）。
+    带区间/约数词、或年份推不出来 → 不猜（None）。
+    """
+    t = str(text or "")
+    dates = find_explicit_dates(t)
+    if not dates:
+        return None
+    if RE_DATE_VAGUE.search(t):
+        return None
+    latest = None
+    for d in dates:
+        year = d["year"] if d["kind"] == "ymd" else _infer_year_from_created(d["month"], d["day"], created)
+        if not year:
+            return None
+        try:
+            # 本地时区当天 23:59:59（和「今天」这个口径一致，不用 UTC 猜）
+            dt = datetime(year, d["month"], d["day"], 23, 59, 59).astimezone()
+        except ValueError:
+            return None
+        ts = dt.timestamp()
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
+def _explicit_date_is_past(text, created, now=None):
+    """文本自带显式日期且**整一天都已过去** → True。无日期/不猜 → False（不降级）。"""
+    boundary = _date_boundary_ts(text, created)
+    if boundary is None:
+        return False
+    return boundary < (now if now is not None else now_ts())
+
+
+# 钉住判定结果里的 kind 提示（见 pin_decision）
+PIN_KIND_RULE = "rule"                 # 规矩类 → procedural（365 天半衰期）
+PIN_KIND_ARRANGEMENT = "arrangement"   # 带时间锚的一次性安排 → semantic（60 天）
+PIN_KIND_SEMANTIC = "semantic"         # 带绝对日期的一次性安排 → semantic，但**不钉**
+
+
+def pin_decision(text):
+    """自动钉住的**唯一真相**（is_pin 只是它的布尔投影）。
+
+    返回 dict：
+      pin              要不要钉住
+      kind             'rule' / 'arrangement' / 'semantic'（给调用方定 kind 用）
+      importance_floor 重要性下限（不钉但该记住的安排给 0.8）
 
     踩过的坑：v1 里「那我以后给你正个咋样」「已开启：proactive…」
     这种讨论过程/状态汇报也被钉住了，结果 10 条 pin 里有一半是噪音。
@@ -288,24 +404,54 @@ def is_pin(text):
       ① 不能是疑问句或讨论语气
       ② 不能是「我已开启/已提交」这类状态汇报（那是我的话，不是他的约定）
       ③ 得真的有规矩的句式
+
+    2026-11-06 再加两道闸（P1-3，生产库实锤 id=222「明天(2026-10-26)下午三点
+    开会，地点3楼」被钉成 procedural、一个月后还在 digest 里带 ★）：
+      ④ **文本自带绝对日期 → 不钉**。绝对日期能被后续过期规则解析，钉住没意义；
+         只有相对时间（明天/下周/周X）没法被解析、才需要钉住兜底。
+         这类仍按「普通 semantic + importance 0.8」保留（还是重要，但不过期不消失）。
+      ⑤ 规则②钉住的是**一次性安排**，不是「规矩」→ kind 保持 semantic（60 天
+         半衰期），不再强制 procedural（365 天）——见 remember() 的 kind 映射。
     """
     t = (text or "").strip()
     if len(t) < 8:
-        return False                      # 太短不可能是完整规矩
+        return {"pin": False, "kind": None, "importance_floor": None}   # 太短不可能是完整规矩
     if NOT_RULE.search(t):
-        return False
+        return {"pin": False, "kind": None, "importance_floor": None}
     # ① 「规矩类」：讲的是以后该怎么做
     hard = re.search(r"(记住|必须|一律|只对|只接|只能|以后都)", t)
     longterm = re.search(r"(以后|每次|一律|默认|长期|说好了|规矩|约定)", t)
     if hard and longterm and RULE_SHAPE.search(t):
-        return True
-    # ② 「重要事实类」：带明确时空锚（明天/几点/几楼/日期）的承诺和安排，
-    #    不满足规矩句式但同样该钉住（否则时间一过就检索不到）。
-    if re.search(r"(明天|后天|下周|下次|周[一二三四五六日])", t) and \
-       re.search(r"(\d{1,2}[:：]\d{2}|上午|下午|晚上|点)", t) and \
-       re.search(r"(开会|见面|约|安排|记得|别忘|提醒)", t):
-        return True
-    return False
+        return {"pin": True, "kind": PIN_KIND_RULE, "importance_floor": None}
+    # ② 「重要事实类」：带明确时空锚（明天/几点/几楼）的承诺和安排 —— 但先过闸④
+    #    「带时间锚」有两种写法，闸④ 对它们的态度不同：
+    #      · 绝对日期（2026-10-26 / 10月26日）：**不钉**，按普通语义事实留
+    #        （能被过期规则解析，钉住只会变成永久钉子）；
+    #      · 相对时间（明天/下周/周X）：**钉住**，因为它在文本里没有可解析的
+    #        绝对时刻，不钉就会随时间漂走（这正是钉住存在的意义）。
+    #    两种写法的「签名」是同一个（钟点 + 安排动词），差别只在日期形态；
+    #    所以这里把「有日期也有钟点+安排词」也认成重要事实，只是不钉。
+    anchored = bool(CLOCK_WORDS.search(t) and ARRANGE_WORDS.search(t))
+    if RELATIVE_DAY_WORDS.search(t) and anchored:
+        if find_explicit_dates(t):
+            # 绝对日期（哪怕同时写了「明天(2026-10-26)」）：绝对日期优先，不钉
+            return {"pin": False, "kind": PIN_KIND_SEMANTIC, "importance_floor": 0.8}
+        return {"pin": True, "kind": PIN_KIND_ARRANGEMENT, "importance_floor": None}
+    if anchored and find_explicit_dates(t):
+        # 只有绝对日期、没有相对时间词（「2026年10月26日下午三点开会」）：
+        # 旧规则②本来就不会钉它；但它仍是一条「重要事实」，importance 也给 0.8，
+        # 否则它和闲聊同权重，会在过期判定前就被 importance 排序挤掉。
+        return {"pin": False, "kind": PIN_KIND_SEMANTIC, "importance_floor": 0.8}
+    return {"pin": False, "kind": None, "importance_floor": None}
+
+
+def is_pin(text):
+    """强记忆点：必须是「讲清楚的一条规矩/带相对时间的一次性安排」才钉住。
+
+    兼容旧调用点（返回布尔）；判定细节全在 pin_decision() —— 别再在这里
+    复制一遍规则，否则「钉不钉」和「钉成什么 kind」会各说各话。
+    """
+    return pin_decision(text)["pin"]
 
 
 def _speaker_index(log_dir=None):
@@ -806,7 +952,7 @@ def combine(row, query_tokens=None, at=None, index=None):
 
 
 def remember(conn, peer, text, kind=None, pin=False, ts=None, importance=None, outbound=False,
-             owner=None, visibility=None, is_self=None):
+             owner=None, visibility=None, is_self=None, importance_floor=None):
     """记一条记忆。
 
     v4 新增三个可选参数（全部有默认值，老调用点不受影响）：
@@ -814,6 +960,11 @@ def remember(conn, peer, text, kind=None, pin=False, ts=None, importance=None, o
                  （c2c-<qq> → qq；group-<群号> → None，群聊必须由调用方给发言人 QQ）
       visibility 'dm_only' / 'public' / None（None 当 public）
       is_self    1 = 我自己说的话。不传则跟 outbound 一致
+
+    task-2 新增 importance_floor（可选）：只抬不降的重要性下限。
+      「带绝对日期的一次性安排」按普通 semantic 记但 importance 至少 0.8
+      （它不钉住，但仍该排在闲聊前面）。单独给一个参数而不是硬塞 importance，
+      是为了保留 estimate_importance 的区分度（直接传 importance 会把它覆盖掉）。
     """
     t = (text or "").strip()
     if not t or t in NOISE:
@@ -826,11 +977,16 @@ def remember(conn, peer, text, kind=None, pin=False, ts=None, importance=None, o
         if importance is None:
             importance = estimate_importance(t) * 0.6
     if pin and kind == "episodic":
-        # 能钉住的多半是「约定/规矩」→ 归到程序记忆，别让它按情节记忆 3 天衰减
+        # 能钉住的多半是「约定/规矩」→ 归到程序记忆，别让它按情节记忆 3 天衰减。
+        # ⚠️ 2026-11-06 task-2：只有**规矩类**走这条。带时间锚的一次性安排由
+        #    ingest 显式传 kind='semantic'（60 天半衰期）—— 它不该按「一年不衰减」
+        #    的程序记忆算，因为它本身是过期就结束的事。
         kind = "procedural"
     f = fp(t)
     ts = ts or now_ts()
     imp = estimate_importance(t, kind) if importance is None else importance
+    if importance_floor is not None:
+        imp = max(imp, importance_floor)
     if pin:
         # 钉住的确实重要，但别一律 0.95 —— 全一样的话 importance 就没区分度了。
         # 抬到至少 0.8，保留原有的高低差异。
@@ -1045,8 +1201,25 @@ def ingest_bridge(conn, path=BRIDGE_LOG):
             # 入站：发言人 QQ 一直就在日志里（RE_INBOUND 的 from=昵称(QQ)），
             # v4 起把它当作 owner —— 群聊记忆因此能归到具体的人而不是「大锅饭」。
             qq = m.group("qq")
-            remember(conn, peer, text, kind=classify(text), pin=is_pin(text), ts=ts,
-                     owner=qq, is_self=0)
+            # 钉住判定走 pin_decision() 一次拿到三件事（2026-11-06 task-2）：
+            #   pin              要不要钉
+            #   kind             'rule'（规矩类 → procedural）/ 'arrangement'
+            #                    （带相对时间的一次性安排 → semantic，60 天半衰期）/
+            #                    'semantic'（带绝对日期的安排 → 不钉但 importance 0.8）
+            # 三个决策必须来自同一个函数：分开写会出现「钉住了但按 60 天衰减」
+            # 或者「说好不钉却 still pinned=1」这种自相矛盾的库状态。
+            pd = pin_decision(text)
+            pin = pd["pin"]
+            kind = classify(text)
+            if pd["kind"] == PIN_KIND_ARRANGEMENT:
+                # 一次性安排不是「规矩」：别让它按程序记忆 365 天不衰减。
+                # 显式传 semantic 而不是靠 remember 的 `if pin and episodic` 分支，
+                # 因为 classify() 也可能把它分到 procedural（含「安排/记得」这些词）。
+                kind = "semantic"
+            elif pd["kind"] == PIN_KIND_SEMANTIC:
+                kind = "semantic"
+            remember(conn, peer, text, kind=kind, pin=pin, ts=ts,
+                     owner=qq, is_self=0, importance_floor=pd["importance_floor"])
             short = {"ts": ts, "from": m.group("name"), "qq": qq, "text": text}
             day = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
             p = os.path.join(LOG_DIR, f"{peer}-{day}.jsonl")
@@ -1253,6 +1426,73 @@ def done(conn, match=None, ids=None, peer=None, text=None, dry_run=False):
             {"peer": p, "text": concl, "new": prev is None, "id": rid})
     if not dry_run:
         conn.commit()
+    return out
+
+
+# ── 解除钉住（unpin，2026-11-06 task-2）──────────────────────────────────────
+# 为什么需要它：pinned 的代价曾经是**不可逆**的 ——
+#   · remember() 里 pin 会把 kind 强制成 procedural（365 天半衰期）；
+#   · prune 对 pinned 直接放行（「钉住的永远不归档」）；
+#   · digest 对 pinned 无条件给 ★；
+#   · 而全仓**没有任何命令能把 pinned 改回 0**（只有 done：归档 + 写结论）。
+# 于是一条「明天下午三点开会」被误钉成永久重要事实后，只能眼睁睁看它一个月
+# 还在摘要里带 ★（生产库 id=222 就是这么来的）。
+#
+# 与 done 的区别（两者刻意不复用同一个命令）：
+#   done     = 这件事**做完了** → 归档旧条目 + 补一条「已完成：」结论（信息变了）
+#   unpin    = 这条**不该是永久重要** → 只把 pinned 置 0（内容/归档状态都不变）
+# 为什么 unpin 不归档也不降 importance：
+#   · 归档是不可逆的展示变化（模型再也查不到这条）。用户想做的可能只是
+#     「别把它当钉子」，而不是「当它没发生过」；
+#   · importance 是「这条值不值得提」的独立判断，unpin 只否定「永久」这个标记。
+#     强行降 importance 会让一条真实的重要事实被 prune 顺手清掉 —— 双重惩罚。
+# 幂等：只查 pinned=1，改完第二次执行命中 0 条，一个字都不写（和 done 同一约定）。
+def unpin(conn, match=None, ids=None, peer=None, dry_run=False):
+    """解除钉住：把命中的 pinned=1 条目置 0（不归档、不删除、importance 不动）。
+
+    用法：
+      unpin --match "开会"                    # 全库按关键词找（子串，大小写不敏感）
+      unpin --id 222                          # 按 id
+      unpin --match "开会" --peer c2c-1000000001
+      unpin --match "开会" --dry-run          # 只看命中，不写库
+
+    返回 dict：{rows, unpinned}
+      rows      命中的**当前仍钉住**的条目（main 用来打印，便于核对有没有误伤）
+      unpinned  实际改写的条数（dry-run 恒为 0）
+
+    ⚠️ 不做「已完成：」那种前缀过滤：completed 结论本身也是 pinned 的，
+       用户完全可能想解除（那时应该用 done 的另一条语义，但 unpin 不拦）。
+       只按 pinned=1 过滤，语义单一，反而不会两边打架。
+    """
+    ids = [int(i) for i in (ids or [])]
+    if not ids and not match:
+        raise ValueError("unpin 需要 --match 关键词 或 --id")
+    where = "retired=0 AND pinned=1"
+    params = []
+    if ids:
+        where += " AND id IN (%s)" % ",".join("?" * len(ids))
+        params.extend(ids)
+    if match:
+        where += " AND text LIKE ? ESCAPE '\\'"
+        params.append("%" + _like_escape(match) + "%")
+    if peer:
+        where += " AND peer=?"
+        params.append(peer)
+    rows = conn.execute(
+        "SELECT * FROM entries WHERE " + where +
+        " ORDER BY importance DESC, id ASC", params
+    ).fetchall()
+    out = {"rows": rows, "unpinned": 0}
+    if not rows or dry_run:
+        return out
+    for r in rows:
+        # 只翻 pinned 这一个位。kind/importance/retired 全不动 —— 见上面注释。
+        conn.execute("UPDATE entries SET pinned=0 WHERE id=?", (r["id"],))
+    out["unpinned"] = len(rows)
+    conn.commit()
+    # 钉住状态会影响排序（combine 里 pinned 抬 importance 下限、recency 按 procedural
+    # 算半衰期），所以进程内 BM25 缓存要作废（和 prune 同一个理由）。
+    invalidate_bm25()
     return out
 
 
@@ -1643,7 +1883,9 @@ def digest(conn, budget=DIGEST_BUDGET_CHARS):
         "> 分三层：[程序]（约定/规矩，几乎不衰减）· [语义]（稳定事实）· [情节]（具体对话，衰减快）。",
         "> 每层各占 1/3 字符预算，逐层轮转输出（截断时三层都看得见），层内按综合分排序。",
         "> ★ = 钉住或极重要；· = 一般；✅ = **已完成**（别再当未了结的事问后续）。",
-        "> 已归档（retired）的条目不再出现；待办用 `memctl done --match 关键词` 了结。",
+        "> 钉住的条目若自带日期且那天已过，★ 会降成 ·（过期安排不再当重要线索）。",
+        "> 已归档（retired）的条目不再出现；待办用 `memctl done --match 关键词` 了结，",
+        "> 过期的钉住条目用 `memctl unpin --match 关键词` 解除（不归档、不删除）。",
         "",
     ]
     LAYERS = [
@@ -1653,6 +1895,7 @@ def digest(conn, budget=DIGEST_BUDGET_CHARS):
     ]
     # 每层至少给 80 字：预算再小也要保证三层各有一行（否则又回到「只有第一层」）
     layer_quota = max(80, int(budget * DIGEST_LAYER_SHARE))
+    now = now_ts()
     for peer in peers:
         lines.append(f"## {peer}")
         lines.append("")
@@ -1670,7 +1913,22 @@ def digest(conn, budget=DIGEST_BUDGET_CHARS):
                 if (r["text"] or "").startswith(DONE_PREFIX):
                     mark = "✅"
                 elif r["pinned"] or r["importance"] >= 0.85:
-                    mark = "★"
+                    # ── 2026-11-06 task-2：过期钉住条目的降级 ───────────────
+                    # 只对 **pinned** 条目做（普通条目本来就按 importance/recency
+                    # 衰减排序，再降一次等于双层惩罚）。
+                    # 判定 = 「文本自带显式日期且那天已过」（见 _explicit_date_is_past）。
+                    # 选**降星（★→·）而不是隐藏**，理由：
+                    #   ① digest 是给人/模型看的「见闻录」，历史事实本身仍有价值
+                    #      （「那次开会他迟到了」这种事后仍可提），只是不该再当
+                    #      「重要待办线索」；隐藏会丢信息且让模型「查不到自己记过」。
+                    #   ② 隐藏会让行数/层配额变动，三层轮转输出和 budget 截断的
+                    #      行为跟着变 —— 一个日期判定不该改渲染结构。
+                    #   ③ ★ 是「优先级」标记，降成 · 正好表示「还有，但别当重点」；
+                    #      ✅（已完成）已经是「不再当线索」，过期安排还没到那一步。
+                    if r["pinned"] and _explicit_date_is_past(r["text"], r["created"], now):
+                        mark = "·"
+                    else:
+                        mark = "★"
                 else:
                     mark = "·"
                 line = f"- {mark} [{DIGEST_LAYER_TAG[kind]}] {r['text'][:150]}"
@@ -1901,6 +2159,13 @@ def main():
     p.add_argument("--text", default=None, help="自定义结论措辞（默认「已完成：<关键词>」）")
     p.add_argument("--dry-run", action="store_true", help="只打印命中，不写库")
 
+    p = sub.add_parser("unpin", help="解除钉住：pinned 1→0（不归档、不删除、不改 importance）")
+    p.add_argument("--match", default=None, help="按文本关键词找（子串匹配，大小写不敏感）")
+    p.add_argument("--id", dest="ids", type=int, action="append",
+                   help="按条目 id（可重复传；和 --match 同时给时取交集）")
+    p.add_argument("--peer", default=None, help="只处理这个 peer（如 c2c-1000000001）")
+    p.add_argument("--dry-run", action="store_true", help="只打印命中，不写库")
+
     sub.add_parser("consolidate", help="情节→语义提炼（粗糙拼接，不调模型）")
 
     p = sub.add_parser("reflect", help="定期反思：调模型把情节真正提炼成语义记忆")
@@ -1994,6 +2259,20 @@ def main():
         archived = len(st["rows"]) if a.dry_run else st["archived"]
         print(f"{'[dry-run] ' if a.dry_run else ''}"
               f"归档 {archived} 条待办 · 结论 {len(st['conclusions'])} 条")
+        return 0
+    elif a.cmd == "unpin":
+        if not a.match and not a.ids:
+            ap.error("unpin 需要 --match 关键词 或 --id（可先加 --dry-run 看命中）")
+        st = unpin(conn, match=a.match, ids=a.ids, peer=a.peer, dry_run=a.dry_run)
+        for r in st["rows"]:
+            print(f"  - #{r['id']} [{r['peer']}] ({r['kind']},imp={r['importance']:.2f}) "
+                  f"{r['text'][:70]}")
+        if not st["rows"]:
+            # 幂等的正常出口：没有 pinned=1 的命中就是「已经是解除状态」
+            print("没有匹配到仍被钉住的条目（可能已经 unpin 过，或关键词不对）")
+            return 0
+        n = len(st["rows"]) if a.dry_run else st["unpinned"]
+        print(f"{'[dry-run] ' if a.dry_run else ''}解除钉住 {n} 条（不归档、不删除、importance 不变）")
         return 0
     elif a.cmd == "consolidate":
         print(f"生成 {consolidate(conn)} 条语义记忆")
