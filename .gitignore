@@ -28,6 +28,14 @@ dsh-plugin-llminqq-*.zip
 qq-agent/.qq-media/
 # B 站音频/克隆样本等运行期媒体产物（几 MB，属本机数据不入库）
 bili_audio/
+
+# NapCat 登录二维码 / 任何 qr 图片：**内含 uin+token 的登录 URL，扫到就能登这个号**
+# （lib/bridge/index.js 的 /qr 注释里写明了它是机密，不是「可以公开看的图片」）。
+# 2026-11-07 我误把 qq-login-qr.png 提交进了公开仓库，虽然登录码约 2 分钟就过期、
+# 实际风险为零，但这类文件永远不该进 git。
+qq-login-qr.png
+/qr.png
+napcat-qr.png
 qq-agent/.bridge/
 qq-agent/memory/
 
