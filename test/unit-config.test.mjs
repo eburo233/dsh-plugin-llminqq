@@ -380,3 +380,51 @@ test('policy.maxReplyChars: 缺省/非法回落默认，合法值保留', () => 
   assert.equal(normalizeMaxReplyChars(120.9), 120)
   assert.equal(normalizeMaxReplyChars(0.4), 1)
 })
+
+// ── 记忆子进程的模型路由（2026-11-07）──────────────────────────────────────
+//
+// 现场：1.5 天里 distill 出现 3 个死信作业 + 多次重试，错误全是
+// `session/prompt 超时 (90000ms)`。根因是记忆子进程继承主对话路由
+// （trae/deepseek-v4.1-flash 单次约 77.8s，离 90s 超时太近）。
+// 而 reflection_llm.mjs 读的是**桥配置**的 memory.reflection ——
+// 插件以前根本不透传，所以设置页/配置里改了也没用。
+test('memoryReflectionConfig：缺省全空 = 继承主路由（保持老行为）', () => {
+  assert.deepEqual(IDX.memoryReflectionConfig(), { provider: '', model: '', reasoningEffort: '' })
+  assert.deepEqual(IDX.memoryReflectionConfig({}), { provider: '', model: '', reasoningEffort: '' })
+  assert.deepEqual(IDX.memoryReflectionConfig({ reflection: {} }), { provider: '', model: '', reasoningEffort: '' })
+})
+
+test('memoryReflectionConfig：指定快模型后原样透传（这是能让 distill 不再超时的开关）', () => {
+  assert.deepEqual(
+    IDX.memoryReflectionConfig({ reflection: { provider: 'trae', model: 'glm-5.3-flashx', reasoningEffort: 'low' } }),
+    { provider: 'trae', model: 'glm-5.3-flashx', reasoningEffort: 'low' })
+  // 前后空格要清掉（手改 JSON / 环境变量展开很常见）
+  assert.deepEqual(
+    IDX.memoryReflectionConfig({ reflection: { provider: ' trae ', model: ' glm-5.3-flashx ' } }),
+    { provider: 'trae', model: 'glm-5.3-flashx', reasoningEffort: '' })
+})
+
+test('memoryReflectionConfig：脏值（非对象/数字）回落全空，不炸', () => {
+  for (const bad of [null, 'x', 42, []]) {
+    assert.deepEqual(IDX.memoryReflectionConfig({ reflection: bad }),
+      { provider: '', model: '', reasoningEffort: '' })
+  }
+})
+
+test('源码级：bridgeConfig 的 memory 段真的透传了 reflection', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'lib', 'index.js'), 'utf8')
+  const start = src.indexOf('function bridgeConfig (cfg) {')
+  assert.ok(start > 0)
+  const memAt = src.indexOf('memory: (() => {', start)
+  const chunk = src.slice(memAt, memAt + 5200)
+  assert.match(chunk, /reflection:\s*memoryReflectionConfig\(cfg\.memory\)/,
+    'memory 段没透传 reflection —— 记忆子进程只能跟主对话抢同一条慢路由，distill 会撞超时')
+})
+
+test('store 默认值：memory.reflection 存在且为空串（继承主路由）', async () => {
+  const { defaults } = await import(pathToFileURL(path.join(ROOT, 'lib', 'store.js')).href)
+  const r = defaults().memory?.reflection
+  assert.ok(r && typeof r === 'object', '缺 memory.reflection 默认值')
+  assert.equal(r.provider, '', '默认必须继承（空串），不能替用户选模型')
+  assert.equal(r.model, '')
+})
