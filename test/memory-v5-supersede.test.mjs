@@ -456,3 +456,47 @@ test('supersedeReport：只读统计 + 样例（生产迁移后验收用）', as
     assert.equal(store.getMemory(b).state, 'archived')
   } finally { cleanup() }
 })
+
+// ── 相似度的退化保护（2026-11-07 实测）────────────────────────────────────
+//
+// containment = shared / min(|A|,|B|)。当短句只有 **1 个 bigram** 时，
+// 只要那个 bigram 出现在长句里 containment 就是 1.0 —— 于是 max(jaccard,containment)
+// 把「只共享一个语气词」判成 100% 同义。库里这类短句（表情/语气词/寒暄）很多，
+// 后果是 supersede **误合并**：一条新闲聊能把另一条记忆归档掉。
+//
+// 真实数据（生产库 986 条 active 里挑出来的）：
+//   「嘿嘿(*^▽^*)」 vs 「明天休息，嘿嘿」   → 修复前 score 1.00
+//   「hello？」    vs 「hello，你还在吗？」 → 修复前 score 1.00
+// 而真正的长句改写反而只有 0.25~0.5，一个都合不上。
+
+test('退化保护：只共享一个语气词的两句不算相似（修复前是 1.00）', () => {
+  const a = textSimilarity('明天休息，嘿嘿', '嘿嘿(*^▽^*)')
+  assert.ok(a.shared <= 2, '这两句本来就只共享极少 token（用例前提）')
+  assert.ok(a.score < 0.5,
+    `score=${a.score} —— 只共享一个语气词却被判成高相似，会让 supersede 误合并`)
+  assert.equal(a.containmentTrusted, false, '短句只有 1 个 bigram 时 containment 不可信')
+})
+
+test('退化保护：短问候不算相似（修复前是 1.00）', () => {
+  const r = textSimilarity('hello？', 'hello，你还在吗？')
+  assert.ok(r.score < 0.5, `score=${r.score} —— 短问候不该判成同义`)
+})
+
+test('退化保护不伤原设计：短句→加长版 仍然能合上（必须保留）', () => {
+  // 这条是 max(jaccard, containment) 存在的理由，不能被上面的保护误伤
+  const r = textSimilarity('喜欢冰美式', '对方最喜欢喝冰美式')
+  assert.equal(r.containmentTrusted, true, '共享 ≥2 个 bigram 且短句 ≥2 个 bigram → containment 可信')
+  assert.ok(r.score >= 0.5, `score=${r.score} —— 改写合并不上了`)
+  assert.equal(r.score, r.containment, 'score 仍应取 max（containment 更高）')
+})
+
+test('退化保护不伤原设计：近似同句仍是高分', () => {
+  const r = textSimilarity('你得发语音安慰我', '你就得发语音安慰我')
+  assert.ok(r.score > 0.8, `score=${r.score} —— 几乎一样的句子应该高分`)
+})
+
+test('退化保护：短句之间的真重复仍能被 Jaccard 抓住', () => {
+  // 保护只压掉「containment 虚高」，两个短句**同文**时 Jaccard 照样是 1
+  assert.equal(textSimilarity('必须吃鸡', '必须吃鸡').score, 1)
+  assert.equal(textSimilarity('嘿嘿', '嘿嘿').score, 1, '完全同文必须 1')
+})
