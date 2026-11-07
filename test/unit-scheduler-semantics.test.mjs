@@ -304,3 +304,39 @@ test('createScheduler 的 configPath 会传给 run（→ memoryEnv 的 LLMINQQ_C
     fs.rmSync(stateDir, { recursive: true, force: true })
   }
 })
+
+// ── 任务覆盖必须逐任务浅合并（2026-11-07）──────────────────────────────────
+//
+// 坑：createScheduler 原来是 `{ ...DEFAULT_TASKS, ...tasks }` —— 整表替换。
+// 传 `{ reflect: { enabled: false } }` 会把 reflect 任务对象**整个换掉**，
+// tool/args/intervalMin 全丢。结果不是「关掉 reflect」，而是「reflect 变成
+// 一个没有 tool 的残废任务」，运行时表现比关掉更难查。
+//
+// 场景来源：engine 切 v5 后要给调度器传「reflect 默认停」的覆盖表
+// （见 lib/index.js 的 schedulerTaskOverrides），所以必须支持部分覆盖。
+test('任务覆盖是逐任务浅合并：只关 enabled 不会丢掉 tool/args/interval', () => {
+  const s = createScheduler({
+    cfg: {}, probe, stateDir: mkStateDir(), run: async () => ({ ok: true }),
+    tasks: { reflect: { enabled: false, disabledBecause: 'engine=v5' } },
+  })
+  const st = s.status()
+  const reflect = st.tasks.find(t => t.name === 'reflect')
+  assert.ok(reflect, '覆盖后 reflect 任务不该消失')
+  assert.equal(reflect.enabled, false, 'enabled 应被覆盖成 false')
+  assert.equal(reflect.tool, 'memctl', 'tool 必须保留（整表替换会把它弄丢）')
+  assert.deepEqual(reflect.args, ['reflect', '--hours', '168'], 'args 必须保留')
+  assert.equal(reflect.intervalMin, 8 * 60, 'intervalMin 必须保留')
+})
+
+test('没被覆盖的任务完全不受影响', () => {
+  const s = createScheduler({
+    cfg: {}, probe, stateDir: mkStateDir(), run: async () => ({ ok: true }),
+    tasks: { reflect: { enabled: false } },
+  })
+  const st = s.status()
+  for (const name of ['ingest', 'digest', 'learn']) {
+    const t = st.tasks.find(x => x.name === name)
+    assert.ok(t, `${name} 任务失踪了`)
+    assert.equal(t.enabled, true, `${name} 不该被 reflect 的覆盖连带关掉`)
+  }
+})

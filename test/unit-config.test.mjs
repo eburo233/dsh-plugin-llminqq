@@ -428,3 +428,47 @@ test('store 默认值：memory.reflection 存在且为空串（继承主路由�
   assert.equal(r.provider, '', '默认必须继承（空串），不能替用户选模型')
   assert.equal(r.model, '')
 })
+
+// ── v4 定时任务在 engine=v5 下的取舍（2026-11-07）──────────────────────────
+//
+// 实测：engine 切 v5 后 v4 的四个任务全还在跑，其中 reflect 每 8 小时烧
+// **532 秒** LLM（近 9 分钟），而它的唯一产出是 v4 语义记忆 —— v5 根本不读。
+// 所以 engine=v5 时默认停 reflect；learn（lexicon 仍被注入）和
+// ingest/digest（各 ~100ms、保证回滚时库新鲜）保留。
+test('schedulerTaskOverrides：engine=v5 → 默认停 reflect', () => {
+  const o = IDX.schedulerTaskOverrides({ memory: { v5: { engine: 'v5' } } }, {})
+  assert.equal(o.reflect?.enabled, false, 'engine=v5 必须停掉 reflect（9 分钟 LLM 无人消费）')
+  assert.ok(o.reflect.disabledBecause, '要能看出为什么停的')
+  // 其它三个任务不该被碰
+  for (const k of ['learn', 'ingest', 'digest']) {
+    assert.equal(o[k], undefined, `${k} 不该被连带覆盖（它的产出还有读者）`)
+  }
+})
+
+test('schedulerTaskOverrides：engine=v4 → 不覆盖（reflect 照常跑）', () => {
+  assert.deepEqual(IDX.schedulerTaskOverrides({ memory: { v5: { engine: 'v4' } } }, {}), {})
+  assert.deepEqual(IDX.schedulerTaskOverrides({}, {}), {}, '缺省 engine 是 v4，不该停任何东西')
+})
+
+test('schedulerTaskOverrides：用户显式开回来优先于 engine 推断', () => {
+  const o = IDX.schedulerTaskOverrides({
+    memory: { v5: { engine: 'v5' }, schedulerTasks: { reflect: { enabled: true } } },
+  }, {})
+  assert.equal(o.reflect.enabled, true, '用户显式 enabled:true 必须赢（回滚/临时加固都要靠它）')
+})
+
+test('schedulerTaskOverrides：环境变量 LLMINQQ_MEMORY_ENGINE 优先于配置文件', () => {
+  // 线上止血靠环境变量，所以它必须能改变「停不停 reflect」的判断
+  const on = IDX.schedulerTaskOverrides({ memory: { v5: { engine: 'v4' } } }, { LLMINQQ_MEMORY_ENGINE: 'v5' })
+  assert.equal(on.reflect?.enabled, false, 'env=v5 时也要停 reflect')
+  const off = IDX.schedulerTaskOverrides({ memory: { v5: { engine: 'v5' } } }, { LLMINQQ_MEMORY_ENGINE: 'v4' })
+  assert.deepEqual(off, {}, 'env=v4（回滚）时必须把 reflect 放回来')
+})
+
+test('schedulerTaskOverrides：任意任务都能被用户覆盖（不止 reflect）', () => {
+  const o = IDX.schedulerTaskOverrides({
+    memory: { v5: { engine: 'v5' }, schedulerTasks: { learn: { enabled: false }, digest: { intervalMin: 120 } } },
+  }, {})
+  assert.equal(o.learn.enabled, false)
+  assert.equal(o.digest.intervalMin, 120)
+})
