@@ -712,3 +712,86 @@ test('close 可重复调用；关闭后再用会报错（而不是静默成功�
   s.close()   // 不该抛
   assert.throws(() => s.appendEvent({ conv: 'c2c:1', msgId: 'x', speaker: '1', text: 'y' }))
 })
+
+// ── ③ 低价值归档 pruneLowValue（§3.4 第三条遗忘机制，2026-11-07 补实现）────
+//
+// 审计文档 §3 列了三条遗忘机制：① valid_until 过期 ② 同 key 取代 ③ salience 低+访问少。
+// 前两条早就有生产调用，**第三条从来没实现过** —— 于是库只增不减
+// （v5 上线 2 天 active 从 873 涨到 986，没有任何回收路径），
+// 正是 P0-2 描述的 v4 病症。
+//
+// 这一组锁住「保守」：只清低价值 episode，误删结论是不可接受的。
+const daySec = 86400
+const oldTs = () => Math.floor(Date.now() / 1000) - 20 * daySec
+
+test('pruneLowValue：只归档「低分 + 零访问 + 够旧」的 episode', () => {
+  const s = mkStore()
+  try {
+    const old = oldTs()
+    const junk = s.insertMemory({ type: 'episode', text: '嘿嘿，听你的', salience: 0.2, created: old, lastSeen: old })
+    const important = s.insertMemory({ type: 'episode', text: '这是重要情节', salience: 0.8, created: old, lastSeen: old })
+    const fact = s.insertMemory({ type: 'fact', text: '对方有鼻炎', salience: 0.1, created: old, lastSeen: old })
+    const fresh = s.insertMemory({ type: 'episode', text: '昨天说的', salience: 0.2, created: Math.floor(Date.now() / 1000) - daySec, lastSeen: 0 })
+    const touched = s.insertMemory({ type: 'episode', text: '常被访问', salience: 0.2, created: old, lastSeen: old })
+    s.touchMemory([touched.id])
+
+    const r = s.pruneLowValue({ now: Math.floor(Date.now() / 1000) })
+    assert.equal(r.pruned, 1, `只该归档 1 条，实际 ${r.pruned}（${JSON.stringify(r.ids)}）`)
+
+    const get = id => s.db.prepare('SELECT state, archived_reason FROM memories WHERE id = ?').get(id)
+    assert.equal(get(junk.id).state, 'archived', '低分零访问的旧 episode 应被归档')
+    assert.equal(get(junk.id).archived_reason, 'pruned')
+    assert.equal(get(important.id).state, 'active', '高 salience 不能被清')
+    assert.equal(get(fact.id).state, 'active', 'fact 类型不在清理范围（结论不能误删）')
+    assert.equal(get(fresh.id).state, 'active', '太新的不能清（给「以后想起来」留窗口）')
+    assert.equal(get(touched.id).state, 'active', '被检索命中过的不能清')
+  } finally { s.cleanup() }
+})
+
+test('pruneLowValue：幂等 + 可重复调用返回 0', () => {
+  const s = mkStore()
+  try {
+    const old = oldTs()
+    s.insertMemory({ type: 'episode', text: '垃圾片段', salience: 0.1, created: old, lastSeen: old })
+    const now = Math.floor(Date.now() / 1000)
+    assert.equal(s.pruneLowValue({ now }).pruned, 1)
+    assert.equal(s.pruneLowValue({ now }).pruned, 0, '第二轮不该再归档（已 archived）')
+  } finally { s.cleanup() }
+})
+
+test('pruneLowValue：归档不是删除 —— 行还在，能捞回来', () => {
+  const s = mkStore()
+  try {
+    const old = oldTs()
+    const m = s.insertMemory({ type: 'episode', text: '可捞回', salience: 0.1, created: old, lastSeen: old })
+    s.pruneLowValue({ now: Math.floor(Date.now() / 1000) })
+    const row = s.db.prepare('SELECT text, state FROM memories WHERE id = ?').get(m.id)
+    assert.ok(row, '归档不能删行（pruned 是 state 变更，不是 DELETE）')
+    assert.equal(row.text, '可捞回')
+    // 手动捞回
+    s.db.prepare("UPDATE memories SET state='active', archived_reason=NULL WHERE id = ?").run(m.id)
+    assert.equal(s.db.prepare('SELECT state FROM memories WHERE id = ?').get(m.id).state, 'active')
+  } finally { s.cleanup() }
+})
+
+test('pruneLowValue：limit 生效（判据万一写错也只影响一小批）', () => {
+  const s = mkStore()
+  try {
+    const old = oldTs()
+    for (let i = 0; i < 10; i++) {
+      s.insertMemory({ type: 'episode', text: `垃圾${i}`, salience: 0.1, created: old, lastSeen: old })
+    }
+    assert.equal(s.pruneLowValue({ now: Math.floor(Date.now() / 1000), limit: 3 }).pruned, 3)
+  } finally { s.cleanup() }
+})
+
+test('pruneLowValue：未来 valid_until 的不清（交给 dueExpire，别抢）', () => {
+  const s = mkStore()
+  try {
+    const old = oldTs()
+    const now = Math.floor(Date.now() / 1000)
+    const m = s.insertMemory({ type: 'episode', text: '还没到期的', salience: 0.1, created: old, lastSeen: old, validUntil: now + 7 * daySec })
+    assert.equal(s.pruneLowValue({ now }).pruned, 0, '有未来失效时间的交给 dueExpire 处理')
+    assert.equal(s.db.prepare('SELECT state FROM memories WHERE id = ?').get(m.id).state, 'active')
+  } finally { s.cleanup() }
+})
