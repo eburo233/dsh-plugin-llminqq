@@ -25,6 +25,7 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 import { openV5 } from '../lib/agent/memory-v5/store.mjs'
+import * as search from '../lib/agent/memory-v5/search.mjs'
 import { chunkText, textToSegments } from '../lib/bridge/common.js'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
@@ -460,4 +461,71 @@ test('memory-v5-count.mjs：拒绝直接打开生产路径（先 cp 到 /tmp 再
   const r = spawnSync(process.execPath, [script, '--db', fakeProd], { encoding: 'utf8', timeout: 30000 })
   assert.equal(r.status, 3, `生产路径该被拒绝，实际 ${r.status}: ${r.stdout}${r.stderr}`)
   assert.match(r.stderr, /拒绝直接打开生产路径/)
+})
+
+// ── 出站同时记「我说过什么」（utterances，2026-11-07 线上实测漏写）───────────
+//
+// 现场：44 小时里桥发了 747 条消息，utterances 表**一条没涨**（停在迁移的 442 条，
+// 最后一条 11-05 16:43）。而 v5 的防复读块 utteranceBlock **优先读 utterances**，
+// 只有它为空才回退查 events —— 442 条旧数据让它永远不为空，
+// 于是「我说过什么」注入的永远是**切换前的旧话**。
+//
+// 这条用例锁两件事：① 文本出站要写 utterances；② 非文本（图片/语音占位）不写，
+// 免得 `[图片] a.png` 这种污染防复读素材。
+test('出站文本要写 utterances（否则防复读永远用迁移前的旧话）', async () => {
+  const s = freshStore()
+  try {
+    const w = makeWriter({ store: s.store })
+    await w.v5RecordOutbound(peerC2C, { text: '我在呢，怎么啦', msgId: '9001' })
+    const utt = s.store.db.prepare('SELECT conv, text, kind FROM utterances ORDER BY id').all()
+    assert.equal(utt.length, 1, '出站文本必须进 utterances 表')
+    assert.equal(utt[0].conv, 'c2c:10001')
+    assert.equal(utt[0].text, '我在呢，怎么啦')
+    assert.equal(utt[0].kind, 'text')
+    // events 仍要写（两条路互不影响）
+    assert.equal(rows(s.store).length, 1, 'events 也要照写')
+  } finally { s.store.close() }
+})
+
+test('出站非文本（图片/语音）只写 events，不污染 utterances', async () => {
+  const s = freshStore()
+  try {
+    const w = makeWriter({ store: s.store })
+    await w.v5RecordOutbound(peerC2C, { text: '[图片] a.png', kindRaw: 'image' })
+    await w.v5RecordOutbound(peerC2C, { text: '晚安', kindRaw: 'voice' })
+    assert.equal(rows(s.store).length, 2, 'events 两条都要写')
+    assert.equal(s.store.db.prepare('SELECT count(*) AS n FROM utterances').get().n, 0,
+      '图片/语音不该进 utterances（「我说过什么」只要语义素材）')
+  } finally { s.store.close() }
+})
+
+test('utterances 写失败不影响出站（旁路功能必须吞错）', async () => {
+  const s = freshStore()
+  try {
+    // 让 appendUtterance 抛错，但 appendEvent 正常
+    const broken = Object.create(s.store)
+    broken.appendUtterance = () => { throw new Error('disk full') }
+    const w = makeWriter({ store: broken })
+    const ok = await w.v5RecordOutbound(peerC2C, { text: '照常说话', msgId: '9002' })
+    assert.equal(ok, true, 'utterance 失败不能让整条出站记录失败')
+    assert.equal(rows(s.store).length, 1, 'events 仍要写进去')
+  } finally { s.store.close() }
+})
+
+test('防复读块在 utterances 有数据时用新话，而不是迁移旧话', async () => {
+  // 复刻线上状态：先塞一条「旧话」（模拟迁移），再写出站文本，最后读防复读块
+  const s = freshStore()
+  try {
+    s.store.appendUtterance({ conv: 'c2c:10001', text: '这是切换前的旧话', at: 1700000000 })
+    const w = makeWriter({ store: s.store })
+    await w.v5RecordOutbound(peerC2C, { text: '这是刚刚说的新话', msgId: '9003' })
+    const block = search.utteranceBlock({ store: s.store, conv: 'c2c:10001', now: Date.now() / 1000 })
+    assert.match(block, /这是刚刚说的新话/, '防复读块必须能看到刚说的话')
+    // 旧话在预算内可以出现（块取最近 3 条），但**必须排在新话之后** ——
+    // 顺序错了等于「最近说过什么」是假的。这才是要锁的不变量。
+    const iNew = block.indexOf('这是刚刚说的新话')
+    const iOld = block.indexOf('这是切换前的旧话')
+    assert.ok(iNew >= 0, '新话必须在块里')
+    if (iOld >= 0) assert.ok(iNew < iOld, '新话必须排在旧话前面（按时间倒序）')
+  } finally { s.store.close() }
 })
