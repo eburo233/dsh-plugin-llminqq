@@ -1410,6 +1410,69 @@ def _v5_archive_done(match=None, peer=None, dry_run=False):
         return None
 
 
+# ── v5 镜像：memctl remember 也要让 v5 记得住（2026-11-07）────────────────────
+#
+# AGENTS.md 教机器人用 `memctl remember "下周三帮他把服务器迁移到新机器"` 明确记一件事。
+# 但 remember 只写 v4 的 entries；engine=v5 之后读路径不看 v4 ——
+# 机器人以为记住了，下一轮却想不起来。和 utterances / pruned / done 同一类：
+# **切引擎后静默失效的旧工作流**。
+#
+# 为什么这里要 shell out 到 node（而不是像 done 那样直接 UPDATE v5 表）：
+#   · done 只是把 state 改掉，不碰索引；
+#   · remember 要**新增**一条记忆，必须同时写 mem_fts（contentless FTS5，
+#     tok 是 Node 侧 bigram 分词的产物）。Python 直接 INSERT 会造出
+#     「存进去了但永远搜不到」的记忆；在 Python 里复刻分词器又会变成两份词法实现。
+#   所以交给 scripts/memory-v5-remember.mjs —— 用 store 自己写，索引一定对。
+#
+# 全程吞错 + 短超时：v4 的 remember 必须照样成功（它仍是回滚目标），
+# v5 是附加路径，失败只往 stderr 记一行。
+def _v5_mirror_remember(peer, text, kind=None, pin=False):
+    try:
+        v5_path = os.path.join(os.path.dirname(DB), "mem-v5.db")
+        if not os.path.isfile(v5_path):
+            return None
+        # ⚠️ 不能只用 REPO_ROOT：插件布局下 BASE = <pkg>/lib/agent/memory，
+        #   REPO_ROOT = BASE/../.. = **<pkg>/lib**（不是包根）——
+        #   第一版就是这么静默找不到脚本的。两种布局都试：
+        #     插件版  <pkg>/lib/agent/memory → 包根 = 往上 3 层
+        #     脚本版  <repo>/qq-agent/memory → 仓库根 = 往上 2 层
+        script = None
+        for cand in (os.path.join(BASE, "..", "..", "..", "scripts", "memory-v5-remember.mjs"),
+                     os.path.join(REPO_ROOT, "scripts", "memory-v5-remember.mjs")):
+            if os.path.isfile(cand):
+                script = os.path.abspath(cand)
+                break
+        if not script:
+            # 静默返回过一次的教训：跳过也要留痕迹，否则「以为镜像了」查不出来
+            sys.stderr.write("[memctl] v5 remember 镜像跳过：找不到 scripts/memory-v5-remember.mjs\n")
+            return None
+        node = os.environ.get("NODE_BIN") or "node"
+        # v4 的 kind（semantic/procedural/episodic）→ v5 的 type 白名单
+        type_map = {"procedural": "rule", "semantic": "fact", "episodic": "episode"}
+        args = [node, script, "--text", str(text), "--data-dir", os.path.dirname(DB)]
+        v5_type = type_map.get(str(kind or ""), None)
+        if v5_type:
+            args += ["--type", v5_type]
+        if peer:
+            args += ["--conv", str(peer).replace("-", ":", 1)]
+            # v4 的 peer 尾段就是 QQ 号（c2c-3022464706 / group-<群号>）
+            tail = str(peer).split("-", 1)[-1]
+            if tail.isdigit() and str(peer).startswith("c2c-"):
+                args += ["--subject", tail]
+        if pin:
+            args += ["--salience", "0.9"]
+        import subprocess
+        r = subprocess.run(args, capture_output=True, text=True, timeout=30, env=os.environ.copy())
+        if r.returncode != 0:
+            sys.stderr.write(f"[memctl] v5 remember 镜像跳过（exit={r.returncode}）："
+                             f"{(r.stderr or r.stdout or '').strip()[:200]}\n")
+            return None
+        return (r.stdout or "").strip()
+    except Exception as e:  # noqa: BLE001 —— 附加路径，绝不影响 v4
+        sys.stderr.write(f"[memctl] v5 remember 镜像跳过（{type(e).__name__}: {e}）\n")
+        return None
+
+
 def done(conn, match=None, ids=None, peer=None, text=None, dry_run=False):
     """把待办标成「已完成」：归档旧条目 + 补一条钉住的结论记忆。
 
@@ -2382,6 +2445,10 @@ def main():
         rid = remember(conn, a.peer, a.text, kind=a.kind, pin=a.pin)
         conn.commit()
         print(f"已记 #{rid}")
+        # v5 镜像：engine=v5 时真正被读的是 v5，只写 v4 等于「记了但想不起来」
+        v5msg = _v5_mirror_remember(a.peer, a.text, kind=a.kind, pin=a.pin)
+        if v5msg:
+            print(f"  v5：{v5msg.splitlines()[-1]}")
     elif a.cmd == "recall":
         for s, r in recall(conn, a.peer, a.query, a.top):
             print(f"[{s:.3f}] ({r['kind']},{'pin' if r['pinned'] else '-'},imp={r['importance']:.2f}) {r['text'][:90]}")
