@@ -107,3 +107,44 @@ test('事故背景写在源码里（双桥 = 消息处理两遍 + EADDRINUSE）'
   assert.match(SRC, /EADDRINUSE/, '要写明 18080 端口冲突这条可观测症状')
   assert.match(SRC, /同一条 QQ 消息被处理两遍|消息被处理两遍/, '要写明用户可见的后果')
 })
+
+// ── 认领来的桥必须有看门狗（2026-11-07 现场）─────────────────────────────────
+//
+// 事故：Nov 7 DSH Web 重启后，startBridge 用 liveBridgeFromDisk() 认领了
+// Nov 6 起的 pid 3688308（`adopted:true`）—— 这对「双桥」是正确的修法，
+// 但认领来的桥**不是子进程，没有 exit 事件**。半天后它死了：
+//   宿主不知道（没回调）→ state.json 一直写着 running:true, pid:3688308
+//   → 机器人静默离线，零日志，直到人肉发现。
+//
+// 所以认领之后要挂 30s 探活看门狗；发现 pid 死了就如实记账 + 重新 spawn。
+test('认领桥之后必须挂探活看门狗（否则桥死了宿主永远不知道）', () => {
+  const body = (() => {
+    const i = SRC.indexOf('const diskPid = liveBridgeFromDisk()')
+    assert.ok(i > 0, '定位不到认领分支')
+    return SRC.slice(i, i + 900)
+  })()
+  assert.match(body, /adopted:\s*true/, '认领分支不见了')
+  assert.match(body, /ensureAdoptedBridgeWatchdog\(/, '认领之后没挂看门狗 —— 桥死了没人管')
+})
+
+test('看门狗：探活 + 如实记账 + 重新拉起，且有退出条件', () => {
+  const i = SRC.indexOf('function ensureAdoptedBridgeWatchdog')
+  assert.ok(i > 0, '缺 ensureAdoptedBridgeWatchdog 实现')
+  const body = SRC.slice(i, i + 1800)
+  assert.match(body, /process\.kill\(pid,\s*0\)/, '没有 0 信号探活')
+  assert.match(body, /running:\s*false/, '桥死了没把状态改成 running:false（状态页会骗人）')
+  assert.match(body, /startBridge\(/, '桥死了没有重新拉起')
+  assert.match(body, /if \(bridgeChild\)/, '已经有子进程时看门狗必须退场，否则和 exit 链重复重启')
+  assert.match(body, /unref/, '定时器要 unref，否则会拖住宿主退出')
+})
+
+test('stopBridge：能关掉「认领来的」桥（不能因为没子进程就什么都不做）', () => {
+  const i = SRC.indexOf('async function stopBridge')
+  assert.ok(i > 0)
+  const body = SRC.slice(i, i + 1100)
+  // 原来的第一句 `if (!bridgeChild) return { ok: true, already: true }` 必须变成
+  // 「先停看门狗，再按磁盘 pid 关掉认领进程」
+  assert.match(body, /stopAdoptedBridgeWatchdog\(\)/, 'stopBridge 没停看门狗')
+  assert.match(body, /liveBridgeFromDisk\(\)/, 'stopBridge 没查磁盘 pid —— 认领的桥关不掉')
+  assert.match(body, /SIGTERM/, 'stopBridge 对认领的桥没有发 SIGTERM')
+})

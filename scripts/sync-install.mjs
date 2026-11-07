@@ -62,6 +62,11 @@ if (!DEST) {
 // 这些不进安装副本：node_modules 是依赖（安装目录自己装）、.git 是版本库、
 // 日志和预览产物跟运行无关
 const SKIP_DIRS = new Set(['node_modules', '.git', '.preview', 'logs', 'dist', '.cache', '__pycache__', '.vendor-backup'])
+// `bili_audio/` 是 B 站音频/克隆样本等**运行期媒体产物**（本机实测 7.2MB），
+// 和 `.qq-media/` 同类：属于本机数据，不是插件源码，没必要每次同步都往安装副本搬。
+// （`.qq-media/` 没进这个列表是历史原因——它曾经是插件自带的表情包/参考音；
+//   现在只往里加，不动既有行为，避免顺手改坏别人的部署。）
+const SKIP_DIRS_EXTRA = new Set(['bili_audio'])
 const SKIP_FILES = [/\.log$/i, /^\.DS_Store$/, /\.pyc$/i]
 // ⚠️ `.git` 在 **worktree** 里是**普通文件**（内容是一行 `gitdir: …`），不是目录。
 // 只按 SKIP_DIRS 过滤会把它当普通文件拷进安装副本，然后：
@@ -75,7 +80,7 @@ function walk (dir, base = dir, out = []) {
     const full = path.join(dir, ent.name)
     const rel = path.relative(base, full)
     if (ent.isDirectory()) {
-      if (SKIP_DIRS.has(ent.name)) continue
+      if (SKIP_DIRS.has(ent.name) || SKIP_DIRS_EXTRA.has(ent.name)) continue
       walk(full, base, out)
     } else if (ent.isFile()) {
       if (SKIP_NAMES.has(ent.name)) continue
