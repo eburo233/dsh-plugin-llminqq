@@ -251,3 +251,48 @@ test('onebot: closedByUs 时断开不再安排重连', async (t) => {
   assert.equal(FakeWS.instances.length, 1, '主动关闭后不许自动重连')
   assert.equal(gw.online, false)
 })
+
+// ── 6. 连接回调（离线补读的触发点）─────────────────────────────────────────
+test('onebot: onConnect 每次连接只回调一次（open 与 lifecycle connect 去重）', (t) => {
+  const reasons = []
+  const { gw } = makeGateway(t, { onConnect: r => reasons.push(r) })
+  // lifecycle connect + enable 是同一轮连接里的两个事件，只能触发一次
+  gw._handleFrame({ post_type: 'meta_event', meta_event_type: 'lifecycle', sub_type: 'connect' })
+  gw._handleFrame({ post_type: 'meta_event', meta_event_type: 'lifecycle', sub_type: 'enable' })
+  assert.deepEqual(reasons, ['lifecycle:connect'], '同一轮连接只能通知一次')
+  // 断线再连 → 新的一轮，应再通知
+  gw._handleFrame({ post_type: 'meta_event', meta_event_type: 'lifecycle', sub_type: 'disable' })
+  gw._handleFrame({ post_type: 'meta_event', meta_event_type: 'lifecycle', sub_type: 'connect' })
+  assert.equal(reasons.length, 2, '重连后应重新通知')
+})
+
+test('onebot: onConnect 抛异常不能带走网关（桥要能继续收消息）', (t) => {
+  const { gw, logs, events } = makeGateway(t, { onConnect: () => { throw new Error('boom') } })
+  gw._handleFrame({ post_type: 'meta_event', meta_event_type: 'lifecycle', sub_type: 'connect' })
+  assert.equal(gw.online, true)
+  assert.ok(logs.some(l => l.includes('onConnect 回调异常')), '异常要被记日志')
+  gw._handleFrame({ post_type: 'message', message_id: 1 })
+  assert.equal(events.length, 1, '回调异常不影响后续事件派发')
+})
+
+// ── 7. 补读注入与实时帧共用去重窗口 ────────────────────────────────────────
+test('onebot: injectEvent 与实时帧共用去重 —— 同一条消息只会处理一次', (t) => {
+  const { gw, events } = makeGateway(t)
+  const evt = { post_type: 'message', message_id: 9001, user_id: 3022464706, time: 1794040100 }
+  // 场景 A：先实时推、后补读（补读命中已有 id）
+  gw._handleFrame({ ...evt })
+  assert.equal(gw.injectEvent({ ...evt }), false, '补读时发现重复应返回 false')
+  assert.equal(events.length, 1)
+  // 场景 B：先补读、后实时推（实时帧被去重挡掉）
+  const evt2 = { post_type: 'message', message_id: 9002, user_id: 3022464706, time: 1794040200 }
+  assert.equal(gw.injectEvent({ ...evt2 }), true)
+  gw._handleFrame({ ...evt2 })
+  assert.equal(events.length, 2, '同一 message_id 不允许处理两次')
+})
+
+test('onebot: injectEvent 对畸形输入返回 false 且不炸', (t) => {
+  const { gw, events } = makeGateway(t)
+  assert.equal(gw.injectEvent(null), false)
+  assert.equal(gw.injectEvent('x'), false)
+  assert.equal(events.length, 0)
+})
