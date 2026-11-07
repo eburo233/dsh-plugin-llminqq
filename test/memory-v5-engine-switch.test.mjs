@@ -99,6 +99,8 @@ function makeEngine ({
   const code = `
     const V5_ENGINE_VALUES = ['v4', 'v5']
     const V5_DISTILL_DEFAULTS = { intervalMin: 10, minIntervalMin: 1, maxIntervalMin: 120 }
+    // 沙箱要跟着源码补常量 —— 少一个就是 ReferenceError（这次就被抓到了）
+    const V5_DISTILL_BATCH = { def: 20, min: 5, max: 100 }
     let v5Disabled = false
     let v5SearchPromise = null
     let v5DistillPromise = null
@@ -402,7 +404,7 @@ const IDX = await import(pathToFileURL(path.join(ROOT, 'lib', 'index.js')).href)
 const STORE = await import(pathToFileURL(path.join(ROOT, 'lib', 'store.js')).href)
 after(() => fs.rmSync(TMP_HOME, { recursive: true, force: true }))
 
-const V5_DEFAULTS = { enabled: true, engine: 'v4', distill: { enabled: true, intervalMin: 10 } }
+const V5_DEFAULTS = { enabled: true, engine: 'v4', distill: { enabled: true, intervalMin: 10, batch: 20 } }
 
 test('memoryV5Config：缺省 → enabled + engine=v4 + distill 10 分钟（默认不切读路径）', () => {
   assert.deepEqual(IDX.memoryV5Config(undefined), V5_DEFAULTS)
@@ -411,8 +413,9 @@ test('memoryV5Config：缺省 → enabled + engine=v4 + distill 10 分钟（默�
 
 test('memoryV5Config：engine=v5、distill 配置原样透传', () => {
   assert.deepEqual(
-    IDX.memoryV5Config({ v5: { enabled: true, engine: 'v5', distill: { enabled: false, intervalMin: 5 } } }),
-    { enabled: true, engine: 'v5', distill: { enabled: false, intervalMin: 5 } })
+    IDX.memoryV5Config({ v5: { enabled: true, engine: 'v5', distill: { enabled: false, intervalMin: 5, batch: 40 } } }),
+    { enabled: true, engine: 'v5', distill: { enabled: false, intervalMin: 5, batch: 40 } },
+    'batch 也要原样透传（吞吐瓶颈靠它调）')
 })
 
 test('memoryV5Config：脏值回落（engine 只认 v5，大小写不敏感；间隔夹 1–120）', () => {
@@ -498,4 +501,31 @@ test('形状对齐：memory.enabled（记忆总开关）不被 v5.enabled 覆盖
   const memory = { enabled: false, v5 }
   assert.equal(memory.enabled, false, 'memory.enabled 必须保持用户的总开关值')
   assert.equal(memory.v5.enabled, true, 'v5.enabled 是独立的一层（默认开），不该被总开关连带')
+})
+
+// ── distill 吞吐：batch 必须可配（2026-11-07 实测瓶颈）────────────────────────
+//
+// 现场：活跃聊天时 events 涨约 364 条/小时（一条消息≈1.8 个事件，收发都算），
+// 而 distill 写死 20 条/10 分钟 = **120 条/小时** → 必然追不上。
+// 实测积压 16 分钟从 0 涨到 77。batch 做成可配后，调大它才能压住积压。
+
+test('v5DistillCfg：batch 默认 20、夹 5–100、脏值回落', () => {
+  assert.equal(makeEngine({ config: CONFIG_V5 }).v5DistillCfg().batch, 20, '默认 20')
+  assert.equal(makeEngine({ config: { memory: { v5: { distill: { batch: 60 } } } } }).v5DistillCfg().batch, 60)
+  assert.equal(makeEngine({ config: { memory: { v5: { distill: { batch: 999 } } } } }).v5DistillCfg().batch, 100, '上限 100（再大 prompt 装不下，会被 deferred 白设）')
+  assert.equal(makeEngine({ config: { memory: { v5: { distill: { batch: 1 } } } } }).v5DistillCfg().batch, 5, '下限 5（太小会每轮都多 spawn 一次 ACP）')
+  assert.equal(makeEngine({ config: { memory: { v5: { distill: { batch: 'abc' } } } } }).v5DistillCfg().batch, 20)
+})
+
+test('v5DistillTick：把配置里的 batch 透传给 distillOnce', () => {
+  const body = SRC.slice(SRC.indexOf('async function v5DistillTick'), SRC.indexOf('async function v5DistillTick') + 3400)
+  assert.match(body, /batch:\s*v5DistillCfg\(\)\.batch/,
+    'distillOnce 没拿到配置里的 batch —— 吞吐永远是写死的 120 条/小时')
+})
+
+test('源码级：memoryV5Config 透传 distill.batch（插件配置 → 桥配置）', async () => {
+  const IDX = await import(pathToFileURL(path.join(ROOT, 'lib', 'index.js')).href)
+  const d = IDX.memoryV5Config({ v5: { distill: { batch: 40, intervalMin: 5 } } }).distill
+  assert.equal(d.batch, 40)
+  assert.equal(d.intervalMin, 5)
 })
